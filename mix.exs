@@ -35,7 +35,8 @@ defmodule MqttX.MixProject do
       {:protox, "~> 1.7", optional: true},
 
       # Dev/test
-      {:ex_doc, "~> 0.30", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.30", only: :dev, runtime: false},
+      {:dialyxir, "~> 1.4", only: :dev, runtime: false}
     ]
   end
 
@@ -43,7 +44,10 @@ defmodule MqttX.MixProject do
     [
       maintainers: ["Cigno Systems"],
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => @source_url},
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "https://hexdocs.pm/mqttx/changelog.html"
+      },
       files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
     ]
   end

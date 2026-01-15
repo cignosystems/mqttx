@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.2] - 2026-01-15
+## [0.1.3] - 2026-01-15
 
 ### Added
 
@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - JSON payload codec now conditionally compiles only on OTP 27+ 
 - Code formatting issues
 - Version test no longer hardcodes version string
+- Dialyzer false positives for defensive pattern matching
 
 ## [0.1.1] - 2026-01-15
 

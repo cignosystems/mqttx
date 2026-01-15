@@ -1,7 +1,7 @@
 defmodule MqttX.MixProject do
   use Mix.Project
 
-  @version "0.1.5"
+  @version "0.1.6"
   @source_url "https://github.com/cignosystems/mqttx"
 
   def project do
@@ -31,8 +31,8 @@ defmodule MqttX.MixProject do
       {:thousand_island, "~> 1.0", optional: true},
       {:ranch, "~> 2.1", optional: true},
 
-      # Payload codecs (optional)
-      {:protox, "~> 1.7", optional: true},
+      # Payload codecs (optional) - supports protox 1.x and 2.x
+      {:protox, ">= 1.7.0", optional: true},
 
       # Dev/test
       {:ex_doc, "~> 0.30", only: :dev, runtime: false},

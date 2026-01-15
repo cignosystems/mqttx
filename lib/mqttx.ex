@@ -7,7 +7,7 @@ defmodule MqttX do
   - Transport-agnostic server/broker
   - Modern client with automatic reconnection
 
-  For full documentation, installation guide, and examples, see the [README](readme.html).
+  **[See full documentation, installation guide, and examples →](readme.html)**
 
   ## Quick Start
 

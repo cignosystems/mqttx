@@ -7,6 +7,8 @@ defmodule MqttX do
   - Transport-agnostic server/broker
   - Modern client with automatic reconnection
 
+  For full documentation, installation guide, and examples, see the [README](readme.html).
+
   ## Quick Start
 
   ### Server
@@ -83,5 +85,5 @@ defmodule MqttX do
   Returns the library version.
   """
   @spec version :: String.t()
-  def version, do: "0.1.4"
+  def version, do: "0.1.5"
 end

@@ -243,6 +243,8 @@ defmodule MqttX.Topic do
     valid_part?(head) and valid_normalized?(tail)
   end
 
+  # Integer clause kept for API completeness even though normalize_part converts them
+  @dialyzer {:nowarn_function, valid_part?: 1}
   defp valid_part?(:multi_level), do: true
   defp valid_part?(:single_level), do: true
   defp valid_part?(n) when is_integer(n), do: true

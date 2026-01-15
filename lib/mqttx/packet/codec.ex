@@ -590,6 +590,9 @@ defmodule MqttX.Packet.Codec do
   defp protocol_name(3), do: @protocol_name_3
   defp protocol_name(_), do: @protocol_name
 
+  # These functions handle all packet types for completeness, but may only be
+  # called with a subset of types in specific contexts. Dialyzer warnings suppressed.
+  @dialyzer {:nowarn_function, type_to_atom: 1}
   defp type_to_atom(@connect), do: :connect
   defp type_to_atom(@connack), do: :connack
   defp type_to_atom(@publish), do: :publish
@@ -606,6 +609,7 @@ defmodule MqttX.Packet.Codec do
   defp type_to_atom(@disconnect), do: :disconnect
   defp type_to_atom(@auth), do: :auth
 
+  @dialyzer {:nowarn_function, atom_to_type: 1}
   defp atom_to_type(:connect), do: @connect
   defp atom_to_type(:connack), do: @connack
   defp atom_to_type(:publish), do: @publish

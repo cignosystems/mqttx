@@ -269,48 +269,6 @@ The packet codec is optimized for:
 | SUBSCRIBE encode | 3.42M ips | 0.82M ips | **4.2x faster** |
 | PUBLISH decode | 2.36M ips | 2.25M ips | ~same |
 
-## Roadmap
-
-### v0.2.0 - Core Functionality
-
-| Feature | Description | Priority |
-|---------|-------------|----------|
-| **TLS/SSL Client Support** | Client only supports TCP, no `:ssl` option | High |
-| **QoS 2 Complete Flow** | Client doesn't implement PUBREC/PUBREL/PUBCOMP exchange | High |
-| **Message Inflight Tracking** | No retry mechanism for unacknowledged QoS 1/2 messages | High |
-| **Session Persistence** | `clean_session=false` sessions aren't stored/restored | Medium |
-| **Retained Messages** | Server doesn't store or deliver retained messages | Medium |
-| **Will Message Delivery** | Server receives will but doesn't publish on ungraceful disconnect | Medium |
-
-### v0.3.0 - MQTT 5.0 Advanced Features
-
-| Feature | Description |
-|---------|-------------|
-| **Shared Subscriptions** | `$share/group/topic` pattern for load balancing |
-| **Topic Alias** | Reduce bandwidth with topic aliases |
-| **Message Expiry** | Respect `message_expiry_interval` property |
-| **Flow Control** | Enforce `receive_maximum` for backpressure |
-| **Enhanced Auth** | Complete AUTH packet exchange flow |
-| **Request/Response** | Response topic and correlation data handling |
-
-### v0.4.0 - Production Readiness
-
-| Feature | Description |
-|---------|-------------|
-| **Telemetry** | `:telemetry` events for metrics/observability |
-| **WebSocket Transport** | For browser-based MQTT clients |
-| **Clustering** | Distributed router across Erlang nodes |
-| **Connection Supervision** | `DynamicSupervisor` for client connections |
-| **Rate Limiting** | Connection and message rate limits |
-
-### Future Improvements
-
-| Item | Description |
-|------|-------------|
-| **Trie-based Router** | O(topic_depth) matching instead of O(n) list scan |
-| **Property-based Tests** | StreamData for fuzzing packet codec |
-| **Integration Tests** | Test against Mosquitto, EMQX, HiveMQ |
-
 ## License
 
 Apache-2.0

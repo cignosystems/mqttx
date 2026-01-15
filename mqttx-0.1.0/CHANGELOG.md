@@ -15,7 +15,7 @@ All notable changes to this project will be documented in this file.
 - MQTT Server behaviour with handler callbacks
 - Topic router with wildcard support (+, #)
 - MQTT Client with automatic reconnection
-- JSON payload codec (via built-in Erlang/OTP 27+ JSON module)
+- JSON payload codec (via Jason)
 - Protobuf payload codec (via Protox)
 - Raw binary payload codec
 - Comprehensive test suite

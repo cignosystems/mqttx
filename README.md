@@ -138,7 +138,9 @@ Start the server:
 {:ok, client} = MqttX.Client.connect(
   host: "localhost",
   port: 1883,
-  client_id: "my_client"
+  client_id: "my_client",
+  username: "user",        # optional
+  password: "secret"       # optional
 )
 
 # Subscribe

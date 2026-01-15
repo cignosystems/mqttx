@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-01-15
+
+### Added
+
+- `handle_info/2` callback for MqttX.Server to handle custom messages (e.g., PubSub)
+- Support for outgoing PUBLISH via `{:publish, topic, payload, state}` return value
+- Enables bidirectional communication (server can push messages to connected clients)
+
 ## [0.1.6] - 2026-01-15
 
 ### Changed

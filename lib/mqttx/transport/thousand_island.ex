@@ -163,6 +163,45 @@ defmodule MqttX.Transport.ThousandIsland do
       {:close, state}
     end
 
+    # Handle custom messages (PubSub, etc.) - forward to user's handler
+    @impl GenServer
+    def handle_info(message, {socket, state}) do
+      if state.connected and function_exported?(state.handler, :handle_info, 2) do
+        case state.handler.handle_info(message, state.handler_state) do
+          {:ok, new_handler_state} ->
+            {:noreply, {socket, %{state | handler_state: new_handler_state}}}
+
+          {:publish, topic, payload, new_handler_state} ->
+            send_publish(socket, topic, payload, %{qos: 0, retain: false}, state.protocol_version)
+            {:noreply, {socket, %{state | handler_state: new_handler_state}}}
+
+          {:publish, topic, payload, opts, new_handler_state} ->
+            send_publish(socket, topic, payload, opts, state.protocol_version)
+            {:noreply, {socket, %{state | handler_state: new_handler_state}}}
+
+          {:stop, _reason, new_handler_state} ->
+            {:stop, :normal, {socket, %{state | handler_state: new_handler_state}}}
+        end
+      else
+        {:noreply, {socket, state}}
+      end
+    end
+
+    # Send PUBLISH packet to client
+    defp send_publish(socket, topic, payload, opts, version) do
+      packet = %{
+        type: :publish,
+        topic: topic,
+        payload: payload,
+        qos: Map.get(opts, :qos, 0),
+        retain: Map.get(opts, :retain, false),
+        dup: false,
+        packet_id: if(Map.get(opts, :qos, 0) > 0, do: :rand.uniform(65535), else: nil),
+        properties: %{}
+      }
+      send_packet(socket, packet, version || 4)
+    end
+
     # Process incoming data buffer
     defp process_buffer(buffer, socket, state) do
       version = state.protocol_version || 4

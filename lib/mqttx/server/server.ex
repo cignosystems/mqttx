@@ -133,7 +133,22 @@ defmodule MqttX.Server do
   """
   @callback handle_puback(packet_id :: non_neg_integer(), state()) :: {:ok, state()}
 
-  @optional_callbacks [handle_unsubscribe: 2, handle_puback: 2]
+  @doc """
+  Handle custom messages (e.g., from PubSub for outgoing MQTT publishes).
+
+  Return values:
+  - `{:ok, state}` - Continue with updated state
+  - `{:publish, topic, payload, state}` - Send PUBLISH to client, then continue
+  - `{:publish, topic, payload, opts, state}` - Send PUBLISH with QoS/retain options
+  - `{:stop, reason, state}` - Close the connection
+  """
+  @callback handle_info(message :: term(), state()) ::
+              {:ok, state()}
+              | {:publish, binary(), binary(), state()}
+              | {:publish, binary(), binary(), map(), state()}
+              | {:stop, term(), state()}
+
+  @optional_callbacks [handle_unsubscribe: 2, handle_puback: 2, handle_info: 2]
 
   @doc """
   Use MqttX.Server to define default implementations.
@@ -152,7 +167,12 @@ defmodule MqttX.Server do
         {:ok, state}
       end
 
-      defoverridable handle_unsubscribe: 2, handle_puback: 2
+      @impl true
+      def handle_info(_message, state) do
+        {:ok, state}
+      end
+
+      defoverridable handle_unsubscribe: 2, handle_puback: 2, handle_info: 2
     end
   end
 

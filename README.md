@@ -277,7 +277,7 @@ The packet codec is optimized for:
 
 ## Roadmap
 
-### v0.2.0 - Core Functionality
+### v0.3.0 - Core Functionality
 
 | Feature | Description | Priority |
 |---------|-------------|----------|
@@ -288,7 +288,7 @@ The packet codec is optimized for:
 | **Retained Messages** | Server doesn't store or deliver retained messages | Medium |
 | **Will Message Delivery** | Server receives will but doesn't publish on ungraceful disconnect | Medium |
 
-### v0.3.0 - MQTT 5.0 Advanced Features
+### v0.4.0 - MQTT 5.0 Advanced Features
 
 | Feature | Description |
 |---------|-------------|
@@ -299,7 +299,7 @@ The packet codec is optimized for:
 | **Enhanced Auth** | Complete AUTH packet exchange flow |
 | **Request/Response** | Response topic and correlation data handling |
 
-### v0.4.0 - Production Readiness
+### v0.5.0 - Production Readiness
 
 | Feature | Description |
 |---------|-------------|

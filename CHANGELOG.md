@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.3] - 2026-01-15
+## [0.1.4] - 2026-01-15
 
 ### Added
 
@@ -10,10 +10,15 @@ All notable changes to this project will be documented in this file.
 - Roadmap section in README
 - Username/password example in client documentation
 - Changelog link on hex.pm package page
+- Hex.pm, Docs, and CI badges to README
+
+### Changed
+
+- Documentation landing page now shows README instead of module docs
 
 ### Fixed
 
-- JSON payload codec now conditionally compiles only on OTP 27+ 
+- JSON payload codec now conditionally compiles only on OTP 27+
 - Code formatting issues
 - Version test no longer hardcodes version string
 - Dialyzer false positives for defensive pattern matching

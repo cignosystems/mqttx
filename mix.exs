@@ -1,7 +1,7 @@
 defmodule MqttX.MixProject do
   use Mix.Project
 
-  @version "0.1.3"
+  @version "0.1.4"
   @source_url "https://github.com/cignosystems/mqttx"
 
   def project do
@@ -54,7 +54,7 @@ defmodule MqttX.MixProject do
 
   defp docs do
     [
-      main: "MqttX",
+      main: "readme",
       source_url: @source_url,
       source_ref: "v#{@version}",
       extras: ["README.md", "CHANGELOG.md"]

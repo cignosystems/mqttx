@@ -1,5 +1,9 @@
 # MqttX
 
+[![Hex.pm](https://img.shields.io/hexpm/v/mqttx.svg)](https://hex.pm/packages/mqttx)
+[![Docs](https://img.shields.io/badge/docs-hexdocs-blue.svg)](https://hexdocs.pm/mqttx)
+[![CI](https://github.com/cignosystems/mqttx/actions/workflows/ci.yml/badge.svg)](https://github.com/cignosystems/mqttx/actions/workflows/ci.yml)
+
 A pure Elixir MQTT 3.1.1/5.0 library featuring:
 
 - 🚀 High-performance packet codec

@@ -174,6 +174,7 @@ defmodule MqttX.Packet.CodecTest do
 
     test "encodes PUBLISH with binary payload" do
       payload = <<0, 1, 2, 3, 255, 254, 253>>
+
       packet = %{
         type: :publish,
         topic: "binary",

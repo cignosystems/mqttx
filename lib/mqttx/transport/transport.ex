@@ -57,12 +57,14 @@ defmodule MqttX.Transport do
   @doc """
   Get the remote address of the connection.
   """
-  @callback peername(socket) :: {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, term()}
+  @callback peername(socket) ::
+              {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, term()}
 
   @doc """
   Get socket options.
   """
-  @callback getopts(socket, [:inet.socket_getopt()]) :: {:ok, [:inet.socket_setopt()]} | {:error, term()}
+  @callback getopts(socket, [:inet.socket_getopt()]) ::
+              {:ok, [:inet.socket_setopt()]} | {:error, term()}
 
   @doc """
   Set socket options.

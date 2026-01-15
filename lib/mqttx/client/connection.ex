@@ -444,6 +444,7 @@ defmodule MqttX.Client.Connection do
   end
 
   defp notify_handler(%{handler: nil}, _event, _data), do: :ok
+
   defp notify_handler(%{handler: handler, handler_state: hstate}, event, data) do
     if function_exported?(handler, :handle_mqtt_event, 3) do
       handler.handle_mqtt_event(event, data, hstate)

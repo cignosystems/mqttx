@@ -54,7 +54,8 @@ defmodule MqttX.Topic do
 
   Returns `{:ok, normalized_topic}` or `{:error, :invalid_topic}`.
   """
-  @spec validate_publish(binary() | list()) :: {:ok, normalized_topic()} | {:error, :invalid_topic}
+  @spec validate_publish(binary() | list()) ::
+          {:ok, normalized_topic()} | {:error, :invalid_topic}
   def validate_publish(topic) do
     case validate(topic) do
       {:ok, normalized} ->

@@ -83,5 +83,5 @@ defmodule MqttX do
   Returns the library version.
   """
   @spec version :: String.t()
-  def version, do: "0.1.0"
+  def version, do: "0.1.2"
 end

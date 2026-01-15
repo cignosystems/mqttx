@@ -32,10 +32,14 @@ defmodule MqttX.Transport.ThousandIsland do
     port = Keyword.get(transport_opts, :port, @default_port)
     ip = Keyword.get(transport_opts, :ip, {0, 0, 0, 0})
     num_acceptors = Keyword.get(transport_opts, :num_acceptors, @default_num_acceptors)
-    transport_module = Keyword.get(transport_opts, :transport_module, ThousandIsland.Transports.TCP)
+
+    transport_module =
+      Keyword.get(transport_opts, :transport_module, ThousandIsland.Transports.TCP)
+
     transport_options = Keyword.get(transport_opts, :transport_options, [])
 
     handler_module = __MODULE__.Handler
+
     handler_opts_full = %{
       handler: handler,
       handler_opts: handler_opts,
@@ -133,24 +137,29 @@ defmodule MqttX.Transport.ThousandIsland do
       if state.connected and state.handler do
         state.handler.handle_disconnect(:closed, state.handler_state)
       end
+
       {:shutdown, state}
     end
 
     @impl ThousandIsland.Handler
     def handle_error(reason, _socket, state) do
       Logger.warning("[MqttX.Transport] Connection error: #{inspect(reason)}")
+
       if state.connected and state.handler do
         state.handler.handle_disconnect({:error, reason}, state.handler_state)
       end
+
       {:shutdown, state}
     end
 
     @impl ThousandIsland.Handler
     def handle_timeout(_socket, state) do
       Logger.debug("[MqttX.Transport] Connection timeout")
+
       if state.connected and state.handler do
         state.handler.handle_disconnect(:timeout, state.handler_state)
       end
+
       {:close, state}
     end
 
@@ -158,7 +167,7 @@ defmodule MqttX.Transport.ThousandIsland do
     defp process_buffer(buffer, socket, state) do
       version = state.protocol_version || 4
 
-        case Codec.decode(version, buffer) do
+      case Codec.decode(version, buffer) do
         {:ok, {packet, rest}} ->
           case handle_packet(packet, socket, state) do
             {:ok, new_state} ->
@@ -195,13 +204,15 @@ defmodule MqttX.Transport.ThousandIsland do
             reason_code: 0,
             properties: %{}
           }
+
           send_packet(socket, connack, protocol_version)
 
-          new_state = %{state |
-            protocol_version: protocol_version,
-            client_id: packet.client_id,
-            handler_state: new_handler_state,
-            connected: true
+          new_state = %{
+            state
+            | protocol_version: protocol_version,
+              client_id: packet.client_id,
+              handler_state: new_handler_state,
+              connected: true
           }
 
           {:ok, new_state}
@@ -213,6 +224,7 @@ defmodule MqttX.Transport.ThousandIsland do
             reason_code: reason_code,
             properties: %{}
           }
+
           send_packet(socket, connack, protocol_version)
           {:close, :auth_failed, %{state | handler_state: new_handler_state}}
       end
@@ -223,6 +235,7 @@ defmodule MqttX.Transport.ThousandIsland do
       handler = state.handler
       topic = packet.topic
       payload = packet.payload
+
       opts = %{
         qos: packet.qos,
         retain: packet.retain,
@@ -253,12 +266,14 @@ defmodule MqttX.Transport.ThousandIsland do
       case handler.handle_subscribe(packet.topics, state.handler_state) do
         {:ok, granted_qos, new_handler_state} ->
           acks = Enum.map(granted_qos, fn qos -> {:ok, qos} end)
+
           suback = %{
             type: :suback,
             packet_id: packet.packet_id,
             acks: acks,
             properties: %{}
           }
+
           send_packet(socket, suback, state.protocol_version)
           {:ok, %{state | handler_state: new_handler_state}}
       end
@@ -271,12 +286,14 @@ defmodule MqttX.Transport.ThousandIsland do
       case handler.handle_unsubscribe(packet.topics, state.handler_state) do
         {:ok, new_handler_state} ->
           acks = Enum.map(packet.topics, fn _ -> {:ok, :found} end)
+
           unsuback = %{
             type: :unsuback,
             packet_id: packet.packet_id,
             acks: acks,
             properties: %{}
           }
+
           send_packet(socket, unsuback, state.protocol_version)
           {:ok, %{state | handler_state: new_handler_state}}
       end
@@ -294,6 +311,7 @@ defmodule MqttX.Transport.ThousandIsland do
       if state.handler do
         state.handler.handle_disconnect(:normal, state.handler_state)
       end
+
       {:close, :disconnect, state}
     end
 

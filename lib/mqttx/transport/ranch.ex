@@ -138,17 +138,21 @@ defmodule MqttX.Transport.Ranch do
 
     def handle_info({:tcp_closed, socket}, %{socket: socket} = state) do
       Logger.debug("[MqttX.Transport.Ranch] Connection closed")
+
       if state.connected and state.handler do
         state.handler.handle_disconnect(:closed, state.handler_state)
       end
+
       {:stop, :normal, state}
     end
 
     def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state) do
       Logger.warning("[MqttX.Transport.Ranch] TCP error: #{inspect(reason)}")
+
       if state.connected and state.handler do
         state.handler.handle_disconnect({:error, reason}, state.handler_state)
       end
+
       {:stop, :normal, state}
     end
 
@@ -196,13 +200,15 @@ defmodule MqttX.Transport.Ranch do
             reason_code: 0,
             properties: %{}
           }
+
           send_packet(state, connack, protocol_version)
 
-          new_state = %{state |
-            protocol_version: protocol_version,
-            client_id: packet.client_id,
-            handler_state: new_handler_state,
-            connected: true
+          new_state = %{
+            state
+            | protocol_version: protocol_version,
+              client_id: packet.client_id,
+              handler_state: new_handler_state,
+              connected: true
           }
 
           {:ok, new_state}
@@ -214,6 +220,7 @@ defmodule MqttX.Transport.Ranch do
             reason_code: reason_code,
             properties: %{}
           }
+
           send_packet(state, connack, protocol_version)
           {:close, :auth_failed, %{state | handler_state: new_handler_state}}
       end
@@ -222,6 +229,7 @@ defmodule MqttX.Transport.Ranch do
     # Handle PUBLISH
     defp handle_packet(%{type: :publish} = packet, state) do
       handler = state.handler
+
       opts = %{
         qos: packet.qos,
         retain: packet.retain,
@@ -236,6 +244,7 @@ defmodule MqttX.Transport.Ranch do
             puback = %{type: :puback, packet_id: packet.packet_id}
             send_packet(state, puback, state.protocol_version)
           end
+
           {:ok, %{state | handler_state: new_handler_state}}
 
         {:error, _reason, new_handler_state} ->
@@ -250,12 +259,14 @@ defmodule MqttX.Transport.Ranch do
       case handler.handle_subscribe(packet.topics, state.handler_state) do
         {:ok, granted_qos, new_handler_state} ->
           acks = Enum.map(granted_qos, fn qos -> {:ok, qos} end)
+
           suback = %{
             type: :suback,
             packet_id: packet.packet_id,
             acks: acks,
             properties: %{}
           }
+
           send_packet(state, suback, state.protocol_version)
           {:ok, %{state | handler_state: new_handler_state}}
       end
@@ -268,12 +279,14 @@ defmodule MqttX.Transport.Ranch do
       case handler.handle_unsubscribe(packet.topics, state.handler_state) do
         {:ok, new_handler_state} ->
           acks = Enum.map(packet.topics, fn _ -> {:ok, :found} end)
+
           unsuback = %{
             type: :unsuback,
             packet_id: packet.packet_id,
             acks: acks,
             properties: %{}
           }
+
           send_packet(state, unsuback, state.protocol_version)
           {:ok, %{state | handler_state: new_handler_state}}
       end
@@ -291,6 +304,7 @@ defmodule MqttX.Transport.Ranch do
       if state.handler do
         state.handler.handle_disconnect(:normal, state.handler_state)
       end
+
       {:close, :disconnect, state}
     end
 

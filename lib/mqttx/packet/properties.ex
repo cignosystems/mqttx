@@ -69,6 +69,7 @@ defmodule MqttX.Packet.Properties do
 
       {:ok, len, rest} when byte_size(rest) >= len ->
         <<props_bin::binary-size(len), remaining::binary>> = rest
+
         case decode_properties(props_bin, %{}) do
           {:ok, props} -> {:ok, props, remaining}
           {:error, _} = err -> err
@@ -247,11 +248,14 @@ defmodule MqttX.Packet.Properties do
   defp decode_properties(<<@prop_subscription_identifier, rest::binary>>, props) do
     with {:ok, val, rest2} <- Varint.decode(rest) do
       existing = Map.get(props, :subscription_identifier)
-      new_val = case existing do
-        nil -> val
-        list when is_list(list) -> list ++ [val]
-        single -> [single, val]
-      end
+
+      new_val =
+        case existing do
+          nil -> val
+          list when is_list(list) -> list ++ [val]
+          single -> [single, val]
+        end
+
       decode_properties(rest2, Map.put(props, :subscription_identifier, new_val))
     end
   end

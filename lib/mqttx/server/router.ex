@@ -78,21 +78,25 @@ defmodule MqttX.Server.Router do
     normalized = normalize_filter(filter)
 
     # Remove from main list
-    subscriptions = Enum.reject(router.subscriptions, fn sub ->
-      sub.client == client and sub.filter == normalized
-    end)
+    subscriptions =
+      Enum.reject(router.subscriptions, fn sub ->
+        sub.client == client and sub.filter == normalized
+      end)
 
     # Update client index
     client_subs = Map.get(router.by_client, client, [])
-    new_client_subs = Enum.reject(client_subs, fn sub ->
-      sub.filter == normalized
-    end)
 
-    by_client = if new_client_subs == [] do
-      Map.delete(router.by_client, client)
-    else
-      Map.put(router.by_client, client, new_client_subs)
-    end
+    new_client_subs =
+      Enum.reject(client_subs, fn sub ->
+        sub.filter == normalized
+      end)
+
+    by_client =
+      if new_client_subs == [] do
+        Map.delete(router.by_client, client)
+      else
+        Map.put(router.by_client, client, new_client_subs)
+      end
 
     %{router | subscriptions: subscriptions, by_client: by_client}
   end
@@ -102,9 +106,10 @@ defmodule MqttX.Server.Router do
   """
   @spec unsubscribe_all(t(), term()) :: t()
   def unsubscribe_all(router, client) do
-    subscriptions = Enum.reject(router.subscriptions, fn sub ->
-      sub.client == client
-    end)
+    subscriptions =
+      Enum.reject(router.subscriptions, fn sub ->
+        sub.client == client
+      end)
 
     by_client = Map.delete(router.by_client, client)
 

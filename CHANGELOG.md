@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-01-15
+
+### Added
+
+- GitHub Actions CI workflow (tests on Elixir 1.17-1.19, OTP 27-28, dialyzer)
+- Roadmap section in README
+- Username/password example in client documentation
+- Changelog link on hex.pm package page
+
+### Fixed
+
+- JSON payload codec now conditionally compiles only on OTP 27+ 
+- Code formatting issues
+- Version test no longer hardcodes version string
+
+## [0.1.1] - 2026-01-15
+
+### Added
+
+- GitHub Actions CI workflow (tests, formatting, dialyzer)
+- Roadmap section in README
+- Username/password example in client documentation
+- Changelog link on hex.pm package page
+
+### Fixed
+
+- JSON codec description now correctly references built-in Erlang/OTP 27+ module
+
 ## [0.1.0] - 2026-01-14
 
 ### Added

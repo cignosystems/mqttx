@@ -2,6 +2,8 @@ defmodule MqttXTest do
   use ExUnit.Case
 
   test "returns version" do
-    assert MqttX.version() == "0.1.0"
+    version = MqttX.version()
+    assert is_binary(version)
+    assert version =~ ~r/^\d+\.\d+\.\d+$/
   end
 end

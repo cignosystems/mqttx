@@ -36,6 +36,7 @@ defmodule MqttX.Client.Connection do
 
   alias MqttX.Packet.Codec
   alias MqttX.Client.Backoff
+  alias MqttX.Telemetry
 
   require Logger
 
@@ -67,10 +68,19 @@ defmodule MqttX.Client.Connection do
     :session_store,
     :session_store_state,
     :subscriptions,
+    # Topic alias support (MQTT 5.0)
+    :topic_alias_maximum,
+    # Flow control (MQTT 5.0)
+    :receive_maximum,
     transport: :tcp,
     retry_interval: @default_retry_interval,
     connected: false,
-    clean_session: true
+    clean_session: true,
+    # Outgoing topic aliases (topic -> alias)
+    topic_to_alias: %{},
+    # Incoming topic aliases (alias -> topic)
+    alias_to_topic: %{},
+    next_alias: 1
   ]
 
   @type t :: %__MODULE__{}
@@ -210,54 +220,78 @@ defmodule MqttX.Client.Connection do
     if state.connected do
       qos = Keyword.get(opts, :qos, 0)
       retain = Keyword.get(opts, :retain, false)
+      properties = Keyword.get(opts, :properties, %{})
 
-      {packet_id, state} = if qos > 0, do: next_packet_id(state), else: {nil, state}
+      # Check flow control for QoS 1/2 (MQTT 5.0 receive_maximum)
+      if qos > 0 and not can_send_qos_message?(state) do
+        {:reply, {:error, :flow_control}, state}
+      else
+        {packet_id, state} = if qos > 0, do: next_packet_id(state), else: {nil, state}
 
-      packet = %{
-        type: :publish,
-        topic: topic,
-        payload: payload,
-        qos: qos,
-        retain: retain,
-        dup: false,
-        packet_id: packet_id
-      }
+        packet = %{
+          type: :publish,
+          topic: topic,
+          payload: payload,
+          qos: qos,
+          retain: retain,
+          dup: false,
+          packet_id: packet_id,
+          properties: properties
+        }
 
-      case send_packet(state, packet) do
-        :ok ->
-          # Track pending acks for QoS 1 and 2
-          state =
-            case qos do
-              0 ->
-                state
+        # Emit telemetry for publish
+        telemetry_meta = %{
+          client_id: state.client_id,
+          topic: topic,
+          qos: qos,
+          payload_size: byte_size(payload)
+        }
 
-              1 ->
-                # QoS 1: waiting for PUBACK
-                pending =
-                  Map.put(state.pending_acks, {:tx, packet_id}, %{
-                    phase: :puback_pending,
-                    packet: packet,
-                    timestamp: System.monotonic_time(:millisecond)
-                  })
+        Telemetry.client_publish_start(telemetry_meta)
 
-                %{state | pending_acks: pending}
-
-              2 ->
-                # QoS 2: waiting for PUBREC
-                pending =
-                  Map.put(state.pending_acks, {:tx, packet_id}, %{
-                    phase: :pubrec_pending,
-                    packet: packet,
-                    timestamp: System.monotonic_time(:millisecond)
-                  })
-
-                %{state | pending_acks: pending}
+        case send_packet(state, packet) do
+          :ok ->
+            # For QoS 0, publish is complete immediately
+            if qos == 0 do
+              Telemetry.client_publish_stop(0, telemetry_meta)
             end
 
-          {:reply, :ok, state}
+            # Track pending acks for QoS 1 and 2
+            state =
+              case qos do
+                0 ->
+                  state
 
-        {:error, _} = err ->
-          {:reply, err, state}
+                1 ->
+                  # QoS 1: waiting for PUBACK
+                  pending =
+                    Map.put(state.pending_acks, {:tx, packet_id}, %{
+                      phase: :puback_pending,
+                      packet: packet,
+                      timestamp: System.monotonic_time(:millisecond),
+                      telemetry_meta: telemetry_meta
+                    })
+
+                  %{state | pending_acks: pending}
+
+                2 ->
+                  # QoS 2: waiting for PUBREC
+                  pending =
+                    Map.put(state.pending_acks, {:tx, packet_id}, %{
+                      phase: :pubrec_pending,
+                      packet: packet,
+                      timestamp: System.monotonic_time(:millisecond),
+                      telemetry_meta: telemetry_meta
+                    })
+
+                  %{state | pending_acks: pending}
+              end
+
+            {:reply, :ok, state}
+
+          {:error, _} = err ->
+            {:reply, err, state}
+        end
       end
     else
       {:reply, {:error, :not_connected}, state}
@@ -276,6 +310,9 @@ defmodule MqttX.Client.Connection do
         packet_id: packet_id,
         topics: topic_list
       }
+
+      # Emit telemetry for subscribe
+      Telemetry.client_subscribe(%{client_id: state.client_id, topics: topics})
 
       case send_packet(state, packet) do
         :ok -> {:reply, :ok, state}
@@ -311,6 +348,7 @@ defmodule MqttX.Client.Connection do
 
   @impl true
   def handle_cast(:disconnect, state) do
+    Telemetry.client_disconnect(%{client_id: state.client_id, reason: :normal})
     send_packet(state, %{type: :disconnect})
     close_socket(state)
     # Save session before stopping
@@ -320,12 +358,26 @@ defmodule MqttX.Client.Connection do
 
   @impl true
   def handle_info(:connect, state) do
+    metadata = %{
+      host: state.host,
+      port: state.port,
+      client_id: state.client_id,
+      transport: state.transport
+    }
+
+    start_time = System.monotonic_time()
+    Telemetry.client_connect_start(metadata)
+
     case do_connect(state) do
       {:ok, state} ->
+        duration = System.monotonic_time() - start_time
+        Telemetry.client_connect_stop(duration, metadata)
         state = %{state | backoff: Backoff.reset(state.backoff)}
         {:noreply, state}
 
       {:error, reason} ->
+        duration = System.monotonic_time() - start_time
+        Telemetry.client_connect_exception(duration, Map.put(metadata, :reason, reason))
         Logger.warning("[MqttX.Client] Connection failed: #{inspect(reason)}")
         schedule_reconnect(state)
         {:noreply, state}
@@ -446,18 +498,25 @@ defmodule MqttX.Client.Connection do
     receive do
       {proto, socket, data} when proto in [:tcp, :ssl] and socket == state.socket ->
         case Codec.decode(state.protocol_version, data) do
-          {:ok, {%{type: :connack, reason_code: 0}, rest}} ->
+          {:ok, {%{type: :connack, reason_code: 0} = connack, rest}} ->
             Logger.info("[MqttX.Client] Connected to #{state.host}:#{state.port}")
             keepalive_timer = Process.send_after(self(), :keepalive, state.keepalive * 1000)
             retry_timer = Process.send_after(self(), :check_inflight, state.retry_interval)
             set_socket_active(state)
+
+            # Extract MQTT 5.0 properties from CONNACK
+            props = Map.get(connack, :properties, %{})
+            topic_alias_max = Map.get(props, :topic_alias_maximum)
+            receive_max = Map.get(props, :receive_maximum, 65535)
 
             state = %{
               state
               | connected: true,
                 buffer: rest,
                 keepalive_timer: keepalive_timer,
-                retry_timer: retry_timer
+                retry_timer: retry_timer,
+                topic_alias_maximum: topic_alias_max,
+                receive_maximum: receive_max
             }
 
             notify_handler(state, :connected, nil)
@@ -498,20 +557,38 @@ defmodule MqttX.Client.Connection do
   end
 
   defp handle_packet(%{type: :publish} = packet, state) do
+    # Handle topic alias (MQTT 5.0)
+    {topic, state} = resolve_incoming_topic_alias(packet, state)
+    packet = %{packet | topic: topic}
+
+    # Emit telemetry for received message (for QoS 0 and 1, immediately; QoS 2 after PUBREL)
+    emit_message_telemetry = fn ->
+      payload_size = byte_size(packet.payload || <<>>)
+
+      Telemetry.client_message(payload_size, %{
+        client_id: state.client_id,
+        topic: topic,
+        qos: packet.qos
+      })
+    end
+
     case packet.qos do
       0 ->
         # QoS 0: deliver immediately, no acknowledgment
-        notify_handler(state, :message, {packet.topic, packet.payload, packet})
+        emit_message_telemetry.()
+        notify_handler(state, :message, {topic, packet.payload, packet})
         state
 
       1 ->
         # QoS 1: deliver and send PUBACK
-        notify_handler(state, :message, {packet.topic, packet.payload, packet})
+        emit_message_telemetry.()
+        notify_handler(state, :message, {topic, packet.payload, packet})
         send_packet(state, %{type: :puback, packet_id: packet.packet_id})
         state
 
       2 ->
         # QoS 2: store message, send PUBREC, wait for PUBREL before delivering
+        # Telemetry will be emitted when PUBREL is received
         # Store in pending_acks with :pubrec_sent phase
         pending =
           Map.put(state.pending_acks, {:rx, packet.packet_id}, %{
@@ -525,7 +602,16 @@ defmodule MqttX.Client.Connection do
   end
 
   defp handle_packet(%{type: :puback} = packet, state) do
-    # QoS 1 complete: remove from pending acks
+    # QoS 1 complete: emit telemetry and remove from pending acks
+    case Map.get(state.pending_acks, {:tx, packet.packet_id}) do
+      %{timestamp: ts, telemetry_meta: meta} ->
+        duration = System.monotonic_time(:millisecond) - ts
+        Telemetry.client_publish_stop(duration, meta)
+
+      _ ->
+        :ok
+    end
+
     pending = Map.delete(state.pending_acks, {:tx, packet.packet_id})
     %{state | pending_acks: pending}
   end
@@ -552,6 +638,15 @@ defmodule MqttX.Client.Connection do
   defp handle_packet(%{type: :pubrel} = packet, state) do
     case Map.get(state.pending_acks, {:rx, packet.packet_id}) do
       %{phase: :pubrec_sent, packet: publish_packet} ->
+        # Emit telemetry for QoS 2 received message
+        payload_size = byte_size(publish_packet.payload || <<>>)
+
+        Telemetry.client_message(payload_size, %{
+          client_id: state.client_id,
+          topic: publish_packet.topic,
+          qos: publish_packet.qos
+        })
+
         # Now deliver the message to handler and send PUBCOMP
         notify_handler(
           state,
@@ -571,6 +666,16 @@ defmodule MqttX.Client.Connection do
 
   # QoS 2 - received PUBCOMP for our outgoing PUBLISH (transaction complete)
   defp handle_packet(%{type: :pubcomp} = packet, state) do
+    # QoS 2 complete: emit telemetry
+    case Map.get(state.pending_acks, {:tx, packet.packet_id}) do
+      %{timestamp: ts, telemetry_meta: meta} ->
+        duration = System.monotonic_time(:millisecond) - ts
+        Telemetry.client_publish_stop(duration, meta)
+
+      _ ->
+        :ok
+    end
+
     pending = Map.delete(state.pending_acks, {:tx, packet.packet_id})
     %{state | pending_acks: pending}
   end
@@ -764,6 +869,52 @@ defmodule MqttX.Client.Connection do
       }
 
       state.session_store.save(state.client_id, session, state.session_store_state)
+    end
+  end
+
+  # ============================================================================
+  # Flow Control Helpers (MQTT 5.0)
+  # ============================================================================
+
+  # Check if we can send another QoS 1/2 message (respects receive_maximum)
+  defp can_send_qos_message?(state) do
+    max_inflight = state.receive_maximum || 65535
+    inflight_count = count_inflight_messages(state)
+    inflight_count < max_inflight
+  end
+
+  # Count outgoing messages waiting for acknowledgment
+  defp count_inflight_messages(state) do
+    state.pending_acks
+    |> Enum.count(fn
+      {{:tx, _}, _} -> true
+      _ -> false
+    end)
+  end
+
+  # ============================================================================
+  # Topic Alias Helpers (MQTT 5.0)
+  # ============================================================================
+
+  # Resolve topic alias for incoming PUBLISH messages
+  defp resolve_incoming_topic_alias(packet, state) do
+    topic_alias = get_in(packet, [:properties, :topic_alias])
+    topic = packet.topic
+
+    cond do
+      # No alias in packet
+      is_nil(topic_alias) ->
+        {topic, state}
+
+      # Alias with topic: store the mapping
+      is_binary(topic) and topic != "" ->
+        alias_to_topic = Map.put(state.alias_to_topic, topic_alias, topic)
+        {topic, %{state | alias_to_topic: alias_to_topic}}
+
+      # Alias only: look up from stored mapping
+      true ->
+        resolved_topic = Map.get(state.alias_to_topic, topic_alias, "")
+        {resolved_topic, state}
     end
   end
 end

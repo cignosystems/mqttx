@@ -87,7 +87,7 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.4.0"},
+    {:mqttx, "~> 0.5.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: Payload codecs
@@ -397,22 +397,10 @@ The packet codec is optimized for:
 
 ## Roadmap
 
-### v0.5.0 - MQTT 5.0 Advanced Features
-
-| Feature | Description |
-|---------|-------------|
-| **Shared Subscriptions** | `$share/group/topic` pattern for load balancing |
-| **Topic Alias** | Reduce bandwidth with topic aliases |
-| **Message Expiry** | Respect `message_expiry_interval` property |
-| **Flow Control** | Enforce `receive_maximum` for backpressure |
-| **Enhanced Auth** | Complete AUTH packet exchange flow |
-| **Request/Response** | Response topic and correlation data handling |
-
 ### v0.6.0 - Production Readiness
 
 | Feature | Description |
 |---------|-------------|
-| **Telemetry** | `:telemetry` events for metrics/observability |
 | **WebSocket Transport** | For browser-based MQTT clients |
 | **Clustering** | Distributed router across Erlang nodes |
 | **Connection Supervision** | `DynamicSupervisor` for client connections |

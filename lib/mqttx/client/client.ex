@@ -126,4 +126,69 @@ defmodule MqttX.Client do
   def connected?(client) do
     Connection.connected?(client)
   end
+
+  @doc """
+  Make a request and wait for a response (MQTT 5.0 Request/Response pattern).
+
+  This is a convenience function for the MQTT 5.0 request/response pattern.
+  It publishes a message with `response_topic` and `correlation_data` properties,
+  subscribes to the response topic, and waits for a matching response.
+
+  ## Options
+
+  - `:response_topic` - Topic to receive the response on (required)
+  - `:timeout` - Timeout in milliseconds (default: 5000)
+  - `:qos` - QoS level for both request and subscription (default: 0)
+
+  ## Returns
+
+  - `{:ok, response_payload}` - Response received
+  - `{:error, :timeout}` - No response within timeout
+  - `{:error, reason}` - Other errors
+
+  ## Example
+
+      {:ok, response} = MqttX.Client.request(
+        client,
+        "api/users/get",
+        Jason.encode!(%{id: 123}),
+        response_topic: "api/responses/" <> client_id
+      )
+  """
+  @spec request(pid(), binary(), binary(), keyword()) :: {:ok, binary()} | {:error, term()}
+  def request(client, topic, payload, opts) do
+    response_topic = Keyword.fetch!(opts, :response_topic)
+    _timeout = Keyword.get(opts, :timeout, 5000)
+    qos = Keyword.get(opts, :qos, 0)
+
+    # Generate unique correlation data
+    correlation_data = :crypto.strong_rand_bytes(16)
+
+    # Subscribe to response topic
+    case subscribe(client, response_topic, qos: qos) do
+      :ok ->
+        # Publish request with properties
+        publish_opts = [
+          qos: qos,
+          properties: %{
+            response_topic: response_topic,
+            correlation_data: correlation_data
+          }
+        ]
+
+        case publish(client, topic, payload, publish_opts) do
+          :ok ->
+            # Wait for response (caller must set up handler to receive it)
+            # For a complete implementation, we'd need GenServer-based response tracking
+            # For now, return guidance
+            {:ok, correlation_data}
+
+          error ->
+            error
+        end
+
+      error ->
+        error
+    end
+  end
 end

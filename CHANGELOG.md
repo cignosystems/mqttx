@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-01-15
+
+### Added
+
+- **Telemetry Integration**: Comprehensive `:telemetry` events for observability
+  - Client events: connect, disconnect, publish, subscribe, message
+  - Server events: client_connect, client_disconnect, publish, subscribe
+  - New `MqttX.Telemetry` module with helper functions
+- **Shared Subscriptions** (MQTT 5.0): `$share/group/topic` pattern for load balancing
+  - Round-robin distribution across group members
+  - `Router.match_and_advance/2` for stateful distribution
+  - Automatic group cleanup when last member leaves
+- **Topic Alias** (MQTT 5.0): Bandwidth reduction for repeated topics
+  - Client stores `topic_alias_maximum` from CONNACK
+  - Resolves incoming topic aliases automatically
+  - `alias_to_topic` map in connection state
+- **Message Expiry** (MQTT 5.0): Respects `message_expiry_interval` property
+  - Retained messages stored with timestamp
+  - Expired messages skipped on delivery
+  - Remaining expiry sent in delivered messages
+- **Flow Control** (MQTT 5.0): Enforces `receive_maximum` for backpressure
+  - Client tracks inflight QoS 1/2 message count
+  - Returns `{:error, :flow_control}` when limit reached
+  - Stores `receive_maximum` from CONNACK
+- **Enhanced Auth** (MQTT 5.0): SASL-style authentication callback
+  - New `handle_auth/3` callback in `MqttX.Server` behaviour
+  - Default implementation returns error (not supported)
+- **Request/Response** (MQTT 5.0): Helper for request/response pattern
+  - `MqttX.Client.request/4` function
+  - Passes `response_topic` and `correlation_data` properties
+  - `:properties` option in `publish/4`
+
+### Changed
+
+- Transport adapters store retained messages with expiry metadata (5-tuple ETS format)
+- Client connection state includes topic alias and receive_maximum fields
+
 ## [0.4.0] - 2026-01-15
 
 ### Added

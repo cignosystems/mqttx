@@ -103,6 +103,7 @@ defmodule MqttX.Transport.Ranch do
     use GenServer
 
     alias MqttX.Packet.Codec
+    alias MqttX.Telemetry
 
     require Logger
 
@@ -158,6 +159,11 @@ defmodule MqttX.Transport.Ranch do
 
     def handle_info({:tcp_closed, socket}, %{socket: socket} = state) do
       Logger.debug("[MqttX.Transport.Ranch] Connection closed")
+
+      # Emit telemetry for ungraceful disconnect
+      if state.connected and not state.graceful_disconnect do
+        Telemetry.server_client_disconnect(%{client_id: state.client_id, reason: :closed})
+      end
 
       # Publish will message if connection was not gracefully closed
       if state.connected and state.will_message and not state.graceful_disconnect do
@@ -217,6 +223,11 @@ defmodule MqttX.Transport.Ranch do
       handler = state.handler
       protocol_version = packet.protocol_version
 
+      # Emit telemetry for connect start
+      telemetry_meta = %{client_id: packet.client_id, protocol_version: protocol_version}
+      start_time = System.monotonic_time()
+      Telemetry.server_client_connect_start(telemetry_meta)
+
       credentials = %{
         username: packet.username,
         password: packet.password
@@ -224,6 +235,10 @@ defmodule MqttX.Transport.Ranch do
 
       case handler.handle_connect(packet.client_id, credentials, state.handler_state) do
         {:ok, new_handler_state} ->
+          # Emit telemetry for connect success
+          duration = System.monotonic_time() - start_time
+          Telemetry.server_client_connect_stop(duration, telemetry_meta)
+
           connack = %{
             type: :connack,
             session_present: false,
@@ -248,6 +263,14 @@ defmodule MqttX.Transport.Ranch do
           {:ok, new_state}
 
         {:error, reason_code, new_handler_state} ->
+          # Emit telemetry for connect failure
+          duration = System.monotonic_time() - start_time
+
+          Telemetry.server_client_connect_exception(
+            duration,
+            Map.put(telemetry_meta, :reason_code, reason_code)
+          )
+
           connack = %{
             type: :connack,
             session_present: false,
@@ -264,6 +287,15 @@ defmodule MqttX.Transport.Ranch do
     defp handle_packet(%{type: :publish} = packet, state) do
       handler = state.handler
 
+      # Emit telemetry for publish received
+      payload_size = byte_size(packet.payload || <<>>)
+
+      Telemetry.server_publish(payload_size, %{
+        client_id: state.client_id,
+        topic: packet.topic,
+        qos: packet.qos
+      })
+
       opts = %{
         qos: packet.qos,
         retain: packet.retain,
@@ -274,7 +306,13 @@ defmodule MqttX.Transport.Ranch do
 
       # Handle retained message storage
       if packet.retain do
-        handle_retained_message(packet.topic, packet.payload, packet.qos, state.retained_table)
+        handle_retained_message(
+          packet.topic,
+          packet.payload,
+          packet.qos,
+          packet.properties,
+          state.retained_table
+        )
       end
 
       case handler.handle_publish(packet.topic, packet.payload, opts, state.handler_state) do
@@ -294,6 +332,10 @@ defmodule MqttX.Transport.Ranch do
     # Handle SUBSCRIBE
     defp handle_packet(%{type: :subscribe} = packet, state) do
       handler = state.handler
+
+      # Emit telemetry for subscribe
+      topics = Enum.map(packet.topics, fn t -> t.topic end)
+      Telemetry.server_subscribe(%{client_id: state.client_id, topics: topics})
 
       case handler.handle_subscribe(packet.topics, state.handler_state) do
         {:ok, granted_qos, new_handler_state} ->
@@ -344,6 +386,9 @@ defmodule MqttX.Transport.Ranch do
 
     # Handle DISCONNECT
     defp handle_packet(%{type: :disconnect}, state) do
+      # Emit telemetry for disconnect
+      Telemetry.server_client_disconnect(%{client_id: state.client_id, reason: :normal})
+
       if state.handler do
         state.handler.handle_disconnect(:normal, state.handler_state)
       end
@@ -409,7 +454,7 @@ defmodule MqttX.Transport.Ranch do
 
       # Handle retained will message
       if will.retain do
-        handle_retained_message(will.topic, will.payload, will.qos, state.retained_table)
+        handle_retained_message(will.topic, will.payload, will.qos, %{}, state.retained_table)
       end
 
       # Let the handler distribute the will message to subscribers
@@ -417,17 +462,19 @@ defmodule MqttX.Transport.Ranch do
     end
 
     # Handle retained message storage
-    defp handle_retained_message(topic, <<>>, _qos, table) do
+    defp handle_retained_message(topic, <<>>, _qos, _properties, table) do
       # Empty payload means delete retained message
       topic_key = normalize_topic_key(topic)
       :ets.delete(table, topic_key)
       :ok
     end
 
-    defp handle_retained_message(topic, payload, qos, table) do
-      # Store the retained message
+    defp handle_retained_message(topic, payload, qos, properties, table) do
+      # Store the retained message with timestamp and expiry interval
       topic_key = normalize_topic_key(topic)
-      :ets.insert(table, {topic_key, payload, qos})
+      timestamp = System.system_time(:second)
+      expiry_interval = Map.get(properties || %{}, :message_expiry_interval)
+      :ets.insert(table, {topic_key, payload, qos, timestamp, expiry_interval})
       :ok
     end
 
@@ -437,35 +484,76 @@ defmodule MqttX.Transport.Ranch do
 
     # Deliver retained messages matching subscribed topics
     defp deliver_retained_messages(state, topics) do
-      :ets.foldl(
-        fn {retained_topic, payload, qos}, _acc ->
-          Enum.each(topics, fn sub ->
-            sub_filter = get_topic_filter(sub)
+      now = System.system_time(:second)
+      expired_keys = []
 
-            if topic_matches?(sub_filter, retained_topic) do
-              sub_qos = Map.get(sub, :qos, 0)
-              effective_qos = min(qos, sub_qos)
+      expired_keys =
+        :ets.foldl(
+          fn entry, expired_acc ->
+            # Handle both old format (3-tuple) and new format (5-tuple) for backward compatibility
+            {retained_topic, payload, qos, timestamp, expiry_interval} =
+              case entry do
+                {topic, payload, qos, ts, exp} -> {topic, payload, qos, ts, exp}
+                {topic, payload, qos} -> {topic, payload, qos, nil, nil}
+              end
 
-              packet = %{
-                type: :publish,
-                topic: retained_topic,
-                payload: payload,
-                qos: effective_qos,
-                retain: true,
-                dup: false,
-                packet_id: if(effective_qos > 0, do: :rand.uniform(65535), else: nil),
-                properties: %{}
-              }
+            # Check if message has expired
+            expired =
+              case {timestamp, expiry_interval} do
+                {nil, _} -> false
+                {_, nil} -> false
+                {ts, exp} -> now - ts > exp
+              end
 
-              send_packet(state, packet, state.protocol_version)
+            if expired do
+              # Track for later deletion
+              [retained_topic | expired_acc]
+            else
+              # Check if any subscribed topic filter matches this retained topic
+              Enum.each(topics, fn sub ->
+                sub_filter = get_topic_filter(sub)
+
+                if topic_matches?(sub_filter, retained_topic) do
+                  sub_qos = Map.get(sub, :qos, 0)
+                  effective_qos = min(qos, sub_qos)
+
+                  # Calculate remaining expiry for the message
+                  remaining_expiry =
+                    case {timestamp, expiry_interval} do
+                      {nil, _} -> nil
+                      {_, nil} -> nil
+                      {ts, exp} -> max(0, exp - (now - ts))
+                    end
+
+                  properties =
+                    if remaining_expiry,
+                      do: %{message_expiry_interval: remaining_expiry},
+                      else: %{}
+
+                  packet = %{
+                    type: :publish,
+                    topic: retained_topic,
+                    payload: payload,
+                    qos: effective_qos,
+                    retain: true,
+                    dup: false,
+                    packet_id: if(effective_qos > 0, do: :rand.uniform(65535), else: nil),
+                    properties: properties
+                  }
+
+                  send_packet(state, packet, state.protocol_version)
+                end
+              end)
+
+              expired_acc
             end
-          end)
+          end,
+          expired_keys,
+          state.retained_table
+        )
 
-          :ok
-        end,
-        :ok,
-        state.retained_table
-      )
+      # Clean up expired messages
+      Enum.each(expired_keys, fn key -> :ets.delete(state.retained_table, key) end)
     end
 
     # Extract topic filter from subscription

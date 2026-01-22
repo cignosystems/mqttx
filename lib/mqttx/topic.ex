@@ -8,6 +8,11 @@ defmodule MqttX.Topic do
   - `+` - Single-level wildcard (matches exactly one level)
   - `#` - Multi-level wildcard (matches zero or more levels, must be last)
 
+  ## Shared Subscriptions (MQTT 5.0)
+
+  Shared subscriptions use the format `$share/group_name/topic_filter`.
+  Messages are distributed among subscribers in a group using round-robin.
+
   ## Examples
 
       # Validation
@@ -26,6 +31,13 @@ defmodule MqttX.Topic do
 
       iex> MqttX.Topic.matches?(["sensors", :multi_level], ["sensors", "room1", "temp"])
       true
+
+      # Shared subscriptions
+      iex> MqttX.Topic.shared?("$share/group1/sensors/#")
+      true
+
+      iex> MqttX.Topic.parse_shared("$share/group1/sensors/#")
+      {:shared, "group1", "sensors/#"}
   """
 
   @type wildcard :: :single_level | :multi_level
@@ -276,5 +288,55 @@ defmodule MqttX.Topic do
 
   defp valid_topic_chars?(_) do
     false
+  end
+
+  # ============================================================================
+  # Shared Subscriptions (MQTT 5.0)
+  # ============================================================================
+
+  @doc """
+  Check if a topic filter is a shared subscription.
+
+  Shared subscriptions use the format `$share/group_name/topic_filter`.
+
+  ## Examples
+
+      iex> MqttX.Topic.shared?("$share/group1/sensors/#")
+      true
+
+      iex> MqttX.Topic.shared?("sensors/#")
+      false
+  """
+  @spec shared?(binary()) :: boolean()
+  def shared?("$share/" <> _rest), do: true
+  def shared?(_), do: false
+
+  @doc """
+  Parse a shared subscription filter.
+
+  Returns `{:shared, group_name, topic_filter}` for shared subscriptions,
+  or `{:normal, topic_filter}` for regular subscriptions.
+
+  ## Examples
+
+      iex> MqttX.Topic.parse_shared("$share/group1/sensors/#")
+      {:shared, "group1", "sensors/#"}
+
+      iex> MqttX.Topic.parse_shared("sensors/#")
+      {:normal, "sensors/#"}
+  """
+  @spec parse_shared(binary()) :: {:shared, binary(), binary()} | {:normal, binary()}
+  def parse_shared("$share/" <> rest) do
+    case String.split(rest, "/", parts: 2) do
+      [group, topic_filter] when group != "" and topic_filter != "" ->
+        {:shared, group, topic_filter}
+
+      _ ->
+        {:normal, "$share/" <> rest}
+    end
+  end
+
+  def parse_shared(topic) do
+    {:normal, topic}
   end
 end

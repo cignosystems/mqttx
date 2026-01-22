@@ -134,6 +134,31 @@ defmodule MqttX.Server do
   @callback handle_puback(packet_id :: non_neg_integer(), state()) :: {:ok, state()}
 
   @doc """
+  Handle enhanced authentication (MQTT 5.0).
+
+  Called when the server receives an AUTH packet for SASL-style authentication.
+
+  Return values:
+  - `{:ok, state}` - Authentication complete, send CONNACK success
+  - `{:continue, data, state}` - Send AUTH continue with data, wait for response
+  - `{:error, reason_code, state}` - Authentication failed
+
+  ## Example
+
+      def handle_auth("SCRAM-SHA-256", data, state) do
+        case verify_scram(data, state) do
+          {:ok, _} -> {:ok, state}
+          {:continue, challenge} -> {:continue, challenge, state}
+          :error -> {:error, 0x87, state}  # Not authorized
+        end
+      end
+  """
+  @callback handle_auth(method :: binary(), data :: binary() | nil, state()) ::
+              {:ok, state()}
+              | {:continue, binary(), state()}
+              | {:error, reason_code(), state()}
+
+  @doc """
   Handle custom messages (e.g., from PubSub for outgoing MQTT publishes).
 
   Return values:
@@ -148,7 +173,7 @@ defmodule MqttX.Server do
               | {:publish, binary(), binary(), map(), state()}
               | {:stop, term(), state()}
 
-  @optional_callbacks [handle_unsubscribe: 2, handle_puback: 2, handle_info: 2]
+  @optional_callbacks [handle_unsubscribe: 2, handle_puback: 2, handle_info: 2, handle_auth: 3]
 
   @doc """
   Use MqttX.Server to define default implementations.
@@ -172,7 +197,13 @@ defmodule MqttX.Server do
         {:ok, state}
       end
 
-      defoverridable handle_unsubscribe: 2, handle_puback: 2, handle_info: 2
+      @impl true
+      def handle_auth(_method, _data, state) do
+        # Default: enhanced auth not supported
+        {:error, 0x8C, state}
+      end
+
+      defoverridable handle_unsubscribe: 2, handle_puback: 2, handle_info: 2, handle_auth: 3
     end
   end
 

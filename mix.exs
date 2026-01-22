@@ -1,7 +1,7 @@
 defmodule MqttX.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "0.5.0"
   @source_url "https://github.com/cignosystems/mqttx"
 
   def project do
@@ -27,6 +27,9 @@ defmodule MqttX.MixProject do
 
   defp deps do
     [
+      # Telemetry for observability
+      {:telemetry, "~> 1.3"},
+
       # Transport adapters (optional - user picks one or both)
       {:thousand_island, "~> 1.4", optional: true},
       {:ranch, "~> 2.2", optional: true},

@@ -199,6 +199,7 @@ defmodule MqttX.Transport.ThousandIsland do
         packet_id: if(Map.get(opts, :qos, 0) > 0, do: :rand.uniform(65535), else: nil),
         properties: %{}
       }
+
       send_packet(socket, packet, version || 4)
     end
 

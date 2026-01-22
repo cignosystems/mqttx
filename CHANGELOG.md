@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-01-15
+
+### Added
+
+- MQTT vs WebSocket JSON performance comparison in README
+- Comprehensive API reference documentation in README
+- New test files for improved coverage:
+  - `backoff_test.exs` - exponential backoff logic tests
+  - `properties_test.exs` - MQTT 5.0 properties encode/decode tests
+  - `client_test.exs` - client API tests
+  - `server_test.exs` - server behaviour and callback tests
+- MQTT 5.0 packet tests (AUTH, DISCONNECT with reason codes, properties)
+- MQTT 3.1 packet tests
+- Edge case tests (empty payload, large payload, max packet ID, unicode topics)
+
+### Changed
+
+- Updated ThousandIsland dependency to `~> 1.4` (was `~> 1.0`)
+- Updated Ranch dependency to `~> 2.2` (was `~> 2.1`)
+- Updated Protox dependency to `~> 2.0` (was `>= 1.7.0`)
+
+### Fixed
+
+- Formatting issues in `thousand_island.ex`
+- Protobuf payload codec updated for Protox 2.0 API changes (encode returns 3-tuple)
+
 ## [0.2.0] - 2026-01-15
 
 ### Added

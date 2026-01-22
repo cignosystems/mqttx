@@ -378,4 +378,288 @@ defmodule MqttX.Packet.CodecTest do
       assert IO.iodata_to_binary(iodata) == binary
     end
   end
+
+  describe "MQTT 5.0 packets" do
+    test "encodes and decodes CONNECT with properties" do
+      packet = %{
+        type: :connect,
+        protocol_version: 5,
+        client_id: "mqtt5-client",
+        clean_session: true,
+        keep_alive: 60,
+        properties: %{
+          session_expiry_interval: 3600,
+          receive_maximum: 100
+        }
+      }
+
+      {:ok, encoded} = Codec.encode(5, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(5, encoded)
+
+      assert decoded.type == :connect
+      assert decoded.protocol_version == 5
+      assert decoded.properties.session_expiry_interval == 3600
+      assert decoded.properties.receive_maximum == 100
+    end
+
+    test "encodes and decodes CONNACK with properties" do
+      packet = %{
+        type: :connack,
+        session_present: false,
+        reason_code: 0,
+        properties: %{
+          topic_alias_maximum: 10,
+          maximum_packet_size: 65536
+        }
+      }
+
+      {:ok, encoded} = Codec.encode(5, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(5, encoded)
+
+      assert decoded.type == :connack
+      assert decoded.properties.topic_alias_maximum == 10
+      assert decoded.properties.maximum_packet_size == 65536
+    end
+
+    test "encodes and decodes PUBLISH with properties" do
+      packet = %{
+        type: :publish,
+        topic: "test/topic",
+        payload: "hello mqtt5",
+        qos: 1,
+        packet_id: 100,
+        retain: false,
+        dup: false,
+        properties: %{
+          message_expiry_interval: 3600,
+          content_type: "text/plain"
+        }
+      }
+
+      {:ok, encoded} = Codec.encode(5, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(5, encoded)
+
+      assert decoded.type == :publish
+      assert decoded.properties.message_expiry_interval == 3600
+      assert decoded.properties.content_type == "text/plain"
+    end
+
+    test "encodes and decodes AUTH packet" do
+      packet = %{
+        type: :auth,
+        reason_code: 0,
+        properties: %{
+          authentication_method: "SCRAM-SHA-256"
+        }
+      }
+
+      {:ok, encoded} = Codec.encode(5, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(5, encoded)
+
+      assert decoded.type == :auth
+      assert decoded.reason_code == 0
+      assert decoded.properties.authentication_method == "SCRAM-SHA-256"
+    end
+
+    test "encodes and decodes DISCONNECT with reason code" do
+      packet = %{
+        type: :disconnect,
+        reason_code: 0x04,
+        properties: %{
+          reason_string: "Normal disconnect"
+        }
+      }
+
+      {:ok, encoded} = Codec.encode(5, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(5, encoded)
+
+      assert decoded.type == :disconnect
+      assert decoded.reason_code == 0x04
+      assert decoded.properties.reason_string == "Normal disconnect"
+    end
+
+    test "encodes empty AUTH packet" do
+      packet = %{type: :auth}
+
+      {:ok, encoded} = Codec.encode(5, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(5, encoded)
+
+      assert decoded.type == :auth
+      assert decoded.reason_code == 0
+    end
+  end
+
+  describe "MQTT 3.1 packets" do
+    test "encodes and decodes MQTT 3.1 CONNECT" do
+      packet = %{
+        type: :connect,
+        protocol_version: 3,
+        client_id: "mqtt31-client",
+        clean_session: true,
+        keep_alive: 60
+      }
+
+      {:ok, encoded} = Codec.encode(3, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(3, encoded)
+
+      assert decoded.type == :connect
+      assert decoded.protocol_version == 3
+      assert decoded.protocol_name == "MQIsdp"
+    end
+  end
+
+  describe "edge cases" do
+    test "handles empty payload in PUBLISH" do
+      packet = %{
+        type: :publish,
+        topic: "test",
+        payload: "",
+        qos: 0,
+        retain: false
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.payload == ""
+    end
+
+    test "handles large payload in PUBLISH" do
+      large_payload = :crypto.strong_rand_bytes(10_000)
+
+      packet = %{
+        type: :publish,
+        topic: "test",
+        payload: large_payload,
+        qos: 0,
+        retain: false
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.payload == large_payload
+    end
+
+    test "handles maximum packet ID" do
+      packet = %{
+        type: :publish,
+        topic: "test",
+        payload: "test",
+        qos: 1,
+        packet_id: 65535,
+        retain: false
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.packet_id == 65535
+    end
+
+    test "handles QoS 2 PUBLISH" do
+      packet = %{
+        type: :publish,
+        topic: "test",
+        payload: "qos2",
+        qos: 2,
+        packet_id: 1,
+        retain: false
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.qos == 2
+    end
+
+    test "handles PUBREC packet" do
+      packet = %{
+        type: :pubrec,
+        packet_id: 100
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.type == :pubrec
+      assert decoded.packet_id == 100
+    end
+
+    test "handles PUBREL packet" do
+      packet = %{
+        type: :pubrel,
+        packet_id: 100
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.type == :pubrel
+      assert decoded.packet_id == 100
+    end
+
+    test "handles PUBCOMP packet" do
+      packet = %{
+        type: :pubcomp,
+        packet_id: 100
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.type == :pubcomp
+      assert decoded.packet_id == 100
+    end
+
+    test "handles UNSUBACK packet" do
+      packet = %{
+        type: :unsuback,
+        packet_id: 200,
+        acks: [{:ok, :found}, {:ok, :notfound}]
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.type == :unsuback
+      assert decoded.packet_id == 200
+    end
+
+    test "handles unicode topic" do
+      packet = %{
+        type: :publish,
+        topic: "sensors/日本語/温度",
+        payload: "25.5",
+        qos: 0,
+        retain: false
+      }
+
+      {:ok, encoded} = Codec.encode(4, packet)
+      {:ok, {decoded, <<>>}} = Codec.decode(4, encoded)
+
+      assert decoded.topic == ["sensors", "日本語", "温度"]
+    end
+
+    test "returns error for malformed packet" do
+      # Invalid packet type (0 is reserved)
+      assert {:error, :invalid_packet} = Codec.decode(4, <<0x00, 0x00>>)
+    end
+
+    test "handles multiple packets in stream" do
+      ping1 = %{type: :pingreq}
+      ping2 = %{type: :pingresp}
+
+      {:ok, encoded1} = Codec.encode(4, ping1)
+      {:ok, encoded2} = Codec.encode(4, ping2)
+
+      combined = encoded1 <> encoded2
+
+      {:ok, {decoded1, rest}} = Codec.decode(4, combined)
+      assert decoded1.type == :pingreq
+
+      {:ok, {decoded2, <<>>}} = Codec.decode(4, rest)
+      assert decoded2.type == :pingresp
+    end
+  end
 end

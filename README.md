@@ -44,6 +44,19 @@ Sending a sensor reading `{temperature: 25.5, humidity: 60, battery: 85}`:
 
 For fleets of thousands of devices, this translates to significant cost savings on cellular data plans and extended battery life from reduced radio-on time.
 
+### MQTT vs WebSocket (Same JSON Payload)
+
+Even when using JSON for both protocols, MQTT still provides significant overhead savings:
+
+| Metric | WebSocket + JSON | MQTT + JSON | Savings |
+|--------|------------------|-------------|---------|
+| Connection handshake | ~300-500 bytes | ~30-50 bytes | **90%** |
+| Per-message overhead | 6-14 bytes | 2-4 bytes | **70%** |
+| Keep-alive (ping) | ~6 bytes | 2 bytes | **67%** |
+| 52-byte JSON message | 58-66 bytes total | 54-56 bytes total | **15-18%** |
+
+**Key insight**: MQTT's binary protocol has lower framing overhead than WebSocket's text-based frames. For high-frequency IoT messages, this adds up significantly.
+
 ## Why MqttX?
 
 Existing Elixir/Erlang MQTT libraries have limitations:
@@ -74,11 +87,11 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.1.0"},
+    {:mqttx, "~> 0.3.0"},
     # Optional: Pick a transport
-    {:thousand_island, "~> 1.0"},  # or {:ranch, "~> 2.1"}
+    {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: Payload codecs
-    {:protox, "~> 1.7"}
+    {:protox, "~> 2.0"}
   ]
 end
 ```
@@ -275,9 +288,69 @@ The packet codec is optimized for:
 | SUBSCRIBE encode | 3.42M ips | 0.82M ips | **4.2x faster** |
 | PUBLISH decode | 2.36M ips | 2.25M ips | ~same |
 
+## API Reference
+
+### MqttX.Client
+
+| Function | Description |
+|----------|-------------|
+| `connect(opts)` | Connect to an MQTT broker. Options: `:host`, `:port`, `:client_id`, `:username`, `:password`, `:clean_session`, `:keepalive`, `:handler`, `:handler_state` |
+| `publish(client, topic, payload, opts \\ [])` | Publish a message. Options: `:qos` (0-2), `:retain` (boolean) |
+| `subscribe(client, topics, opts \\ [])` | Subscribe to topics. Options: `:qos` (0-2) |
+| `unsubscribe(client, topics)` | Unsubscribe from topics |
+| `disconnect(client)` | Disconnect from the broker |
+| `connected?(client)` | Check if client is connected |
+
+### MqttX.Server
+
+| Function | Description |
+|----------|-------------|
+| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:name` |
+
+**Callbacks:**
+
+| Callback | Description |
+|----------|-------------|
+| `init(opts)` | Initialize handler state |
+| `handle_connect(client_id, credentials, state)` | Handle client connection. Return `{:ok, state}` or `{:error, reason_code, state}` |
+| `handle_publish(topic, payload, opts, state)` | Handle incoming PUBLISH. Return `{:ok, state}` |
+| `handle_subscribe(topics, state)` | Handle SUBSCRIBE. Return `{:ok, granted_qos_list, state}` |
+| `handle_unsubscribe(topics, state)` | Handle UNSUBSCRIBE. Return `{:ok, state}` |
+| `handle_disconnect(reason, state)` | Handle client disconnection. Return `:ok` |
+| `handle_info(message, state)` | Handle custom messages. Return `{:ok, state}`, `{:publish, topic, payload, state}`, or `{:stop, reason, state}` |
+
+### MqttX.Packet.Codec
+
+| Function | Description |
+|----------|-------------|
+| `encode(version, packet)` | Encode a packet to binary. Returns `{:ok, binary}` |
+| `decode(version, binary)` | Decode a packet from binary. Returns `{:ok, {packet, rest}}` or `{:error, reason}` |
+| `encode_iodata(version, packet)` | Encode to iodata (more efficient). Returns `{:ok, iodata}` |
+
+### MqttX.Server.Router
+
+| Function | Description |
+|----------|-------------|
+| `new()` | Create a new empty router |
+| `subscribe(router, filter, client, opts)` | Add a subscription. Options: `:qos` |
+| `unsubscribe(router, filter, client)` | Remove a subscription |
+| `unsubscribe_all(router, client)` | Remove all subscriptions for a client |
+| `match(router, topic)` | Find matching subscriptions. Returns `[{client, opts}]` |
+
+### MqttX.Topic
+
+| Function | Description |
+|----------|-------------|
+| `validate(topic)` | Validate and normalize a topic. Returns `{:ok, normalized}` or `{:error, :invalid_topic}` |
+| `validate_publish(topic)` | Validate topic for publishing (no wildcards) |
+| `matches?(filter, topic)` | Check if a filter matches a topic |
+| `normalize(topic)` | Normalize topic to list format |
+| `flatten(normalized)` | Convert normalized topic back to binary string |
+| `wildcard?(topic)` | Check if topic contains wildcards |
+
 ## Roadmap
 
-### v0.3.0 - Core Functionality
+### v0.4.0 - Core Functionality
 
 | Feature | Description | Priority |
 |---------|-------------|----------|
@@ -288,7 +361,7 @@ The packet codec is optimized for:
 | **Retained Messages** | Server doesn't store or deliver retained messages | Medium |
 | **Will Message Delivery** | Server receives will but doesn't publish on ungraceful disconnect | Medium |
 
-### v0.4.0 - MQTT 5.0 Advanced Features
+### v0.5.0 - MQTT 5.0 Advanced Features
 
 | Feature | Description |
 |---------|-------------|
@@ -299,7 +372,7 @@ The packet codec is optimized for:
 | **Enhanced Auth** | Complete AUTH packet exchange flow |
 | **Request/Response** | Response topic and correlation data handling |
 
-### v0.5.0 - Production Readiness
+### v0.6.0 - Production Readiness
 
 | Feature | Description |
 |---------|-------------|

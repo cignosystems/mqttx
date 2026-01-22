@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-01-15
+
+### Added
+
+- **TLS/SSL Client Support**: Optional TLS via `:transport` option (`:tcp` or `:ssl`)
+  - `:ssl_opts` for SSL configuration (verify, cacerts, etc.)
+  - Default port 8883 for SSL connections
+- **QoS 2 Complete Flow**: Full PUBREC/PUBREL/PUBCOMP handshake implementation
+  - Client tracks outgoing QoS 2 messages through all phases
+  - Client handles incoming QoS 2 messages correctly
+- **Message Inflight Tracking**: Timer-based retry for unacknowledged QoS 1/2 messages
+  - Configurable `:retry_interval` option (default: 5000ms)
+  - Automatic retry with `dup: true` flag
+  - Max 3 retries before dropping message
+- **Retained Messages**: Server stores and delivers retained messages
+  - ETS-based storage per server instance
+  - Delivered to new subscribers on SUBSCRIBE
+  - Empty payload clears retained message
+- **Will Message Delivery**: Server publishes will message on ungraceful disconnect
+  - Stored from CONNECT packet
+  - Published when connection closes without DISCONNECT
+  - Supports retained will messages
+- **Session Persistence**: Configurable session storage for `clean_session: false`
+  - `MqttX.Session.Store` behaviour for custom implementations
+  - `MqttX.Session.ETSStore` built-in in-memory store
+  - Saves/restores subscriptions, pending messages, packet IDs
+
+### Changed
+
+- Client connection state now tracks subscriptions for session persistence
+- Transport adapters create ETS tables for retained messages
+
 ## [0.3.0] - 2026-01-15
 
 ### Added

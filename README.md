@@ -87,7 +87,7 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.3.0"},
+    {:mqttx, "~> 0.4.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: Payload codecs
@@ -151,7 +151,7 @@ Start the server:
 ### MQTT Client
 
 ```elixir
-# Connect
+# Connect with TCP (default)
 {:ok, client} = MqttX.Client.connect(
   host: "localhost",
   port: 1883,
@@ -168,6 +168,35 @@ Start the server:
 
 # Disconnect
 :ok = MqttX.Client.disconnect(client)
+```
+
+### TLS/SSL Connection
+
+```elixir
+# Connect with TLS
+{:ok, client} = MqttX.Client.connect(
+  host: "broker.example.com",
+  port: 8883,                    # default SSL port
+  client_id: "secure_client",
+  transport: :ssl,
+  ssl_opts: [
+    verify: :verify_peer,
+    cacerts: :public_key.cacerts_get(),
+    server_name_indication: ~c"broker.example.com"
+  ]
+)
+```
+
+### Session Persistence
+
+```elixir
+# Enable session persistence for QoS 1/2 message reliability
+{:ok, client} = MqttX.Client.connect(
+  host: "localhost",
+  client_id: "persistent_client",
+  clean_session: false,          # maintain session across reconnects
+  session_store: MqttX.Session.ETSStore  # built-in ETS store
+)
 ```
 
 ### Packet Codec (Standalone)
@@ -294,12 +323,30 @@ The packet codec is optimized for:
 
 | Function | Description |
 |----------|-------------|
-| `connect(opts)` | Connect to an MQTT broker. Options: `:host`, `:port`, `:client_id`, `:username`, `:password`, `:clean_session`, `:keepalive`, `:handler`, `:handler_state` |
+| `connect(opts)` | Connect to an MQTT broker |
 | `publish(client, topic, payload, opts \\ [])` | Publish a message. Options: `:qos` (0-2), `:retain` (boolean) |
 | `subscribe(client, topics, opts \\ [])` | Subscribe to topics. Options: `:qos` (0-2) |
 | `unsubscribe(client, topics)` | Unsubscribe from topics |
 | `disconnect(client)` | Disconnect from the broker |
 | `connected?(client)` | Check if client is connected |
+
+**Connect Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `:host` | Broker hostname (required) | - |
+| `:port` | Broker port | 1883 (TCP), 8883 (SSL) |
+| `:client_id` | Client identifier (required) | - |
+| `:username` | Authentication username | `nil` |
+| `:password` | Authentication password | `nil` |
+| `:clean_session` | Start fresh session | `true` |
+| `:keepalive` | Keep-alive interval (seconds) | 60 |
+| `:transport` | `:tcp` or `:ssl` | `:tcp` |
+| `:ssl_opts` | SSL options for `:ssl` transport | `[]` |
+| `:retry_interval` | QoS retry interval (ms) | 5000 |
+| `:session_store` | Session store module | `nil` |
+| `:handler` | Callback module for messages | `nil` |
+| `:handler_state` | Initial handler state | `nil` |
 
 ### MqttX.Server
 
@@ -349,17 +396,6 @@ The packet codec is optimized for:
 | `wildcard?(topic)` | Check if topic contains wildcards |
 
 ## Roadmap
-
-### v0.4.0 - Core Functionality
-
-| Feature | Description | Priority |
-|---------|-------------|----------|
-| **TLS/SSL Client Support** | Client only supports TCP, no `:ssl` option | High |
-| **QoS 2 Complete Flow** | Client doesn't implement PUBREC/PUBREL/PUBCOMP exchange | High |
-| **Message Inflight Tracking** | No retry mechanism for unacknowledged QoS 1/2 messages | High |
-| **Session Persistence** | `clean_session=false` sessions aren't stored/restored | Medium |
-| **Retained Messages** | Server doesn't store or deliver retained messages | Medium |
-| **Will Message Delivery** | Server receives will but doesn't publish on ungraceful disconnect | Medium |
 
 ### v0.5.0 - MQTT 5.0 Advanced Features
 

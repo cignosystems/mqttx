@@ -30,6 +30,60 @@ defmodule MqttX.ClientTest do
       assert is_pid(pid)
       GenServer.stop(pid, :normal, 100)
     end
+
+    test "accepts transport :tcp option" do
+      {:ok, pid} = Client.connect(host: "localhost", client_id: "test", transport: :tcp)
+      assert is_pid(pid)
+      GenServer.stop(pid, :normal, 100)
+    end
+
+    test "accepts transport :ssl option with ssl_opts" do
+      {:ok, pid} =
+        Client.connect(
+          host: "localhost",
+          client_id: "test",
+          transport: :ssl,
+          ssl_opts: [verify: :verify_none]
+        )
+
+      assert is_pid(pid)
+      GenServer.stop(pid, :normal, 100)
+    end
+
+    test "uses default port 8883 for SSL transport" do
+      # When transport is :ssl and no port specified, defaults to 8883
+      {:ok, pid} =
+        Client.connect(
+          host: "localhost",
+          client_id: "test",
+          transport: :ssl,
+          ssl_opts: []
+        )
+
+      assert is_pid(pid)
+      GenServer.stop(pid, :normal, 100)
+    end
+
+    test "accepts retry_interval option" do
+      {:ok, pid} =
+        Client.connect(host: "localhost", client_id: "test", retry_interval: 10_000)
+
+      assert is_pid(pid)
+      GenServer.stop(pid, :normal, 100)
+    end
+
+    test "accepts session_store option" do
+      {:ok, pid} =
+        Client.connect(
+          host: "localhost",
+          client_id: "test",
+          clean_session: false,
+          session_store: MqttX.Session.ETSStore
+        )
+
+      assert is_pid(pid)
+      GenServer.stop(pid, :normal, 100)
+    end
   end
 
   describe "connected?/1" do

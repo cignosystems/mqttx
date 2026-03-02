@@ -1,7 +1,7 @@
 defmodule MqttX.MixProject do
   use Mix.Project
 
-  @version "0.5.0"
+  @version "0.6.0"
   @source_url "https://github.com/cignosystems/mqttx"
 
   def project do
@@ -14,7 +14,7 @@ defmodule MqttX.MixProject do
       package: package(),
       docs: docs(),
       name: "MqttX",
-      description: "Pure Elixir MQTT 3.1.1/5.0 library - codec, server, and client"
+      description: "Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package"
     ]
   end
 
@@ -51,7 +51,7 @@ defmodule MqttX.MixProject do
         "GitHub" => @source_url,
         "Changelog" => "https://hexdocs.pm/mqttx/changelog.html"
       },
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
+      files: ~w(lib assets guides .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
     ]
   end
 
@@ -59,10 +59,41 @@ defmodule MqttX.MixProject do
     [
       main: "readme",
       name: "MqttX",
+      logo: "assets/mqttx.png",
       source_ref: "v#{@version}",
       canonical: "https://hexdocs.pm/mqttx",
       source_url: @source_url,
-      extras: ["README.md", "CHANGELOG.md"]
+      extras: [
+        "README.md",
+        "CHANGELOG.md",
+        "guides/getting-started.md",
+        "guides/client.md",
+        "guides/server.md",
+        "guides/codec.md",
+        "guides/telemetry.md",
+        "guides/performance.md"
+      ],
+      groups_for_extras: [
+        Guides: [
+          "guides/getting-started.md",
+          "guides/client.md",
+          "guides/server.md",
+          "guides/codec.md",
+          "guides/telemetry.md",
+          "guides/performance.md"
+        ]
+      ],
+      before_closing_head_tag: &before_closing_head_tag/1
     ]
   end
+
+  defp before_closing_head_tag(:html) do
+    """
+    <style>
+      .sidebar-projectImage img { max-height: 80px; }
+    </style>
+    """
+  end
+
+  defp before_closing_head_tag(_), do: ""
 end

@@ -7,7 +7,9 @@ defmodule MqttX.Application do
   def start(_type, _args) do
     children = [
       # Registry for client connections (used by server)
-      {Registry, keys: :unique, name: MqttX.ClientRegistry}
+      {Registry, keys: :unique, name: MqttX.ClientRegistry},
+      # DynamicSupervisor for managed client connections
+      MqttX.Client.Supervisor
     ]
 
     opts = [strategy: :one_for_one, name: MqttX.Supervisor]

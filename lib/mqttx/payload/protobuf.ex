@@ -24,10 +24,13 @@ defmodule MqttX.Payload.Protobuf do
   @impl true
   def encode(struct) when is_struct(struct) do
     if Code.ensure_loaded?(Protox) do
-      case Protox.encode(struct) do
-        # Protox 2.0 returns {ok, iodata, size}
-        {:ok, iodata, _size} -> {:ok, IO.iodata_to_binary(iodata)}
-        {:error, reason} -> {:error, {:protobuf_encode_error, reason}}
+      try do
+        case Protox.encode(struct) do
+          {:ok, iodata, _size} -> {:ok, IO.iodata_to_binary(iodata)}
+          {:error, reason} -> {:error, {:protobuf_encode_error, reason}}
+        end
+      rescue
+        e -> {:error, {:protobuf_encode_error, e}}
       end
     else
       {:error, :protox_not_available}
@@ -36,8 +39,12 @@ defmodule MqttX.Payload.Protobuf do
 
   def encode({module, data}) when is_atom(module) and is_map(data) do
     if Code.ensure_loaded?(Protox) do
-      struct = struct(module, data)
-      encode(struct)
+      if Code.ensure_loaded?(module) and function_exported?(module, :__struct__, 0) do
+        struct = struct(module, data)
+        encode(struct)
+      else
+        {:error, {:unknown_message_module, module}}
+      end
     else
       {:error, :protox_not_available}
     end
@@ -78,10 +85,13 @@ defmodule MqttX.Payload.Protobuf do
   @spec encode_iodata(struct()) :: {:ok, iodata()} | {:error, term()}
   def encode_iodata(struct) when is_struct(struct) do
     if Code.ensure_loaded?(Protox) do
-      case Protox.encode(struct) do
-        # Protox 2.0 returns {ok, iodata, size}
-        {:ok, iodata, _size} -> {:ok, iodata}
-        {:error, reason} -> {:error, {:protobuf_encode_error, reason}}
+      try do
+        case Protox.encode(struct) do
+          {:ok, iodata, _size} -> {:ok, iodata}
+          {:error, reason} -> {:error, {:protobuf_encode_error, reason}}
+        end
+      rescue
+        e -> {:error, {:protobuf_encode_error, e}}
       end
     else
       {:error, :protox_not_available}

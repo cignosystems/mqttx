@@ -189,7 +189,14 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_retain_available, bool_byte(val)>>]
   end
 
-  # User properties - key is binary
+  # User properties - stored as {:user_properties, [{key, val}, ...]}
+  defp encode_property({:user_properties, pairs}) when is_list(pairs) do
+    Enum.map(pairs, fn {key, val} ->
+      [<<@prop_user_property>>, encode_utf8(key), encode_utf8(val)]
+    end)
+  end
+
+  # Legacy: user properties as binary key (backward compatibility)
   defp encode_property({key, val}) when is_binary(key) and is_binary(val) do
     [<<@prop_user_property>>, encode_utf8(key), encode_utf8(val)]
   end
@@ -339,7 +346,9 @@ defmodule MqttX.Packet.Properties do
   defp decode_properties(<<@prop_user_property, rest::binary>>, props) do
     with {:ok, key, rest2} <- decode_utf8(rest),
          {:ok, val, rest3} <- decode_utf8(rest2) do
-      decode_properties(rest3, Map.put(props, key, val))
+      # User properties accumulate into a list (MQTT 5.0 allows repeated keys)
+      existing = Map.get(props, :user_properties, [])
+      decode_properties(rest3, Map.put(props, :user_properties, existing ++ [{key, val}]))
     end
   end
 

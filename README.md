@@ -1,10 +1,16 @@
+<p align="center">
+  <img src="assets/mqttx.png" alt="MqttX" width="600">
+</p>
+
+<p align="center">
+  <a href="https://hex.pm/packages/mqttx"><img src="https://img.shields.io/hexpm/v/mqttx.svg" alt="Hex.pm"></a>
+  <a href="https://hexdocs.pm/mqttx"><img src="https://img.shields.io/badge/docs-hexdocs-blue.svg" alt="Docs"></a>
+  <a href="https://github.com/cignosystems/mqttx/actions/workflows/ci.yml"><img src="https://github.com/cignosystems/mqttx/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
 # MqttX
 
-[![Hex.pm](https://img.shields.io/hexpm/v/mqttx.svg)](https://hex.pm/packages/mqttx)
-[![Docs](https://img.shields.io/badge/docs-hexdocs-blue.svg)](https://hexdocs.pm/mqttx)
-[![CI](https://github.com/cignosystems/mqttx/actions/workflows/ci.yml/badge.svg)](https://github.com/cignosystems/mqttx/actions/workflows/ci.yml)
-
-A pure Elixir MQTT 3.1.1/5.0 library featuring:
+Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package.
 
 - 🚀 High-performance packet codec
 - 🖥️ Transport-agnostic server/broker
@@ -87,7 +93,7 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.5.0"},
+    {:mqttx, "~> 0.6.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: Payload codecs
@@ -302,20 +308,32 @@ All 15 packet types are supported:
 
 ## Performance
 
-The packet codec is optimized for:
+Designed to scale to **10k-100k+ concurrent devices** on a single BEAM node. Each connection is a lightweight Erlang process (~2-5KB), and the hot paths are optimized for high message throughput:
 
-- Zero-copy binary references (sub-binaries)
-- Unrolled remaining length decode for common cases
-- Returns iodata for encoding (avoids concatenation)
-- Inline functions for hot paths
+- **Trie-based topic router**: O(L+K) matching where L = topic depth, K = matching subscriptions — independent of total subscription count
+- **iodata encoding**: Socket sends use iodata directly, avoiding binary copies on every packet
+- **Zero-copy binary references**: Decoder returns sub-binaries for payload and topic
+- **Empty-buffer fast path**: Skips binary concatenation when the TCP buffer is empty (common case)
+- **Cached callback dispatch**: `function_exported?` computed once at connection init, not per message
+- **Direct inflight counter**: O(1) flow control check instead of scanning pending_acks
+- **ETS-optimized retained delivery**: O(1) lookup for exact topic subscriptions
 
-**Benchmarks vs mqtt_packet_map** (Apple M4 Pro):
+| Metric | Conservative | Optimistic |
+|--------|-------------|------------|
+| Concurrent connections | 50,000 | 200,000 |
+| Messages/second (QoS 0) | 100,000 | 500,000+ |
+| Messages/second (QoS 1) | 50,000 | 200,000 |
+| Memory per connection | ~2-5 KB | ~2-5 KB |
+
+**Codec benchmarks vs mqtt_packet_map** (Apple M4 Pro):
 
 | Operation | MqttX | mqtt_packet_map | Result |
 |-----------|-------|-----------------|--------|
 | PUBLISH encode | 5.05M ips | 1.72M ips | **2.9x faster** |
 | SUBSCRIBE encode | 3.42M ips | 0.82M ips | **4.2x faster** |
 | PUBLISH decode | 2.36M ips | 2.25M ips | ~same |
+
+See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS tuning, and deployment recommendations.
 
 ## API Reference
 
@@ -324,6 +342,9 @@ The packet codec is optimized for:
 | Function | Description |
 |----------|-------------|
 | `connect(opts)` | Connect to an MQTT broker |
+| `connect_supervised(opts)` | Connect under `MqttX.Client.Supervisor` with crash recovery |
+| `list()` | List all registered client connections |
+| `whereis(client_id)` | Look up a connection by client_id |
 | `publish(client, topic, payload, opts \\ [])` | Publish a message. Options: `:qos` (0-2), `:retain` (boolean) |
 | `subscribe(client, topics, opts \\ [])` | Subscribe to topics. Options: `:qos` (0-2) |
 | `unsubscribe(client, topics)` | Unsubscribe from topics |
@@ -352,7 +373,7 @@ The packet codec is optimized for:
 
 | Function | Description |
 |----------|-------------|
-| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:name` |
+| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:name`, `:rate_limit` |
 
 **Callbacks:**
 
@@ -397,22 +418,18 @@ The packet codec is optimized for:
 
 ## Roadmap
 
-### v0.6.0 - Production Readiness
+### Next Up
 
 | Feature | Description |
 |---------|-------------|
-| **WebSocket Transport** | For browser-based MQTT clients |
-| **Clustering** | Distributed router across Erlang nodes |
-| **Connection Supervision** | `DynamicSupervisor` for client connections |
-| **Rate Limiting** | Connection and message rate limits |
+| **WebSocket Transport** | MQTT over WebSocket for browser-based clients |
 
-### Future Improvements
+### Future
 
-| Item | Description |
-|------|-------------|
-| **Trie-based Router** | O(topic_depth) matching instead of O(n) list scan |
-| **Property-based Tests** | StreamData for fuzzing packet codec |
-| **Integration Tests** | Test against Mosquitto, EMQX, HiveMQ |
+| Feature | Description |
+|---------|-------------|
+| **Clustering** | Distributed router across Erlang nodes via `pg` |
+| **Property-based Tests** | StreamData for fuzzing the packet codec |
 
 ## License
 

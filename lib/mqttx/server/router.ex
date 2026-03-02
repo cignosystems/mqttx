@@ -2,8 +2,10 @@ defmodule MqttX.Server.Router do
   @moduledoc """
   Topic router for MQTT servers.
 
-  The router maintains a subscription table and provides efficient
-  topic matching for message routing.
+  The router maintains a trie-based subscription table and provides efficient
+  topic matching for message routing. Matching is O(L + K) where L is the
+  topic depth and K is the number of matching subscriptions, compared to
+  the previous O(N) linear scan across all subscriptions.
 
   ## Usage
 
@@ -43,12 +45,20 @@ defmodule MqttX.Server.Router do
         }
 
   @type t :: %__MODULE__{
-          subscriptions: [subscription()],
-          by_client: %{term() => [subscription()]},
-          shared_groups: %{binary() => shared_group()}
+          trie: map(),
+          by_client: %{
+            term() => [
+              {:normal, Topic.normalized_topic()} | {:shared, binary(), Topic.normalized_topic()}
+            ]
+          },
+          shared_groups: %{binary() => shared_group()},
+          count: non_neg_integer()
         }
 
-  defstruct subscriptions: [], by_client: %{}, shared_groups: %{}
+  defstruct trie: %{children: %{}, subscribers: %{}},
+            by_client: %{},
+            shared_groups: %{},
+            count: 0
 
   @doc """
   Create a new empty router.
@@ -93,22 +103,16 @@ defmodule MqttX.Server.Router do
     normalized = normalize_filter(filter)
     qos = Keyword.get(opts, :qos, 0)
     extra_opts = Keyword.drop(opts, [:qos])
+    client_opts = Map.put(Map.new(extra_opts), :qos, qos)
 
-    sub = %{
-      filter: normalized,
-      client: client,
-      qos: qos,
-      opts: Map.new(extra_opts)
-    }
+    # Insert into trie
+    trie = trie_insert(router.trie, normalized, client, client_opts)
 
-    # Add to main list
-    subscriptions = [sub | router.subscriptions]
+    # Track in by_client index
+    client_entries = Map.get(router.by_client, client, [])
+    by_client = Map.put(router.by_client, client, [{:normal, normalized} | client_entries])
 
-    # Add to client index
-    client_subs = Map.get(router.by_client, client, [])
-    by_client = Map.put(router.by_client, client, [sub | client_subs])
-
-    %{router | subscriptions: subscriptions, by_client: by_client}
+    %{router | trie: trie, by_client: by_client, count: router.count + 1}
   end
 
   defp subscribe_shared(router, group, topic_filter, client, opts) do
@@ -133,16 +137,9 @@ defmodule MqttX.Server.Router do
         end
       )
 
-    # Also track in by_client for cleanup
-    sub = %{
-      filter: normalized,
-      client: client,
-      qos: qos,
-      opts: Map.put(Map.new(extra_opts), :shared_group, group)
-    }
-
-    client_subs = Map.get(router.by_client, client, [])
-    by_client = Map.put(router.by_client, client, [sub | client_subs])
+    # Track in by_client index
+    client_entries = Map.get(router.by_client, client, [])
+    by_client = Map.put(router.by_client, client, [{:shared, group, normalized} | client_entries])
 
     %{router | shared_groups: shared_groups, by_client: by_client}
   end
@@ -168,28 +165,24 @@ defmodule MqttX.Server.Router do
   defp unsubscribe_normal(router, filter, client) do
     normalized = normalize_filter(filter)
 
-    # Remove from main list
-    subscriptions =
-      Enum.reject(router.subscriptions, fn sub ->
-        sub.client == client and sub.filter == normalized
-      end)
+    # Remove from trie
+    {trie, removed} = trie_remove(router.trie, normalized, client)
 
-    # Update client index
-    client_subs = Map.get(router.by_client, client, [])
+    # Update by_client index
+    client_entries = Map.get(router.by_client, client, [])
 
-    new_client_subs =
-      Enum.reject(client_subs, fn sub ->
-        sub.filter == normalized and not Map.has_key?(sub.opts, :shared_group)
-      end)
+    new_client_entries =
+      List.delete(client_entries, {:normal, normalized})
 
     by_client =
-      if new_client_subs == [] do
+      if new_client_entries == [] do
         Map.delete(router.by_client, client)
       else
-        Map.put(router.by_client, client, new_client_subs)
+        Map.put(router.by_client, client, new_client_entries)
       end
 
-    %{router | subscriptions: subscriptions, by_client: by_client}
+    count_delta = if removed, do: 1, else: 0
+    %{router | trie: trie, by_client: by_client, count: max(0, router.count - count_delta)}
   end
 
   defp unsubscribe_shared(router, group, topic_filter, client) do
@@ -211,19 +204,17 @@ defmodule MqttX.Server.Router do
           end
       end
 
-    # Update client index
-    client_subs = Map.get(router.by_client, client, [])
+    # Update by_client index
+    client_entries = Map.get(router.by_client, client, [])
 
-    new_client_subs =
-      Enum.reject(client_subs, fn sub ->
-        sub.filter == normalized and Map.get(sub.opts, :shared_group) == group
-      end)
+    new_client_entries =
+      List.delete(client_entries, {:shared, group, normalized})
 
     by_client =
-      if new_client_subs == [] do
+      if new_client_entries == [] do
         Map.delete(router.by_client, client)
       else
-        Map.put(router.by_client, client, new_client_subs)
+        Map.put(router.by_client, client, new_client_entries)
       end
 
     %{router | shared_groups: shared_groups, by_client: by_client}
@@ -234,24 +225,44 @@ defmodule MqttX.Server.Router do
   """
   @spec unsubscribe_all(t(), term()) :: t()
   def unsubscribe_all(router, client) do
-    subscriptions =
-      Enum.reject(router.subscriptions, fn sub ->
-        sub.client == client
-      end)
+    client_entries = Map.get(router.by_client, client, [])
 
-    # Remove client from all shared groups
-    shared_groups =
-      router.shared_groups
-      |> Enum.map(fn {group, data} ->
-        new_members = Enum.reject(data.members, fn {c, _} -> c == client end)
-        {group, %{data | members: new_members}}
+    # Remove each subscription from its respective structure
+    {trie, count_removed, shared_groups} =
+      Enum.reduce(client_entries, {router.trie, 0, router.shared_groups}, fn
+        {:normal, filter}, {trie_acc, removed, sg_acc} ->
+          {new_trie, did_remove} = trie_remove(trie_acc, filter, client)
+          delta = if did_remove, do: 1, else: 0
+          {new_trie, removed + delta, sg_acc}
+
+        {:shared, group, _filter}, {trie_acc, removed, sg_acc} ->
+          new_sg =
+            case Map.get(sg_acc, group) do
+              nil ->
+                sg_acc
+
+              group_data ->
+                new_members = Enum.reject(group_data.members, fn {c, _} -> c == client end)
+
+                if new_members == [] do
+                  Map.delete(sg_acc, group)
+                else
+                  Map.put(sg_acc, group, %{group_data | members: new_members})
+                end
+            end
+
+          {trie_acc, removed, new_sg}
       end)
-      |> Enum.reject(fn {_group, data} -> data.members == [] end)
-      |> Map.new()
 
     by_client = Map.delete(router.by_client, client)
 
-    %{router | subscriptions: subscriptions, shared_groups: shared_groups, by_client: by_client}
+    %{
+      router
+      | trie: trie,
+        by_client: by_client,
+        shared_groups: shared_groups,
+        count: max(0, router.count - count_removed)
+    }
   end
 
   @doc """
@@ -265,11 +276,9 @@ defmodule MqttX.Server.Router do
   def match(router, topic) do
     normalized = normalize_topic(topic)
 
-    # Get regular subscription matches
+    # Get regular subscription matches via trie traversal
     regular_matches =
-      router.subscriptions
-      |> Enum.filter(fn sub -> Topic.matches?(sub.filter, normalized) end)
-      |> Enum.map(fn sub -> {sub.client, Map.put(sub.opts, :qos, sub.qos)} end)
+      trie_match(router.trie, normalized)
       |> Enum.uniq_by(fn {client, _opts} -> client end)
 
     # Get shared subscription matches (one per group, round-robin)
@@ -277,10 +286,8 @@ defmodule MqttX.Server.Router do
       router.shared_groups
       |> Enum.filter(fn {_group, data} -> Topic.matches?(data.filter, normalized) end)
       |> Enum.map(fn {_group, data} ->
-        # Select client using round-robin
         index = rem(data.index, length(data.members))
-        {client, opts} = Enum.at(data.members, index)
-        {client, opts}
+        Enum.at(data.members, index)
       end)
 
     # Combine, avoiding duplicates (regular takes priority)
@@ -304,11 +311,9 @@ defmodule MqttX.Server.Router do
   def match_and_advance(router, topic) do
     normalized = normalize_topic(topic)
 
-    # Get regular subscription matches
+    # Get regular subscription matches via trie traversal
     regular_matches =
-      router.subscriptions
-      |> Enum.filter(fn sub -> Topic.matches?(sub.filter, normalized) end)
-      |> Enum.map(fn sub -> {sub.client, Map.put(sub.opts, :qos, sub.qos)} end)
+      trie_match(router.trie, normalized)
       |> Enum.uniq_by(fn {client, _opts} -> client end)
 
     # Get shared subscription matches and advance indices
@@ -343,7 +348,33 @@ defmodule MqttX.Server.Router do
   """
   @spec subscriptions_for(t(), term()) :: [subscription()]
   def subscriptions_for(router, client) do
-    Map.get(router.by_client, client, [])
+    router.by_client
+    |> Map.get(client, [])
+    |> Enum.map(fn
+      {:normal, filter} ->
+        # Look up the subscriber opts from the trie
+        opts = trie_get_subscriber(router.trie, filter, client)
+        qos = Map.get(opts, :qos, 0)
+        %{filter: filter, client: client, qos: qos, opts: Map.delete(opts, :qos)}
+
+      {:shared, group, filter} ->
+        # Look up from shared_groups
+        case Map.get(router.shared_groups, group) do
+          %{members: members} ->
+            {_, member_opts} = Enum.find(members, {client, %{}}, fn {c, _} -> c == client end)
+            qos = Map.get(member_opts, :qos, 0)
+
+            %{
+              filter: filter,
+              client: client,
+              qos: qos,
+              opts: Map.put(Map.delete(member_opts, :qos), :shared_group, group)
+            }
+
+          nil ->
+            %{filter: filter, client: client, qos: 0, opts: %{shared_group: group}}
+        end
+    end)
   end
 
   @doc """
@@ -351,7 +382,7 @@ defmodule MqttX.Server.Router do
   """
   @spec count(t()) :: non_neg_integer()
   def count(router) do
-    length(router.subscriptions)
+    router.count
   end
 
   @doc """
@@ -361,6 +392,116 @@ defmodule MqttX.Server.Router do
   def client_count(router) do
     map_size(router.by_client)
   end
+
+  # ============================================================================
+  # TRIE OPERATIONS
+  # ============================================================================
+
+  # Insert a client subscription at the trie node reached by walking the filter segments
+  defp trie_insert(node, [], client, opts) do
+    subscribers = Map.put(node.subscribers, client, opts)
+    %{node | subscribers: subscribers}
+  end
+
+  defp trie_insert(node, [segment | rest], client, opts) do
+    key = segment_key(segment)
+    child = Map.get(node.children, key, %{children: %{}, subscribers: %{}})
+    updated_child = trie_insert(child, rest, client, opts)
+    %{node | children: Map.put(node.children, key, updated_child)}
+  end
+
+  # Remove a client from the trie node at the given filter path.
+  # Returns {updated_node, removed?} and prunes empty nodes on the way back up.
+  defp trie_remove(node, [], client) do
+    if Map.has_key?(node.subscribers, client) do
+      subscribers = Map.delete(node.subscribers, client)
+      {%{node | subscribers: subscribers}, true}
+    else
+      {node, false}
+    end
+  end
+
+  defp trie_remove(node, [segment | rest], client) do
+    key = segment_key(segment)
+
+    case Map.get(node.children, key) do
+      nil ->
+        {node, false}
+
+      child ->
+        {updated_child, removed} = trie_remove(child, rest, client)
+
+        # Prune empty nodes
+        children =
+          if updated_child.subscribers == %{} and updated_child.children == %{} do
+            Map.delete(node.children, key)
+          else
+            Map.put(node.children, key, updated_child)
+          end
+
+        {%{node | children: children}, removed}
+    end
+  end
+
+  # Match a topic against the trie, collecting all matching subscribers.
+  # For each segment, we branch into: exact match, :single_level, and :multi_level.
+  defp trie_match(node, []) do
+    # Exact end of topic - collect subscribers here
+    subscribers = Map.to_list(node.subscribers)
+
+    # Also check for multi-level wildcard at this position
+    multi_subs =
+      case Map.get(node.children, :multi_level) do
+        nil -> []
+        multi_node -> Map.to_list(multi_node.subscribers)
+      end
+
+    subscribers ++ multi_subs
+  end
+
+  defp trie_match(node, [segment | rest]) do
+    # 1. Exact segment match
+    exact_matches =
+      case Map.get(node.children, segment) do
+        nil -> []
+        child -> trie_match(child, rest)
+      end
+
+    # 2. Single-level wildcard (+) match
+    single_matches =
+      case Map.get(node.children, :single_level) do
+        nil -> []
+        child -> trie_match(child, rest)
+      end
+
+    # 3. Multi-level wildcard (#) match - matches everything from here
+    multi_matches =
+      case Map.get(node.children, :multi_level) do
+        nil -> []
+        child -> Map.to_list(child.subscribers)
+      end
+
+    exact_matches ++ single_matches ++ multi_matches
+  end
+
+  # Look up a specific client's opts at a trie path
+  defp trie_get_subscriber(node, [], client) do
+    Map.get(node.subscribers, client, %{})
+  end
+
+  defp trie_get_subscriber(node, [segment | rest], client) do
+    key = segment_key(segment)
+
+    case Map.get(node.children, key) do
+      nil -> %{}
+      child -> trie_get_subscriber(child, rest, client)
+    end
+  end
+
+  # Convert a normalized filter segment to a trie key
+  defp segment_key(:single_level), do: :single_level
+  defp segment_key(:multi_level), do: :multi_level
+  defp segment_key(segment), do: segment
 
   # Normalize filter (can be string or list)
   defp normalize_filter(filter) when is_binary(filter) do

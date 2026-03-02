@@ -106,7 +106,10 @@ defmodule MqttX.Server do
   Called when a client publishes a message.
   """
   @callback handle_publish(topic(), payload(), publish_opts(), state()) ::
-              {:ok, state()} | {:error, term(), state()}
+              {:ok, state()}
+              | {:error, term(), state()}
+              | {:disconnect, reason_code(), state()}
+              | {:disconnect, reason_code(), map(), state()}
 
   @doc """
   Handle a SUBSCRIBE request.
@@ -115,6 +118,8 @@ defmodule MqttX.Server do
   """
   @callback handle_subscribe([subscribe_topic()], state()) ::
               {:ok, [0 | 1 | 2], state()}
+              | {:disconnect, reason_code(), state()}
+              | {:disconnect, reason_code(), map(), state()}
 
   @doc """
   Handle client disconnection.
@@ -126,7 +131,10 @@ defmodule MqttX.Server do
   @doc """
   Handle an UNSUBSCRIBE request.
   """
-  @callback handle_unsubscribe([topic()], state()) :: {:ok, state()}
+  @callback handle_unsubscribe([topic()], state()) ::
+              {:ok, state()}
+              | {:disconnect, reason_code(), state()}
+              | {:disconnect, reason_code(), map(), state()}
 
   @doc """
   Handle a PUBACK for QoS 1 messages.
@@ -165,15 +173,33 @@ defmodule MqttX.Server do
   - `{:ok, state}` - Continue with updated state
   - `{:publish, topic, payload, state}` - Send PUBLISH to client, then continue
   - `{:publish, topic, payload, opts, state}` - Send PUBLISH with QoS/retain options
+  - `{:disconnect, reason_code, state}` - Send DISCONNECT and close connection
+  - `{:disconnect, reason_code, properties, state}` - Send DISCONNECT with properties and close
   - `{:stop, reason, state}` - Close the connection
   """
   @callback handle_info(message :: term(), state()) ::
               {:ok, state()}
               | {:publish, binary(), binary(), state()}
               | {:publish, binary(), binary(), map(), state()}
+              | {:disconnect, reason_code(), state()}
+              | {:disconnect, reason_code(), map(), state()}
               | {:stop, term(), state()}
 
-  @optional_callbacks [handle_unsubscribe: 2, handle_puback: 2, handle_info: 2, handle_auth: 3]
+  @doc """
+  Handle session expiry (MQTT 5.0).
+
+  Called when a client's session expires after `session_expiry_interval` seconds
+  post-disconnect. Use this to clean up session state (subscriptions, queued messages, etc.).
+  """
+  @callback handle_session_expired(client_id(), state()) :: :ok
+
+  @optional_callbacks [
+    handle_unsubscribe: 2,
+    handle_puback: 2,
+    handle_info: 2,
+    handle_auth: 3,
+    handle_session_expired: 2
+  ]
 
   @doc """
   Use MqttX.Server to define default implementations.
@@ -203,8 +229,34 @@ defmodule MqttX.Server do
         {:error, 0x8C, state}
       end
 
-      defoverridable handle_unsubscribe: 2, handle_puback: 2, handle_info: 2, handle_auth: 3
+      @impl true
+      def handle_session_expired(_client_id, _state) do
+        :ok
+      end
+
+      defoverridable handle_unsubscribe: 2,
+                     handle_puback: 2,
+                     handle_info: 2,
+                     handle_auth: 3,
+                     handle_session_expired: 2
     end
+  end
+
+  @doc """
+  Disconnect a client from the server with an MQTT 5.0 reason code.
+
+  Sends a DISCONNECT packet to the client and closes the connection.
+  The `pid` is the transport process handling the client connection.
+
+  ## Example
+
+      MqttX.Server.disconnect(client_pid, 0x98)  # Use assigned client identifier
+      MqttX.Server.disconnect(client_pid, 0x89, %{reason_string: "Session taken over"})
+  """
+  @spec disconnect(pid(), reason_code(), map()) :: :ok
+  def disconnect(pid, reason_code, properties \\ %{}) do
+    send(pid, {:server_disconnect, reason_code, properties})
+    :ok
   end
 
   @doc """

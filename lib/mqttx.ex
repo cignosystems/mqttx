@@ -1,8 +1,8 @@
 defmodule MqttX do
   @moduledoc """
-  MqttX - Pure Elixir MQTT 3.1.1/5.0 Library
+  MqttX — Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package.
 
-  A comprehensive MQTT library featuring:
+  Key features:
   - High-performance packet codec
   - Transport-agnostic server/broker
   - Modern client with automatic reconnection
@@ -85,5 +85,5 @@ defmodule MqttX do
   Returns the library version.
   """
   @spec version :: String.t()
-  def version, do: "0.5.0"
+  def version, do: "0.6.0"
 end

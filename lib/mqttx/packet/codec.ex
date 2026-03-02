@@ -112,16 +112,15 @@ defmodule MqttX.Packet.Codec do
            pass_flag::1, will_retain::1, will_qos::2, will_flag::1, clean::1, _reserved::1,
            keepalive::16-big, rest::binary>>
        ) do
-    case validate_protocol(proto, protocol_level) do
-      {:ok, protocol_version} ->
-        {:ok, props, rest2} = Properties.decode(protocol_version, rest)
-        {client_id, rest3} = decode_utf8(rest2)
+    with {:ok, protocol_version} <- validate_protocol(proto, protocol_level),
+         {:ok, props, rest2} <- Properties.decode(protocol_version, rest) do
+      {client_id, rest3} = decode_utf8(rest2)
 
-        {:ok, will_props, rest4} =
-          if will_flag == 1,
-            do: Properties.decode(protocol_version, rest3),
-            else: {:ok, %{}, rest3}
-
+      with {:ok, will_props, rest4} <-
+             if(will_flag == 1,
+               do: Properties.decode(protocol_version, rest3),
+               else: {:ok, %{}, rest3}
+             ) do
         {will_topic, rest5} = decode_utf8_optional(rest4, will_flag)
         {will_payload, rest6} = decode_binary_optional(rest5, will_flag)
         {username, rest7} = decode_utf8_optional(rest6, user_flag)
@@ -153,9 +152,7 @@ defmodule MqttX.Packet.Codec do
            password: password,
            will: will
          }}
-
-      {:error, _} = err ->
-        err
+      end
     end
   end
 
@@ -166,15 +163,15 @@ defmodule MqttX.Packet.Codec do
          0,
          <<_reserved::7, session_present::1, reason_code::8, rest::binary>>
        ) do
-    {:ok, props, <<>>} = Properties.decode(version, rest)
-
-    {:ok,
-     %{
-       type: :connack,
-       session_present: session_present == 1,
-       reason_code: reason_code,
-       properties: props
-     }}
+    with {:ok, props, <<>>} <- Properties.decode(version, rest) do
+      {:ok,
+       %{
+         type: :connack,
+         session_present: session_present == 1,
+         reason_code: reason_code,
+         properties: props
+       }}
+    end
   end
 
   # PUBLISH
@@ -198,118 +195,108 @@ defmodule MqttX.Packet.Codec do
           {pid, r}
       end
 
-    {:ok, props, payload} = Properties.decode(version, rest2)
-
-    case Topic.validate_publish(topic) do
-      {:ok, normalized_topic} ->
-        {:ok,
-         %{
-           type: :publish,
-           dup: dup,
-           qos: qos,
-           retain: retain,
-           topic: normalized_topic,
-           packet_id: packet_id,
-           properties: props,
-           payload: payload
-         }}
-
-      {:error, _} ->
-        {:error, :invalid_topic}
+    with {:ok, props, payload} <- Properties.decode(version, rest2),
+         {:ok, normalized_topic} <- Topic.validate_publish(topic) do
+      {:ok,
+       %{
+         type: :publish,
+         dup: dup,
+         qos: qos,
+         retain: retain,
+         topic: normalized_topic,
+         packet_id: packet_id,
+         properties: props,
+         payload: payload
+       }}
+    else
+      {:error, :invalid_topic} -> {:error, :invalid_topic}
+      {:error, _} = err -> err
     end
   end
 
   # PUBACK, PUBREC, PUBCOMP
   defp decode_packet(version, type, 0, <<packet_id::16-big, rest::binary>>)
        when type in [@puback, @pubrec, @pubcomp] do
-    {reason_code, props} = decode_ack_payload(version, rest)
-
-    {:ok,
-     %{
-       type: type_to_atom(type),
-       packet_id: packet_id,
-       reason_code: reason_code,
-       properties: props
-     }}
+    with {:ok, reason_code, props} <- decode_ack_payload(version, rest) do
+      {:ok,
+       %{
+         type: type_to_atom(type),
+         packet_id: packet_id,
+         reason_code: reason_code,
+         properties: props
+       }}
+    end
   end
 
   # PUBREL (has fixed flags 0010)
   defp decode_packet(version, @pubrel, 2, <<packet_id::16-big, rest::binary>>) do
-    {reason_code, props} = decode_ack_payload(version, rest)
-
-    {:ok,
-     %{
-       type: :pubrel,
-       packet_id: packet_id,
-       reason_code: reason_code,
-       properties: props
-     }}
+    with {:ok, reason_code, props} <- decode_ack_payload(version, rest) do
+      {:ok,
+       %{
+         type: :pubrel,
+         packet_id: packet_id,
+         reason_code: reason_code,
+         properties: props
+       }}
+    end
   end
 
   # SUBSCRIBE
   defp decode_packet(version, @subscribe, 2, <<packet_id::16-big, rest::binary>>) do
-    {:ok, props, topics_bin} = Properties.decode(version, rest)
-
-    case decode_subscribe_topics(topics_bin, []) do
-      {:ok, topics} ->
-        {:ok,
-         %{
-           type: :subscribe,
-           packet_id: packet_id,
-           properties: props,
-           topics: topics
-         }}
-
-      {:error, _} = err ->
-        err
+    with {:ok, props, topics_bin} <- Properties.decode(version, rest),
+         {:ok, topics} <- decode_subscribe_topics(topics_bin, []) do
+      {:ok,
+       %{
+         type: :subscribe,
+         packet_id: packet_id,
+         properties: props,
+         topics: topics
+       }}
     end
   end
 
   # SUBACK
   defp decode_packet(version, @suback, 0, <<packet_id::16-big, rest::binary>>) do
-    {:ok, props, acks_bin} = Properties.decode(version, rest)
-    acks = decode_suback_acks(acks_bin, [])
+    with {:ok, props, acks_bin} <- Properties.decode(version, rest) do
+      acks = decode_suback_acks(acks_bin, [])
 
-    {:ok,
-     %{
-       type: :suback,
-       packet_id: packet_id,
-       properties: props,
-       acks: acks
-     }}
+      {:ok,
+       %{
+         type: :suback,
+         packet_id: packet_id,
+         properties: props,
+         acks: acks
+       }}
+    end
   end
 
   # UNSUBSCRIBE
   defp decode_packet(version, @unsubscribe, 2, <<packet_id::16-big, rest::binary>>) do
-    {:ok, props, topics_bin} = Properties.decode(version, rest)
-
-    case decode_unsubscribe_topics(topics_bin, []) do
-      {:ok, topics} ->
-        {:ok,
-         %{
-           type: :unsubscribe,
-           packet_id: packet_id,
-           properties: props,
-           topics: topics
-         }}
-
-      {:error, _} = err ->
-        err
+    with {:ok, props, topics_bin} <- Properties.decode(version, rest),
+         {:ok, topics} <- decode_unsubscribe_topics(topics_bin, []) do
+      {:ok,
+       %{
+         type: :unsubscribe,
+         packet_id: packet_id,
+         properties: props,
+         topics: topics
+       }}
     end
   end
 
   # UNSUBACK
   defp decode_packet(version, @unsuback, 0, <<packet_id::16-big, rest::binary>>) do
-    {:ok, props, acks_bin} = Properties.decode(version, rest)
-    acks = decode_unsuback_acks(acks_bin, [])
+    with {:ok, props, acks_bin} <- Properties.decode(version, rest) do
+      acks = decode_unsuback_acks(acks_bin, [])
 
-    {:ok,
-     %{
-       type: :unsuback,
-       packet_id: packet_id,
-       properties: props,
-       acks: acks
-     }}
+      {:ok,
+       %{
+         type: :unsuback,
+         packet_id: packet_id,
+         properties: props,
+         acks: acks
+       }}
+    end
   end
 
   # PINGREQ
@@ -328,14 +315,14 @@ defmodule MqttX.Packet.Codec do
   end
 
   defp decode_packet(version, @disconnect, 0, <<reason_code::8, rest::binary>>) do
-    {:ok, props, <<>>} = Properties.decode(version, rest)
-
-    {:ok,
-     %{
-       type: :disconnect,
-       reason_code: reason_code,
-       properties: props
-     }}
+    with {:ok, props, <<>>} <- Properties.decode(version, rest) do
+      {:ok,
+       %{
+         type: :disconnect,
+         reason_code: reason_code,
+         properties: props
+       }}
+    end
   end
 
   # AUTH (MQTT 5.0 only)
@@ -344,14 +331,14 @@ defmodule MqttX.Packet.Codec do
   end
 
   defp decode_packet(5, @auth, 0, <<reason_code::8, rest::binary>>) do
-    {:ok, props, <<>>} = Properties.decode(5, rest)
-
-    {:ok,
-     %{
-       type: :auth,
-       reason_code: reason_code,
-       properties: props
-     }}
+    with {:ok, props, <<>>} <- Properties.decode(5, rest) do
+      {:ok,
+       %{
+         type: :auth,
+         reason_code: reason_code,
+         properties: props
+       }}
+    end
   end
 
   # Invalid packet
@@ -665,16 +652,18 @@ defmodule MqttX.Packet.Codec do
 
   # ACK payload handling (for MQTT 5.0)
   defp decode_ack_payload(5, <<>>) do
-    {0, %{}}
+    {:ok, 0, %{}}
   end
 
   defp decode_ack_payload(5, <<reason_code::8, rest::binary>>) do
-    {:ok, props, <<>>} = Properties.decode(5, rest)
-    {reason_code, props}
+    case Properties.decode(5, rest) do
+      {:ok, props, <<>>} -> {:ok, reason_code, props}
+      {:error, _} = err -> err
+    end
   end
 
   defp decode_ack_payload(_version, <<>>) do
-    {0, %{}}
+    {:ok, 0, %{}}
   end
 
   defp encode_ack_response(5, packet_id, reason_code, props)

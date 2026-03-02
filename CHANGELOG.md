@@ -2,6 +2,61 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-02-22
+
+### Added
+
+- **Connection Supervision**: `MqttX.Client.Supervisor` DynamicSupervisor for managed client connections
+  - `MqttX.Client.connect_supervised/1` starts connections under the supervisor with automatic crash recovery
+  - `MqttX.Client.list/0` lists all registered connections via `MqttX.ClientRegistry`
+  - `MqttX.Client.whereis/1` looks up connections by client_id
+  - Connections auto-register in `MqttX.ClientRegistry` on init
+- **Rate Limiting**: Per-client connection and message rate limiting for MQTT servers
+  - `MqttX.Server.RateLimiter` module with ETS-based atomic counters
+  - Connection rate limiting (configurable max connections per interval)
+  - Per-client message rate limiting (configurable max messages per client per interval)
+  - MQTT 5.0 reason code `0x96` (message_rate_too_high) sent for rate-limited QoS 1+ publishes
+  - Integrated into both ThousandIsland and Ranch transport adapters
+  - Configured via `:rate_limit` option in `MqttX.Server.start_link/3`
+- **Capacity Planning guide**: Device-per-vCPU sizing tables for IoT workloads (sleepy sensors through real-time streaming), instance sizing recommendations
+- **Performance & Scaling guide**: Architecture decisions, trie router internals, VM/OS tuning, and deployment guidelines
+- **Project Branding**: MqttX logo in README and hexdocs
+- **EMQX interop test suite**: 49 tests against live EMQX broker covering MQTT 5.0 features
+- **Server Keepalive Timeout**: Disconnects clients that stop sending packets within 1.5x `keep_alive` seconds (MQTT spec compliance)
+  - Automatic timer start after CONNACK, reset on every received packet
+  - Will message published on keepalive timeout (ungraceful disconnect)
+- **Will Delay Interval** (MQTT 5.0): Delays will message publication by `will_delay_interval` seconds after ungraceful disconnect
+  - `will_delay_interval: 0` (or MQTT 3.1.1) publishes immediately (backward compatible)
+  - Will properties forwarded to handler
+- **Session Expiry Timer** (MQTT 5.0): Fires `handle_session_expired/2` callback after `session_expiry_interval` seconds post-disconnect
+  - `0` = expire immediately, `0xFFFFFFFF` = never expire
+  - New optional `handle_session_expired/2` callback in `MqttX.Server` behaviour
+- **Server-Initiated Disconnect**: Kick clients with MQTT 5.0 reason codes
+  - `MqttX.Server.disconnect/3` sends DISCONNECT and closes connection
+  - `{:disconnect, reason_code, state}` return type from `handle_publish`, `handle_subscribe`, `handle_unsubscribe`, `handle_info`
+  - Ranch transport now properly forwards `handle_info` messages to handler (was silently dropping them)
+
+### Changed
+
+- **Trie-based Topic Router**: Replaced O(N) linear scan with a trie data structure for O(L+K) topic matching — independent of total subscription count. Same public API.
+- **iodata Encoding**: Socket sends use `Codec.encode_iodata/2` in all transports, avoiding binary copies on every packet
+- **Empty-buffer fast path**: Skips binary concatenation when the TCP buffer is empty (common case)
+- **Cached callback dispatch**: `function_exported?` computed once at connection init, not per message
+- **Direct inflight counter**: O(1) flow control check instead of scanning pending_acks
+- **Retained message delivery**: Exact topic subscriptions use O(1) ETS lookup instead of full table scan
+
+### Fixed
+
+- **Handler state lost on callbacks**: `notify_handler` now correctly returns updated handler state (was silently discarding it)
+- **Missing retries field in pending_acks**: QoS 1/2 pending_acks entries now include `retries: 0` (prevented retry tracking)
+- **Session not saved on socket close**: Session data now persists on unexpected TCP close/error, not just clean disconnect
+- **Queued messages not delivered on reconnect**: Buffer is now processed after CONNACK for persistent sessions
+- **Protobuf codec crash on non-protobuf structs**: Now returns `{:error, {:protobuf_encode_error, _}}` instead of raising
+- **Protobuf codec crash on unknown module**: Now returns `{:error, {:unknown_message_module, module}}` instead of raising
+- Removed dead outgoing topic alias code (`topic_to_alias`, `next_alias`) that was never functional
+- `MqttX.version/0` now returns correct version string
+- Guides now included in hex.pm docs
+
 ## [0.5.0] - 2026-01-15
 
 ### Added

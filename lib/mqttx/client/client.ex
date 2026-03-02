@@ -54,6 +54,62 @@ defmodule MqttX.Client do
   alias MqttX.Client.Connection
 
   @doc """
+  Connect to an MQTT broker with supervision.
+
+  Starts the connection under `MqttX.Client.Supervisor`, providing
+  automatic restart on crash. The connection is registered in
+  `MqttX.ClientRegistry` for lookup by `client_id`.
+
+  Accepts the same options as `connect/1`.
+
+  ## Example
+
+      {:ok, pid} = MqttX.Client.connect_supervised(
+        host: "localhost",
+        port: 1883,
+        client_id: "my_client"
+      )
+  """
+  @spec connect_supervised(keyword()) :: {:ok, pid()} | {:error, term()}
+  def connect_supervised(opts) do
+    MqttX.Client.Supervisor.start_child(opts)
+  end
+
+  @doc """
+  List all registered client connections.
+
+  Returns a list of `{client_id, pid, metadata}` tuples for all connections
+  registered in `MqttX.ClientRegistry`.
+
+  ## Example
+
+      MqttX.Client.list()
+      #=> [{"my_client", #PID<0.123.0>, %{host: "localhost", port: 1883}}]
+  """
+  @spec list() :: [{binary(), pid(), map()}]
+  def list do
+    Registry.select(MqttX.ClientRegistry, [{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}])
+  end
+
+  @doc """
+  Look up a client connection by its `client_id`.
+
+  Returns `{pid, metadata}` if found, or `nil` if not registered.
+
+  ## Example
+
+      MqttX.Client.whereis("my_client")
+      #=> {#PID<0.123.0>, %{host: "localhost", port: 1883}}
+  """
+  @spec whereis(binary()) :: {pid(), map()} | nil
+  def whereis(client_id) do
+    case Registry.lookup(MqttX.ClientRegistry, client_id) do
+      [{pid, meta}] -> {pid, meta}
+      [] -> nil
+    end
+  end
+
+  @doc """
   Connect to an MQTT broker.
 
   ## Options
@@ -128,46 +184,54 @@ defmodule MqttX.Client do
   end
 
   @doc """
-  Make a request and wait for a response (MQTT 5.0 Request/Response pattern).
+  Set up an MQTT 5.0 Request/Response exchange.
 
-  This is a convenience function for the MQTT 5.0 request/response pattern.
-  It publishes a message with `response_topic` and `correlation_data` properties,
-  subscribes to the response topic, and waits for a matching response.
+  Subscribes to the `response_topic`, then publishes a message with
+  `response_topic` and `correlation_data` properties set. Returns the
+  generated `correlation_data` so the caller can match incoming responses
+  in their handler.
+
+  This is a setup helper, not a blocking RPC call. Use `handle_mqtt_event/3`
+  in your handler to match responses by `correlation_data`.
 
   ## Options
 
   - `:response_topic` - Topic to receive the response on (required)
-  - `:timeout` - Timeout in milliseconds (default: 5000)
   - `:qos` - QoS level for both request and subscription (default: 0)
 
   ## Returns
 
-  - `{:ok, response_payload}` - Response received
-  - `{:error, :timeout}` - No response within timeout
-  - `{:error, reason}` - Other errors
+  - `{:ok, correlation_data}` - Request sent, use this to match the response
+  - `{:error, reason}` - Subscribe or publish failed
 
   ## Example
 
-      {:ok, response} = MqttX.Client.request(
+      {:ok, correlation_data} = MqttX.Client.request(
         client,
         "api/users/get",
         Jason.encode!(%{id: 123}),
         response_topic: "api/responses/" <> client_id
       )
+
+      # In your handler:
+      def handle_mqtt_event(:message, {_topic, payload, packet}, state) do
+        if packet.properties[:correlation_data] == state.pending_correlation do
+          # This is the response
+        end
+        state
+      end
   """
   @spec request(pid(), binary(), binary(), keyword()) :: {:ok, binary()} | {:error, term()}
   def request(client, topic, payload, opts) do
     response_topic = Keyword.fetch!(opts, :response_topic)
-    _timeout = Keyword.get(opts, :timeout, 5000)
     qos = Keyword.get(opts, :qos, 0)
 
-    # Generate unique correlation data
+    # Generate unique correlation data for matching responses
     correlation_data = :crypto.strong_rand_bytes(16)
 
-    # Subscribe to response topic
+    # Subscribe to response topic, then publish the request
     case subscribe(client, response_topic, qos: qos) do
       :ok ->
-        # Publish request with properties
         publish_opts = [
           qos: qos,
           properties: %{
@@ -177,14 +241,8 @@ defmodule MqttX.Client do
         ]
 
         case publish(client, topic, payload, publish_opts) do
-          :ok ->
-            # Wait for response (caller must set up handler to receive it)
-            # For a complete implementation, we'd need GenServer-based response tracking
-            # For now, return guidance
-            {:ok, correlation_data}
-
-          error ->
-            error
+          :ok -> {:ok, correlation_data}
+          error -> error
         end
 
       error ->

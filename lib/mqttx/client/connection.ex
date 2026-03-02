@@ -44,6 +44,7 @@ defmodule MqttX.Client.Connection do
   @default_ssl_port 8883
   @default_keepalive 60
   @default_retry_interval 5000
+  @default_max_inflight 100
   @max_retries 3
   @connect_timeout 5000
 
@@ -72,15 +73,20 @@ defmodule MqttX.Client.Connection do
     :topic_alias_maximum,
     # Flow control (MQTT 5.0)
     :receive_maximum,
+    # Local cap on pending QoS 1/2 messages (prevents unbounded memory growth)
+    :max_inflight,
+    # Will message (Last Will & Testament)
+    :will,
+    # CONNECT properties (MQTT 5.0: session_expiry_interval, topic_alias_maximum, etc.)
+    connect_properties: %{},
     transport: :tcp,
     retry_interval: @default_retry_interval,
     connected: false,
     clean_session: true,
-    # Outgoing topic aliases (topic -> alias)
-    topic_to_alias: %{},
-    # Incoming topic aliases (alias -> topic)
+    # Incoming topic aliases (alias -> topic, MQTT 5.0)
     alias_to_topic: %{},
-    next_alias: 1
+    handler_has_handle_mqtt_event: false,
+    inflight_tx_count: 0
   ]
 
   @type t :: %__MODULE__{}
@@ -106,6 +112,13 @@ defmodule MqttX.Client.Connection do
   - `:transport` - Transport type: `:tcp` or `:ssl` (default: `:tcp`)
   - `:ssl_opts` - SSL options when transport is `:ssl` (e.g., `[verify: :verify_peer]`)
   - `:retry_interval` - Retry interval for unacknowledged QoS 1/2 messages in ms (default: 5000)
+  - `:max_inflight` - Maximum pending QoS 1/2 messages before backpressure (default: 100)
+  - `:will_topic` - Will message topic (enables Last Will & Testament)
+  - `:will_payload` - Will message payload (default: `""`)
+  - `:will_qos` - Will message QoS: 0, 1, or 2 (default: 0)
+  - `:will_retain` - Will message retain flag (default: false)
+  - `:will_properties` - Will message properties map (MQTT 5.0, default: `%{}`)
+  - `:connect_properties` - CONNECT packet properties (MQTT 5.0), e.g. `%{session_expiry_interval: 3600}`
   - `:session_store` - Session store module or `{module, opts}` for session persistence
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -132,6 +145,10 @@ defmodule MqttX.Client.Connection do
   ## Options
 
   - `:qos` - QoS level 0, 1, or 2 (default: 0)
+  - `:no_local` - Don't receive own publishes (MQTT 5.0, default: false)
+  - `:retain_as_published` - Keep original retain flag (MQTT 5.0, default: false)
+  - `:retain_handling` - Retained message behavior: 0=send on subscribe, 1=send if new, 2=don't send (MQTT 5.0, default: 0)
+  - `:properties` - SUBSCRIBE packet properties map (MQTT 5.0), e.g. `%{subscription_identifier: 1}`
   """
   @spec subscribe(GenServer.server(), binary() | [binary()], keyword()) :: :ok | {:error, term()}
   def subscribe(pid, topics, opts \\ []) do
@@ -186,6 +203,8 @@ defmodule MqttX.Client.Connection do
         {1, %{}, []}
       end
 
+    handler = Keyword.get(opts, :handler)
+
     state = %__MODULE__{
       host: Keyword.fetch!(opts, :host),
       port: Keyword.get(opts, :port, default_port),
@@ -194,7 +213,7 @@ defmodule MqttX.Client.Connection do
       password: Keyword.get(opts, :password),
       clean_session: clean_session,
       keepalive: Keyword.get(opts, :keepalive, @default_keepalive),
-      handler: Keyword.get(opts, :handler),
+      handler: handler,
       handler_state: Keyword.get(opts, :handler_state),
       protocol_version: Keyword.get(opts, :protocol_version, 4),
       transport: transport,
@@ -206,8 +225,16 @@ defmodule MqttX.Client.Connection do
       backoff: Backoff.new(),
       packet_id: packet_id,
       buffer: <<>>,
-      pending_acks: pending_acks
+      pending_acks: pending_acks,
+      max_inflight: Keyword.get(opts, :max_inflight, @default_max_inflight),
+      will: build_will(opts),
+      connect_properties: Keyword.get(opts, :connect_properties, %{}),
+      handler_has_handle_mqtt_event:
+        if(handler, do: function_exported?(handler, :handle_mqtt_event, 3), else: false)
     }
+
+    # Register with ClientRegistry for lookup by client_id
+    Registry.register(MqttX.ClientRegistry, client_id, %{host: state.host, port: state.port})
 
     # Attempt initial connection
     send(self(), :connect)
@@ -269,10 +296,11 @@ defmodule MqttX.Client.Connection do
                       phase: :puback_pending,
                       packet: packet,
                       timestamp: System.monotonic_time(:millisecond),
-                      telemetry_meta: telemetry_meta
+                      telemetry_meta: telemetry_meta,
+                      retries: 0
                     })
 
-                  %{state | pending_acks: pending}
+                  %{state | pending_acks: pending, inflight_tx_count: state.inflight_tx_count + 1}
 
                 2 ->
                   # QoS 2: waiting for PUBREC
@@ -281,10 +309,11 @@ defmodule MqttX.Client.Connection do
                       phase: :pubrec_pending,
                       packet: packet,
                       timestamp: System.monotonic_time(:millisecond),
-                      telemetry_meta: telemetry_meta
+                      telemetry_meta: telemetry_meta,
+                      retries: 0
                     })
 
-                  %{state | pending_acks: pending}
+                  %{state | pending_acks: pending, inflight_tx_count: state.inflight_tx_count + 1}
               end
 
             {:reply, :ok, state}
@@ -301,14 +330,29 @@ defmodule MqttX.Client.Connection do
   def handle_call({:subscribe, topics, opts}, _from, state) do
     if state.connected do
       qos = Keyword.get(opts, :qos, 0)
+      no_local = Keyword.get(opts, :no_local, false)
+      retain_as_published = Keyword.get(opts, :retain_as_published, false)
+      retain_handling = Keyword.get(opts, :retain_handling, 0)
       {packet_id, state} = next_packet_id(state)
 
-      topic_list = Enum.map(topics, fn t -> %{topic: t, qos: qos} end)
+      topic_list =
+        Enum.map(topics, fn t ->
+          %{
+            topic: t,
+            qos: qos,
+            no_local: no_local,
+            retain_as_published: retain_as_published,
+            retain_handling: retain_handling
+          }
+        end)
+
+      subscribe_props = Keyword.get(opts, :properties, %{})
 
       packet = %{
         type: :subscribe,
         packet_id: packet_id,
-        topics: topic_list
+        topics: topic_list,
+        properties: subscribe_props
       }
 
       # Emit telemetry for subscribe
@@ -373,6 +417,9 @@ defmodule MqttX.Client.Connection do
         duration = System.monotonic_time() - start_time
         Telemetry.client_connect_stop(duration, metadata)
         state = %{state | backoff: Backoff.reset(state.backoff)}
+
+        # Process any data that arrived after CONNACK (e.g. queued messages for persistent sessions)
+        state = if state.buffer != <<>>, do: process_buffer(state), else: state
         {:noreply, state}
 
       {:error, reason} ->
@@ -412,7 +459,13 @@ defmodule MqttX.Client.Connection do
   # Handle incoming data from both TCP and SSL sockets
   def handle_info({proto, socket, data}, %{socket: socket} = state)
       when proto in [:tcp, :ssl] do
-    state = %{state | buffer: state.buffer <> data}
+    buffer =
+      case state.buffer do
+        <<>> -> data
+        buf -> buf <> data
+      end
+
+    state = %{state | buffer: buffer}
     state = process_buffer(state)
     set_socket_active(state)
     {:noreply, state}
@@ -422,10 +475,11 @@ defmodule MqttX.Client.Connection do
   def handle_info({closed, socket}, %{socket: socket} = state)
       when closed in [:tcp_closed, :ssl_closed] do
     Logger.info("[MqttX.Client] Connection closed")
+    save_session(state)
     state = %{state | connected: false, socket: nil}
     cancel_keepalive(state)
     cancel_retry_timer(state)
-    notify_handler(state, :disconnected, :closed)
+    state = notify_handler(state, :disconnected, :closed)
     schedule_reconnect(state)
     {:noreply, state}
   end
@@ -434,10 +488,11 @@ defmodule MqttX.Client.Connection do
   def handle_info({error, socket, reason}, %{socket: socket} = state)
       when error in [:tcp_error, :ssl_error] do
     Logger.warning("[MqttX.Client] Socket error: #{inspect(reason)}")
+    save_session(state)
     state = %{state | connected: false, socket: nil}
     cancel_keepalive(state)
     cancel_retry_timer(state)
-    notify_handler(state, :disconnected, {:error, reason})
+    state = notify_handler(state, :disconnected, {:error, reason})
     schedule_reconnect(state)
     {:noreply, state}
   end
@@ -485,7 +540,9 @@ defmodule MqttX.Client.Connection do
       clean_session: state.clean_session,
       keep_alive: state.keepalive,
       username: state.username,
-      password: state.password
+      password: state.password,
+      will: state.will,
+      properties: state.connect_properties
     }
 
     case send_packet(state, packet) do
@@ -519,7 +576,7 @@ defmodule MqttX.Client.Connection do
                 receive_maximum: receive_max
             }
 
-            notify_handler(state, :connected, nil)
+            state = notify_handler(state, :connected, %{properties: props})
             {:ok, state}
 
           {:ok, {%{type: :connack, reason_code: code}, _rest}} ->
@@ -576,13 +633,13 @@ defmodule MqttX.Client.Connection do
       0 ->
         # QoS 0: deliver immediately, no acknowledgment
         emit_message_telemetry.()
-        notify_handler(state, :message, {topic, packet.payload, packet})
+        state = notify_handler(state, :message, {topic, packet.payload, packet})
         state
 
       1 ->
         # QoS 1: deliver and send PUBACK
         emit_message_telemetry.()
-        notify_handler(state, :message, {topic, packet.payload, packet})
+        state = notify_handler(state, :message, {topic, packet.payload, packet})
         send_packet(state, %{type: :puback, packet_id: packet.packet_id})
         state
 
@@ -613,7 +670,7 @@ defmodule MqttX.Client.Connection do
     end
 
     pending = Map.delete(state.pending_acks, {:tx, packet.packet_id})
-    %{state | pending_acks: pending}
+    %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
   end
 
   # QoS 2 - received PUBREC for our outgoing PUBLISH
@@ -648,11 +705,12 @@ defmodule MqttX.Client.Connection do
         })
 
         # Now deliver the message to handler and send PUBCOMP
-        notify_handler(
-          state,
-          :message,
-          {publish_packet.topic, publish_packet.payload, publish_packet}
-        )
+        state =
+          notify_handler(
+            state,
+            :message,
+            {publish_packet.topic, publish_packet.payload, publish_packet}
+          )
 
         send_packet(state, %{type: :pubcomp, packet_id: packet.packet_id})
         pending = Map.delete(state.pending_acks, {:rx, packet.packet_id})
@@ -677,7 +735,7 @@ defmodule MqttX.Client.Connection do
     end
 
     pending = Map.delete(state.pending_acks, {:tx, packet.packet_id})
-    %{state | pending_acks: pending}
+    %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
   end
 
   defp handle_packet(%{type: :suback}, state) do
@@ -697,7 +755,7 @@ defmodule MqttX.Client.Connection do
   end
 
   defp send_packet(state, packet) do
-    case Codec.encode(state.protocol_version, packet) do
+    case Codec.encode_iodata(state.protocol_version, packet) do
       {:ok, data} ->
         socket_send(state, data)
 
@@ -742,10 +800,10 @@ defmodule MqttX.Client.Connection do
   defp retry_expired_messages(state) do
     now = System.monotonic_time(:millisecond)
 
-    {to_retry, _to_remove, pending} =
-      Enum.reduce(state.pending_acks, {[], [], state.pending_acks}, fn
+    {to_retry, dropped_count, pending} =
+      Enum.reduce(state.pending_acks, {[], 0, state.pending_acks}, fn
         {{:tx, packet_id} = key, %{packet: packet, timestamp: ts, retries: retries} = entry},
-        {retry, remove, acc} ->
+        {retry, dropped, acc} ->
           age = now - ts
 
           cond do
@@ -755,18 +813,18 @@ defmodule MqttX.Client.Connection do
                 "[MqttX.Client] Dropping packet #{packet_id} after #{retries} retries"
               )
 
-              {retry, [key | remove], Map.delete(acc, key)}
+              {retry, dropped + 1, Map.delete(acc, key)}
 
             # Message expired - retry it
             age > state.retry_interval ->
               updated_entry = %{entry | timestamp: now, retries: retries + 1}
 
-              {[{packet_id, packet, entry.phase} | retry], remove,
+              {[{packet_id, packet, entry.phase} | retry], dropped,
                Map.put(acc, key, updated_entry)}
 
             # Message not expired yet
             true ->
-              {retry, remove, acc}
+              {retry, dropped, acc}
           end
 
         # Skip received messages (rx) - they don't need retry
@@ -779,7 +837,11 @@ defmodule MqttX.Client.Connection do
       resend_packet(state, packet_id, packet, phase)
     end)
 
-    %{state | pending_acks: pending}
+    %{
+      state
+      | pending_acks: pending,
+        inflight_tx_count: max(0, state.inflight_tx_count - dropped_count)
+    }
   end
 
   defp resend_packet(state, packet_id, packet, phase) do
@@ -822,13 +884,18 @@ defmodule MqttX.Client.Connection do
     :ssl.setopts(socket, active: :once)
   end
 
-  defp notify_handler(%{handler: nil}, _event, _data), do: :ok
+  defp notify_handler(%{handler: nil} = state, _event, _data), do: state
 
-  defp notify_handler(%{handler: handler, handler_state: hstate}, event, data) do
-    if function_exported?(handler, :handle_mqtt_event, 3) do
-      handler.handle_mqtt_event(event, data, hstate)
-    end
+  defp notify_handler(
+         %{handler: handler, handler_state: hstate, handler_has_handle_mqtt_event: true} = state,
+         event,
+         data
+       ) do
+    new_hstate = handler.handle_mqtt_event(event, data, hstate)
+    %{state | handler_state: new_hstate}
   end
+
+  defp notify_handler(state, _event, _data), do: state
 
   # Session store helpers
   defp init_session_store(nil), do: {nil, nil}
@@ -861,7 +928,7 @@ defmodule MqttX.Client.Connection do
   end
 
   defp save_session(state) do
-    if state.session_store and not state.clean_session do
+    if not is_nil(state.session_store) and not state.clean_session do
       session = %{
         packet_id: state.packet_id,
         pending_acks: state.pending_acks,
@@ -873,23 +940,37 @@ defmodule MqttX.Client.Connection do
   end
 
   # ============================================================================
+  # Will Message Helper
+  # ============================================================================
+
+  defp build_will(opts) do
+    case Keyword.get(opts, :will_topic) do
+      nil ->
+        nil
+
+      topic ->
+        %{
+          topic: topic,
+          payload: Keyword.get(opts, :will_payload, <<>>),
+          qos: Keyword.get(opts, :will_qos, 0),
+          retain: Keyword.get(opts, :will_retain, false),
+          properties: Keyword.get(opts, :will_properties, %{})
+        }
+    end
+  end
+
+  # ============================================================================
   # Flow Control Helpers (MQTT 5.0)
   # ============================================================================
 
-  # Check if we can send another QoS 1/2 message (respects receive_maximum)
+  # Check if we can send another QoS 1/2 message.
+  # Respects both the broker's receive_maximum (MQTT 5.0) and the local max_inflight cap
+  # to prevent unbounded pending_acks growth.
   defp can_send_qos_message?(state) do
-    max_inflight = state.receive_maximum || 65535
-    inflight_count = count_inflight_messages(state)
-    inflight_count < max_inflight
-  end
-
-  # Count outgoing messages waiting for acknowledgment
-  defp count_inflight_messages(state) do
-    state.pending_acks
-    |> Enum.count(fn
-      {{:tx, _}, _} -> true
-      _ -> false
-    end)
+    broker_max = state.receive_maximum || 65535
+    local_max = state.max_inflight || @default_max_inflight
+    max_allowed = min(broker_max, local_max)
+    state.inflight_tx_count < max_allowed
   end
 
   # ============================================================================

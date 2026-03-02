@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/mqttx.png" alt="MqttX" width="600">
+  <img src="https://raw.githubusercontent.com/cignosystems/mqttx/main/assets/mqttx.png" alt="MqttX" width="600">
 </p>
 
 <p align="center">

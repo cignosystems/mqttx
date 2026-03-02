@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-03-02
+
+### Fixed
+
+- Logo rendering on hexdocs.pm (use absolute URL for README image)
+- CI: increased GenServer.stop timeout in client tests for slower runners
+- CI: skip JSON payload tests on OTP < 27
+- Removed accidentally committed mqttx-0.1.0 directory
+
 ## [0.6.0] - 2026-03-02
 
 ### Added

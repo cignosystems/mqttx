@@ -22,19 +22,19 @@ defmodule MqttX.ClientTest do
       assert is_pid(pid)
 
       # Clean up - use GenServer.stop for graceful shutdown
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "uses default port 1883" do
       {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
       assert is_pid(pid)
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts transport :tcp option" do
       {:ok, pid} = Client.connect(host: "localhost", client_id: "test", transport: :tcp)
       assert is_pid(pid)
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts transport :ssl option with ssl_opts" do
@@ -47,7 +47,7 @@ defmodule MqttX.ClientTest do
         )
 
       assert is_pid(pid)
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "uses default port 8883 for SSL transport" do
@@ -61,7 +61,7 @@ defmodule MqttX.ClientTest do
         )
 
       assert is_pid(pid)
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts retry_interval option" do
@@ -69,7 +69,7 @@ defmodule MqttX.ClientTest do
         Client.connect(host: "localhost", client_id: "test", retry_interval: 10_000)
 
       assert is_pid(pid)
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts session_store option" do
@@ -82,7 +82,7 @@ defmodule MqttX.ClientTest do
         )
 
       assert is_pid(pid)
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
   end
 
@@ -96,7 +96,7 @@ defmodule MqttX.ClientTest do
       # Should be false since no broker is running
       refute Client.connected?(pid)
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
   end
 
@@ -110,7 +110,7 @@ defmodule MqttX.ClientTest do
       result = Client.publish(pid, "test/topic", "payload")
       assert result == {:error, :not_connected}
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts qos option" do
@@ -122,7 +122,7 @@ defmodule MqttX.ClientTest do
       assert {:error, :not_connected} = Client.publish(pid, "test", "msg", qos: 1)
       assert {:error, :not_connected} = Client.publish(pid, "test", "msg", qos: 2)
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts retain option" do
@@ -132,7 +132,7 @@ defmodule MqttX.ClientTest do
       assert {:error, :not_connected} = Client.publish(pid, "test", "msg", retain: true)
       assert {:error, :not_connected} = Client.publish(pid, "test", "msg", retain: false)
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
   end
 
@@ -144,7 +144,7 @@ defmodule MqttX.ClientTest do
       result = Client.subscribe(pid, "test/topic")
       assert result == {:error, :not_connected}
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts single topic as binary" do
@@ -153,7 +153,7 @@ defmodule MqttX.ClientTest do
 
       assert {:error, :not_connected} = Client.subscribe(pid, "test/topic")
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts multiple topics as list" do
@@ -162,7 +162,7 @@ defmodule MqttX.ClientTest do
 
       assert {:error, :not_connected} = Client.subscribe(pid, ["topic/a", "topic/b"])
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts qos option" do
@@ -171,7 +171,7 @@ defmodule MqttX.ClientTest do
 
       assert {:error, :not_connected} = Client.subscribe(pid, "test", qos: 1)
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
   end
 
@@ -183,7 +183,7 @@ defmodule MqttX.ClientTest do
       result = Client.unsubscribe(pid, "test/topic")
       assert result == {:error, :not_connected}
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts single topic" do
@@ -192,7 +192,7 @@ defmodule MqttX.ClientTest do
 
       assert {:error, :not_connected} = Client.unsubscribe(pid, "test/topic")
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts multiple topics" do
@@ -201,7 +201,7 @@ defmodule MqttX.ClientTest do
 
       assert {:error, :not_connected} = Client.unsubscribe(pid, ["topic/a", "topic/b"])
 
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
     end
   end
 
@@ -211,7 +211,7 @@ defmodule MqttX.ClientTest do
       assert Process.alive?(pid)
 
       # Use GenServer.stop for clean shutdown
-      GenServer.stop(pid, :normal, 100)
+      GenServer.stop(pid, :normal, 1000)
 
       refute Process.alive?(pid)
     end

@@ -680,7 +680,8 @@ defmodule MqttX.Packet.Codec do
   end
 
   # MQTT 5.0: empty topic is valid when topic_alias is present
-  defp validate_publish_topic("", %{topic_alias: alias_val}) when is_integer(alias_val) and alias_val > 0 do
+  defp validate_publish_topic("", %{topic_alias: alias_val})
+       when is_integer(alias_val) and alias_val > 0 do
     {:ok, ""}
   end
 

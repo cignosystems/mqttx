@@ -197,7 +197,8 @@ defmodule MqttX.Transport.HandlerTest do
 
   describe "init/5" do
     test "initializes protocol state", ctx do
-      {:ok, state} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       assert state.connected == false
       assert state.buffer == <<>>
@@ -206,7 +207,9 @@ defmodule MqttX.Transport.HandlerTest do
 
     test "returns error when rate limited", ctx do
       rate_limiter = MqttX.Server.RateLimiter.new(max_connections: 0)
-      result = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, rate_limiter, ctx.send_fn)
+
+      result =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, rate_limiter, ctx.send_fn)
 
       assert result == {:error, :rate_limited}
     end
@@ -214,7 +217,8 @@ defmodule MqttX.Transport.HandlerTest do
 
   describe "handle_data/2 — CONNECT flow" do
     test "processes CONNECT and sends CONNACK", ctx do
-      {:ok, state} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
         type: :connect,
@@ -426,7 +430,8 @@ defmodule MqttX.Transport.HandlerTest do
 
   describe "handle_data/2 — incomplete data" do
     test "buffers incomplete packets", ctx do
-      {:ok, state} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
         type: :connect,
@@ -463,9 +468,16 @@ defmodule MqttX.Transport.HandlerTest do
 
       # Send QoS 2 PUBLISH
       publish = %{
-        type: :publish, topic: "qos2/topic", payload: "qos2-msg",
-        qos: 2, retain: false, dup: false, packet_id: 10, properties: %{}
+        type: :publish,
+        topic: "qos2/topic",
+        payload: "qos2-msg",
+        qos: 2,
+        retain: false,
+        dup: false,
+        packet_id: 10,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(4, publish)
       {:ok, state} = Proto.handle_data(data, state)
 
@@ -500,9 +512,16 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       publish = %{
-        type: :publish, topic: "dup/topic", payload: "dup-msg",
-        qos: 2, retain: false, dup: false, packet_id: 20, properties: %{}
+        type: :publish,
+        topic: "dup/topic",
+        payload: "dup-msg",
+        qos: 2,
+        retain: false,
+        dup: false,
+        packet_id: 20,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(4, publish)
       {:ok, state} = Proto.handle_data(data, state)
 
@@ -529,8 +548,18 @@ defmodule MqttX.Transport.HandlerTest do
 
       # Manually create a stale pending entry (timestamp in the past)
       past = System.monotonic_time(:millisecond) - 10_000
-      packet = %{type: :publish, topic: "retry/topic", payload: "retry-msg",
-                 qos: 2, retain: false, dup: false, packet_id: 30, properties: %{}}
+
+      packet = %{
+        type: :publish,
+        topic: "retry/topic",
+        payload: "retry-msg",
+        qos: 2,
+        retain: false,
+        dup: false,
+        packet_id: 30,
+        properties: %{}
+      }
+
       opts = %{qos: 2, retain: false, dup: false, packet_id: 30, properties: %{}}
       state = %{state | pending_qos2_rx: %{30 => {packet, opts, past, 0}}}
 
@@ -552,8 +581,18 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       past = System.monotonic_time(:millisecond) - 10_000
-      packet = %{type: :publish, topic: "drop/topic", payload: "drop",
-                 qos: 2, retain: false, dup: false, packet_id: 40, properties: %{}}
+
+      packet = %{
+        type: :publish,
+        topic: "drop/topic",
+        payload: "drop",
+        qos: 2,
+        retain: false,
+        dup: false,
+        packet_id: 40,
+        properties: %{}
+      }
+
       opts = %{qos: 2, retain: false, dup: false, packet_id: 40, properties: %{}}
       state = %{state | pending_qos2_rx: %{40 => {packet, opts, past, 3}}, inflight_count: 1}
 
@@ -620,15 +659,26 @@ defmodule MqttX.Transport.HandlerTest do
 
     test "advertises maximum_packet_size when configured", ctx do
       {:ok, state} =
-        Proto.init(TestHandler,
+        Proto.init(
+          TestHandler,
           [agent: ctx.agent, transport_opts: %{max_packet_size: 1024}],
-          ctx.retained_table, nil, ctx.send_fn)
+          ctx.retained_table,
+          nil,
+          ctx.send_fn
+        )
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "mps-client",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "mps-client",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, _state} = Proto.handle_data(data, state)
 
@@ -646,10 +696,16 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       publish = %{
-        type: :publish, topic: "alias/topic", payload: "ta-msg",
-        qos: 0, retain: false, dup: false, packet_id: nil,
+        type: :publish,
+        topic: "alias/topic",
+        payload: "ta-msg",
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
         properties: %{topic_alias: 1}
       }
+
       {:ok, data} = Codec.encode(5, publish)
       {:ok, new_state} = Proto.handle_data(data, state)
 
@@ -665,19 +721,31 @@ defmodule MqttX.Transport.HandlerTest do
 
       # First: store mapping
       publish1 = %{
-        type: :publish, topic: "mapped/topic", payload: "first",
-        qos: 0, retain: false, dup: false, packet_id: nil,
+        type: :publish,
+        topic: "mapped/topic",
+        payload: "first",
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
         properties: %{topic_alias: 5}
       }
+
       {:ok, data1} = Codec.encode(5, publish1)
       {:ok, state} = Proto.handle_data(data1, state)
 
       # Second: use alias only (empty topic)
       publish2 = %{
-        type: :publish, topic: "", payload: "second",
-        qos: 0, retain: false, dup: false, packet_id: nil,
+        type: :publish,
+        topic: "",
+        payload: "second",
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
         properties: %{topic_alias: 5}
       }
+
       {:ok, data2} = Codec.encode(5, publish2)
       {:ok, _state} = Proto.handle_data(data2, state)
 
@@ -691,22 +759,42 @@ defmodule MqttX.Transport.HandlerTest do
   describe "flow control (receive_maximum)" do
     test "rejects QoS 2 publish when inflight reaches receive_maximum", ctx do
       {:ok, state} =
-        Proto.init(TestHandler,
+        Proto.init(
+          TestHandler,
           [agent: ctx.agent, transport_opts: %{receive_maximum: 2}],
-          ctx.retained_table, nil, ctx.send_fn)
+          ctx.retained_table,
+          nil,
+          ctx.send_fn
+        )
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "fc-client",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "fc-client",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
 
       # QoS 2 Publish 1 — accepted (inflight becomes 1)
-      pub1 = %{type: :publish, topic: "fc/t", payload: "1",
-               qos: 2, retain: false, dup: false, packet_id: 1, properties: %{}}
+      pub1 = %{
+        type: :publish,
+        topic: "fc/t",
+        payload: "1",
+        qos: 2,
+        retain: false,
+        dup: false,
+        packet_id: 1,
+        properties: %{}
+      }
+
       {:ok, d1} = Codec.encode(5, pub1)
       {:ok, state} = Proto.handle_data(d1, state)
       assert_received {:sent, _pubrec1}
@@ -732,22 +820,42 @@ defmodule MqttX.Transport.HandlerTest do
 
     test "rejects QoS 2 publish when inflight exceeds receive_maximum", ctx do
       {:ok, state} =
-        Proto.init(TestHandler,
+        Proto.init(
+          TestHandler,
           [agent: ctx.agent, transport_opts: %{receive_maximum: 1}],
-          ctx.retained_table, nil, ctx.send_fn)
+          ctx.retained_table,
+          nil,
+          ctx.send_fn
+        )
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "fc2-client",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "fc2-client",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
 
       # First QoS 2 — accepted
-      pub1 = %{type: :publish, topic: "fc/t", payload: "1",
-               qos: 2, retain: false, dup: false, packet_id: 1, properties: %{}}
+      pub1 = %{
+        type: :publish,
+        topic: "fc/t",
+        payload: "1",
+        qos: 2,
+        retain: false,
+        dup: false,
+        packet_id: 1,
+        properties: %{}
+      }
+
       {:ok, d1} = Codec.encode(5, pub1)
       {:ok, state} = Proto.handle_data(d1, state)
       assert_received {:sent, _pubrec1}
@@ -769,25 +877,43 @@ defmodule MqttX.Transport.HandlerTest do
   describe "maximum packet size" do
     test "oversized PUBLISH triggers DISCONNECT 0x95", ctx do
       {:ok, state} =
-        Proto.init(TestHandler,
+        Proto.init(
+          TestHandler,
           [agent: ctx.agent, transport_opts: %{max_packet_size: 20}],
-          ctx.retained_table, nil, ctx.send_fn)
+          ctx.retained_table,
+          nil,
+          ctx.send_fn
+        )
 
       # CONNECT is small enough
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "mps",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "mps",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
 
       # This PUBLISH is larger than 20 bytes
       publish = %{
-        type: :publish, topic: "a/very/long/topic/name", payload: String.duplicate("x", 50),
-        qos: 0, retain: false, dup: false, packet_id: nil, properties: %{}
+        type: :publish,
+        topic: "a/very/long/topic/name",
+        payload: String.duplicate("x", 50),
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, publish)
       {:close, :packet_too_large, new_state} = Proto.handle_data(data, state)
 
@@ -802,15 +928,20 @@ defmodule MqttX.Transport.HandlerTest do
 
     test "outgoing publish exceeding client max is silently dropped", ctx do
       {:ok, state} =
-        Proto.init(PublishOnInfoHandler,
-          [agent: ctx.agent],
-          ctx.retained_table, nil, ctx.send_fn)
+        Proto.init(PublishOnInfoHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "mps-drop",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{maximum_packet_size: 10}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "mps-drop",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{maximum_packet_size: 10}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -818,22 +949,28 @@ defmodule MqttX.Transport.HandlerTest do
       assert state.client_max_packet_size == 10
 
       # Trigger a large outgoing publish via handle_info
-      {:noreply, _state} = Proto.handle_info({:send_publish, "big/topic", String.duplicate("x", 100)}, state)
+      {:noreply, _state} =
+        Proto.handle_info({:send_publish, "big/topic", String.duplicate("x", 100)}, state)
 
       refute_received {:sent, _}
     end
 
     test "outgoing publish within client max is sent", ctx do
       {:ok, state} =
-        Proto.init(PublishOnInfoHandler,
-          [agent: ctx.agent],
-          ctx.retained_table, nil, ctx.send_fn)
+        Proto.init(PublishOnInfoHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "mps-ok",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{maximum_packet_size: 256}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "mps-ok",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{maximum_packet_size: 256}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -852,23 +989,41 @@ defmodule MqttX.Transport.HandlerTest do
   describe "server-initiated DISCONNECT" do
     test "handle_publish returning {:disconnect, code, state} sends DISCONNECT and closes", ctx do
       {:ok, state} =
-        Proto.init(DisconnectOnPublishHandler,
+        Proto.init(
+          DisconnectOnPublishHandler,
           [agent: ctx.agent],
-          ctx.retained_table, nil, ctx.send_fn)
+          ctx.retained_table,
+          nil,
+          ctx.send_fn
+        )
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "disc-pub",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "disc-pub",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
 
       publish = %{
-        type: :publish, topic: "disc/trigger", payload: "bye",
-        qos: 0, retain: false, dup: false, packet_id: nil, properties: %{}
+        type: :publish,
+        topic: "disc/trigger",
+        payload: "bye",
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, publish)
       {:close, {:server_disconnect, 0x8E}, new_state} = Proto.handle_data(data, state)
 
@@ -895,14 +1050,23 @@ defmodule MqttX.Transport.HandlerTest do
     end
 
     test "will message NOT published on server-initiated disconnect (graceful)", ctx do
-      {:ok, state} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       will = %{topic: "will/topic", payload: "will-msg", qos: 0, retain: false, properties: %{}}
+
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "disc-will",
-        username: nil, password: nil, will: will, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "disc-will",
+        username: nil,
+        password: nil,
+        will: will,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -918,23 +1082,35 @@ defmodule MqttX.Transport.HandlerTest do
 
       # Will message should NOT have been published (graceful disconnect)
       events = Agent.get(ctx.agent, & &1)
+
       refute Enum.any?(events, fn
-        {:publish, "will/topic", _} -> true
-        _ -> false
-      end)
+               {:publish, "will/topic", _} -> true
+               _ -> false
+             end)
     end
 
     test "handle_info {:trigger_disconnect, code} through DisconnectOnPublishHandler", ctx do
       {:ok, state} =
-        Proto.init(DisconnectOnPublishHandler,
+        Proto.init(
+          DisconnectOnPublishHandler,
           [agent: ctx.agent],
-          ctx.retained_table, nil, ctx.send_fn)
+          ctx.retained_table,
+          nil,
+          ctx.send_fn
+        )
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "disc-trigger",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "disc-trigger",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -958,10 +1134,17 @@ defmodule MqttX.Transport.HandlerTest do
 
       # First, connect the client (v5 required for AUTH)
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "auth-ok",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "auth-ok",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -979,7 +1162,12 @@ defmodule MqttX.Transport.HandlerTest do
       assert auth_resp.properties.authentication_data == "challenge-data"
 
       # Send correct response
-      auth2 = %{type: :auth, reason_code: 0x18, properties: %{authentication_method: "PLAIN", authentication_data: "correct-response"}}
+      auth2 = %{
+        type: :auth,
+        reason_code: 0x18,
+        properties: %{authentication_method: "PLAIN", authentication_data: "correct-response"}
+      }
+
       {:ok, data} = Codec.encode(5, auth2)
       {:ok, state} = Proto.handle_data(data, state)
 
@@ -995,10 +1183,17 @@ defmodule MqttX.Transport.HandlerTest do
         Proto.init(TestAuthHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "auth-continue",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "auth-continue",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -1020,10 +1215,17 @@ defmodule MqttX.Transport.HandlerTest do
         Proto.init(TestAuthHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "auth-fail",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "auth-fail",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -1035,7 +1237,12 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       # Send wrong response
-      auth2 = %{type: :auth, reason_code: 0x18, properties: %{authentication_method: "PLAIN", authentication_data: "wrong-response"}}
+      auth2 = %{
+        type: :auth,
+        reason_code: 0x18,
+        properties: %{authentication_method: "PLAIN", authentication_data: "wrong-response"}
+      }
+
       {:ok, data} = Codec.encode(5, auth2)
       {:close, :auth_failed, _state} = Proto.handle_data(data, state)
 
@@ -1050,10 +1257,17 @@ defmodule MqttX.Transport.HandlerTest do
         Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "auth-default",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "auth-default",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -1076,11 +1290,18 @@ defmodule MqttX.Transport.HandlerTest do
 
   describe "pre-CONNECT packet rejection" do
     test "rejects PUBLISH before CONNECT with protocol error", ctx do
-      {:ok, state} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       publish = %{
-        type: :publish, topic: "test/topic", payload: "hello",
-        qos: 0, retain: false, dup: false, packet_id: nil, properties: %{}
+        type: :publish,
+        topic: "test/topic",
+        payload: "hello",
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
+        properties: %{}
       }
 
       {:ok, data} = Codec.encode(4, publish)
@@ -1094,8 +1315,13 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       publish = %{
-        type: :publish, topic: "some/topic", payload: "msg",
-        qos: 0, retain: false, dup: false, packet_id: nil,
+        type: :publish,
+        topic: "some/topic",
+        payload: "msg",
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
         properties: %{topic_alias: 200}
       }
 
@@ -1115,8 +1341,13 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       publish = %{
-        type: :publish, topic: "some/topic", payload: "msg",
-        qos: 0, retain: false, dup: false, packet_id: nil,
+        type: :publish,
+        topic: "some/topic",
+        payload: "msg",
+        qos: 0,
+        retain: false,
+        dup: false,
+        packet_id: nil,
         properties: %{topic_alias: 0}
       }
 
@@ -1128,15 +1359,20 @@ defmodule MqttX.Transport.HandlerTest do
   describe "property forwarding in send_publish" do
     test "forwards MQTT 5.0 properties through send_publish", ctx do
       {:ok, state} =
-        Proto.init(PublishOnInfoHandler,
-          [agent: ctx.agent],
-          ctx.retained_table, nil, ctx.send_fn)
+        Proto.init(PublishOnInfoHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
       connect = %{
-        type: :connect, protocol_version: 5, client_id: "prop-fwd",
-        username: nil, password: nil, will: nil, clean_session: true,
-        keep_alive: 0, properties: %{}
+        type: :connect,
+        protocol_version: 5,
+        client_id: "prop-fwd",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
       }
+
       {:ok, data} = Codec.encode(5, connect)
       {:ok, state} = Proto.handle_data(data, state)
       drain_mailbox()
@@ -1152,7 +1388,8 @@ defmodule MqttX.Transport.HandlerTest do
   end
 
   describe "CONNACK capability properties" do
-    test "contains retain_available, wildcard_subscription_available, subscription_identifier_available", ctx do
+    test "contains retain_available, wildcard_subscription_available, subscription_identifier_available",
+         ctx do
       _state = connect_client_v5(ctx, "cap-props")
       drain_mailbox_except_last()
 
@@ -1171,7 +1408,10 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       # Insert a retained message
-      :ets.insert(ctx.retained_table, {"rh/topic", ["rh", "topic"], "retained-payload", 0, System.system_time(:second), nil})
+      :ets.insert(
+        ctx.retained_table,
+        {"rh/topic", ["rh", "topic"], "retained-payload", 0, System.system_time(:second), nil}
+      )
 
       # Subscribe with retain_handling: 2 (don't send retained)
       subscribe = %{
@@ -1197,7 +1437,10 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       # Insert a retained message
-      :ets.insert(ctx.retained_table, {"rh0/topic", ["rh0", "topic"], "retained-payload", 0, System.system_time(:second), nil})
+      :ets.insert(
+        ctx.retained_table,
+        {"rh0/topic", ["rh0", "topic"], "retained-payload", 0, System.system_time(:second), nil}
+      )
 
       # Subscribe with retain_handling: 0 (send retained)
       subscribe = %{
@@ -1222,12 +1465,19 @@ defmodule MqttX.Transport.HandlerTest do
   # ===== Helpers =====
 
   defp connect_client(ctx, client_id) do
-    {:ok, state} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+    {:ok, state} =
+      Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
     connect = %{
-      type: :connect, protocol_version: 4, client_id: client_id,
-      username: nil, password: nil, will: nil, clean_session: true,
-      keep_alive: 0, properties: %{}
+      type: :connect,
+      protocol_version: 4,
+      client_id: client_id,
+      username: nil,
+      password: nil,
+      will: nil,
+      clean_session: true,
+      keep_alive: 0,
+      properties: %{}
     }
 
     {:ok, data} = Codec.encode(4, connect)
@@ -1236,12 +1486,19 @@ defmodule MqttX.Transport.HandlerTest do
   end
 
   defp connect_client_v5(ctx, client_id) do
-    {:ok, state} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+    {:ok, state} =
+      Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
     connect = %{
-      type: :connect, protocol_version: 5, client_id: client_id,
-      username: nil, password: nil, will: nil, clean_session: true,
-      keep_alive: 0, properties: %{}
+      type: :connect,
+      protocol_version: 5,
+      client_id: client_id,
+      username: nil,
+      password: nil,
+      will: nil,
+      clean_session: true,
+      keep_alive: 0,
+      properties: %{}
     }
 
     {:ok, data} = Codec.encode(5, connect)

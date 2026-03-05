@@ -311,7 +311,8 @@ defmodule MqttX.Server.Router do
 
   Returns `{matches, updated_router}`.
   """
-  @spec match_and_advance(t(), binary() | Topic.normalized_topic(), term()) :: {[{term(), map()}], t()}
+  @spec match_and_advance(t(), binary() | Topic.normalized_topic(), term()) ::
+          {[{term(), map()}], t()}
   def match_and_advance(router, topic, publisher \\ nil) do
     normalized = normalize_topic(topic)
 

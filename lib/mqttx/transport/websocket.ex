@@ -73,7 +73,7 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
     def send(_socket, _data), do: {:error, :not_supported}
 
     @impl MqttX.Transport
-    def close(_socket), do: {:error, :not_supported}
+    def close(_socket), do: :ok
 
     @impl MqttX.Transport
     def peername(_socket), do: {:error, :not_supported}

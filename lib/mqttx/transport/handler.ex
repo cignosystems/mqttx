@@ -23,7 +23,8 @@ defmodule MqttX.Transport.Handler do
       end
     end
 
-    transport_opts = if is_list(handler_opts), do: Keyword.get(handler_opts, :transport_opts, %{}), else: %{}
+    transport_opts =
+      if is_list(handler_opts), do: Keyword.get(handler_opts, :transport_opts, %{}), else: %{}
 
     state = %{
       send_fn: send_fn,
@@ -61,8 +62,7 @@ defmodule MqttX.Transport.Handler do
       handler_has_handle_info: function_exported?(handler, :handle_info, 2),
       handler_has_handle_puback: function_exported?(handler, :handle_puback, 2),
       handler_has_handle_auth: function_exported?(handler, :handle_auth, 3),
-      handler_has_handle_session_expired:
-        function_exported?(handler, :handle_session_expired, 2)
+      handler_has_handle_session_expired: function_exported?(handler, :handle_session_expired, 2)
     }
 
     {:ok, state}
@@ -206,12 +206,24 @@ defmodule MqttX.Transport.Handler do
               :pubrec_pending when not is_nil(packet) ->
                 dup_packet = %{packet | dup: true}
                 send_packet(state, dup_packet, state.protocol_version)
-                {Map.put(keep, pid, %{phase: :pubrec_pending, packet: packet, timestamp: now, retries: retries + 1}), dropped}
+
+                {Map.put(keep, pid, %{
+                   phase: :pubrec_pending,
+                   packet: packet,
+                   timestamp: now,
+                   retries: retries + 1
+                 }), dropped}
 
               :pubrel_sent ->
                 pubrel = %{type: :pubrel, packet_id: pid}
                 send_packet(state, pubrel, state.protocol_version)
-                {Map.put(keep, pid, %{phase: :pubrel_sent, packet: packet, timestamp: now, retries: retries + 1}), dropped}
+
+                {Map.put(keep, pid, %{
+                   phase: :pubrel_sent,
+                   packet: packet,
+                   timestamp: now,
+                   retries: retries + 1
+                 }), dropped}
 
               _ ->
                 {Map.put(keep, pid, entry), dropped}
@@ -227,10 +239,11 @@ defmodule MqttX.Transport.Handler do
 
     _ = dropped_tx
 
-    state = %{state |
-      pending_qos2_rx: new_rx,
-      pending_qos2_tx: new_tx,
-      inflight_count: new_inflight
+    state = %{
+      state
+      | pending_qos2_rx: new_rx,
+        pending_qos2_tx: new_tx,
+        inflight_count: new_inflight
     }
 
     {:noreply, schedule_qos2_retry_timer(state)}
@@ -267,26 +280,31 @@ defmodule MqttX.Transport.Handler do
           {:noreply, %{state | handler_state: new_handler_state}}
 
         {:publish, topic, payload, new_handler_state} ->
-          new_state = send_publish(%{state | handler_state: new_handler_state}, topic, payload, %{qos: 0, retain: false})
+          new_state =
+            send_publish(%{state | handler_state: new_handler_state}, topic, payload, %{
+              qos: 0,
+              retain: false
+            })
+
           {:noreply, new_state}
 
         {:publish, topic, payload, opts, new_handler_state} ->
-          new_state = send_publish(%{state | handler_state: new_handler_state}, topic, payload, opts)
+          new_state =
+            send_publish(%{state | handler_state: new_handler_state}, topic, payload, opts)
+
           {:noreply, new_state}
 
         {:disconnect, reason_code, new_handler_state} ->
           send_disconnect(state, reason_code, %{})
           state.handler.handle_disconnect({:server_disconnect, reason_code}, new_handler_state)
 
-          {:stop, :normal,
-           %{state | handler_state: new_handler_state, graceful_disconnect: true}}
+          {:stop, :normal, %{state | handler_state: new_handler_state, graceful_disconnect: true}}
 
         {:disconnect, reason_code, properties, new_handler_state} ->
           send_disconnect(state, reason_code, properties)
           state.handler.handle_disconnect({:server_disconnect, reason_code}, new_handler_state)
 
-          {:stop, :normal,
-           %{state | handler_state: new_handler_state, graceful_disconnect: true}}
+          {:stop, :normal, %{state | handler_state: new_handler_state, graceful_disconnect: true}}
 
         {:stop, _reason, new_handler_state} ->
           {:stop, :normal, %{state | handler_state: new_handler_state}}
@@ -581,7 +599,15 @@ defmodule MqttX.Transport.Handler do
         send_packet(state, pubrel, state.protocol_version)
         # Keep tracking — wait for PUBCOMP
         now = System.monotonic_time(:millisecond)
-        pending = Map.put(remaining, packet.packet_id, %{phase: :pubrel_sent, packet: nil, timestamp: now, retries: 0})
+
+        pending =
+          Map.put(remaining, packet.packet_id, %{
+            phase: :pubrel_sent,
+            packet: nil,
+            timestamp: now,
+            retries: 0
+          })
+
         {:ok, %{state | pending_qos2_tx: pending}}
     end
   end
@@ -591,7 +617,13 @@ defmodule MqttX.Transport.Handler do
     case Map.pop(state.pending_qos2_rx, packet.packet_id) do
       {nil, _} ->
         # Unknown packet_id — send PUBCOMP with 0x92 (Packet Identifier not found) per spec 4.3.3
-        pubcomp = %{type: :pubcomp, packet_id: packet.packet_id, reason_code: 0x92, properties: %{}}
+        pubcomp = %{
+          type: :pubcomp,
+          packet_id: packet.packet_id,
+          reason_code: 0x92,
+          properties: %{}
+        }
+
         send_packet(state, pubcomp, state.protocol_version)
         {:ok, state}
 
@@ -615,12 +647,26 @@ defmodule MqttX.Transport.Handler do
           {:ok, new_handler_state} ->
             pubcomp = %{type: :pubcomp, packet_id: packet.packet_id}
             send_packet(state, pubcomp, state.protocol_version)
-            {:ok, %{state | handler_state: new_handler_state, pending_qos2_rx: remaining, inflight_count: max(state.inflight_count - 1, 0)}}
+
+            {:ok,
+             %{
+               state
+               | handler_state: new_handler_state,
+                 pending_qos2_rx: remaining,
+                 inflight_count: max(state.inflight_count - 1, 0)
+             }}
 
           {:error, _reason, new_handler_state} ->
             pubcomp = %{type: :pubcomp, packet_id: packet.packet_id}
             send_packet(state, pubcomp, state.protocol_version)
-            {:ok, %{state | handler_state: new_handler_state, pending_qos2_rx: remaining, inflight_count: max(state.inflight_count - 1, 0)}}
+
+            {:ok,
+             %{
+               state
+               | handler_state: new_handler_state,
+                 pending_qos2_rx: remaining,
+                 inflight_count: max(state.inflight_count - 1, 0)
+             }}
 
           {:disconnect, reason_code, new_handler_state} ->
             send_disconnect(state, reason_code, %{})
@@ -861,7 +907,15 @@ defmodule MqttX.Transport.Handler do
           # For QoS 2 outgoing, track in pending_qos2_tx with retry info
           if qos == 2 do
             now = System.monotonic_time(:millisecond)
-            pending = Map.put(state.pending_qos2_tx, packet_id, %{phase: :pubrec_pending, packet: packet, timestamp: now, retries: 0})
+
+            pending =
+              Map.put(state.pending_qos2_tx, packet_id, %{
+                phase: :pubrec_pending,
+                packet: packet,
+                timestamp: now,
+                retries: 0
+              })
+
             %{state | pending_qos2_tx: pending}
           else
             state

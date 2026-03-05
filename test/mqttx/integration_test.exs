@@ -1549,13 +1549,15 @@ defmodule MqttX.IntegrationTest do
       events = wait_for_events(agent, 2)
 
       assert Enum.any?(events, fn
-        {:subscribe, topics} ->
-          Enum.any?(topics, fn t ->
-            topic = if is_list(t.topic), do: Enum.join(t.topic, "/"), else: t.topic
-            String.starts_with?(topic, "$share/")
-          end)
-        _ -> false
-      end)
+               {:subscribe, topics} ->
+                 Enum.any?(topics, fn t ->
+                   topic = if is_list(t.topic), do: Enum.join(t.topic, "/"), else: t.topic
+                   String.starts_with?(topic, "$share/")
+                 end)
+
+               _ ->
+                 false
+             end)
 
       GenServer.stop(client, :normal, 1000)
       ThousandIsland.stop(server_pid)

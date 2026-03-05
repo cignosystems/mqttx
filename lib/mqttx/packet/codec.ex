@@ -196,7 +196,7 @@ defmodule MqttX.Packet.Codec do
       end
 
     with {:ok, props, payload} <- Properties.decode(version, rest2),
-         {:ok, normalized_topic} <- Topic.validate_publish(topic) do
+         {:ok, normalized_topic} <- validate_publish_topic(topic, props) do
       {:ok,
        %{
          type: :publish,
@@ -677,6 +677,15 @@ defmodule MqttX.Packet.Codec do
 
   defp encode_ack_response(_version, packet_id, _reason_code, _props) do
     [<<packet_id::16-big>>]
+  end
+
+  # MQTT 5.0: empty topic is valid when topic_alias is present
+  defp validate_publish_topic("", %{topic_alias: alias_val}) when is_integer(alias_val) and alias_val > 0 do
+    {:ok, ""}
+  end
+
+  defp validate_publish_topic(topic, _props) do
+    Topic.validate_publish(topic)
   end
 
   # Subscribe topics

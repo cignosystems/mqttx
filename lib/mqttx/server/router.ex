@@ -271,15 +271,19 @@ defmodule MqttX.Server.Router do
   Returns a list of `{client, opts}` tuples for each matching subscription.
 
   For shared subscriptions, only one client per group is selected (round-robin).
+
+  The optional `publisher` parameter enables no_local filtering: subscriptions
+  with `no_local: true` are excluded when the publisher matches the subscriber.
   """
-  @spec match(t(), binary() | Topic.normalized_topic()) :: [{term(), map()}]
-  def match(router, topic) do
+  @spec match(t(), binary() | Topic.normalized_topic(), term()) :: [{term(), map()}]
+  def match(router, topic, publisher \\ nil) do
     normalized = normalize_topic(topic)
 
     # Get regular subscription matches via trie traversal
     regular_matches =
       trie_match(router.trie, normalized)
       |> Enum.uniq_by(fn {client, _opts} -> client end)
+      |> filter_no_local(publisher)
 
     # Get shared subscription matches (one per group, round-robin)
     shared_matches =
@@ -302,19 +306,20 @@ defmodule MqttX.Server.Router do
   @doc """
   Find all matching subscriptions and advance round-robin for shared groups.
 
-  This is the same as `match/2` but also updates the router state
+  This is the same as `match/3` but also updates the router state
   to advance the round-robin index for matched shared subscriptions.
 
   Returns `{matches, updated_router}`.
   """
-  @spec match_and_advance(t(), binary() | Topic.normalized_topic()) :: {[{term(), map()}], t()}
-  def match_and_advance(router, topic) do
+  @spec match_and_advance(t(), binary() | Topic.normalized_topic(), term()) :: {[{term(), map()}], t()}
+  def match_and_advance(router, topic, publisher \\ nil) do
     normalized = normalize_topic(topic)
 
     # Get regular subscription matches via trie traversal
     regular_matches =
       trie_match(router.trie, normalized)
       |> Enum.uniq_by(fn {client, _opts} -> client end)
+      |> filter_no_local(publisher)
 
     # Get shared subscription matches and advance indices
     {shared_matches, updated_shared_groups} =
@@ -502,6 +507,15 @@ defmodule MqttX.Server.Router do
   defp segment_key(:single_level), do: :single_level
   defp segment_key(:multi_level), do: :multi_level
   defp segment_key(segment), do: segment
+
+  # Filter out subscriptions with no_local when publisher matches subscriber
+  defp filter_no_local(matches, nil), do: matches
+
+  defp filter_no_local(matches, publisher) do
+    Enum.reject(matches, fn {client, opts} ->
+      client == publisher and Map.get(opts, :no_local, false)
+    end)
+  end
 
   # Normalize filter (can be string or list)
   defp normalize_filter(filter) when is_binary(filter) do

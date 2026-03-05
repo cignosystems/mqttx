@@ -250,4 +250,48 @@ defmodule MqttX.Server.RouterTest do
       assert length(router.shared_groups["workers"].members) == 1
     end
   end
+
+  describe "no_local support" do
+    test "match/3 with no_local excludes publisher from results" do
+      router = Router.new()
+      router = Router.subscribe(router, "topic/a", :client1, qos: 1, no_local: true)
+      router = Router.subscribe(router, "topic/a", :client2, qos: 1)
+
+      # When client1 is the publisher, it should not receive its own message
+      matches = Router.match(router, "topic/a", :client1)
+      clients = Enum.map(matches, fn {c, _} -> c end)
+      refute :client1 in clients
+      assert :client2 in clients
+    end
+
+    test "match/3 without no_local includes publisher in results" do
+      router = Router.new()
+      router = Router.subscribe(router, "topic/a", :client1, qos: 1)
+      router = Router.subscribe(router, "topic/a", :client2, qos: 1)
+
+      matches = Router.match(router, "topic/a", :client1)
+      clients = Enum.map(matches, fn {c, _} -> c end)
+      assert :client1 in clients
+      assert :client2 in clients
+    end
+
+    test "match/2 without publisher does not filter no_local" do
+      router = Router.new()
+      router = Router.subscribe(router, "topic/a", :client1, qos: 1, no_local: true)
+
+      matches = Router.match(router, "topic/a")
+      assert length(matches) == 1
+    end
+
+    test "match_and_advance/3 with no_local excludes publisher" do
+      router = Router.new()
+      router = Router.subscribe(router, "topic/a", :client1, qos: 1, no_local: true)
+      router = Router.subscribe(router, "topic/a", :client2, qos: 1)
+
+      {matches, _router} = Router.match_and_advance(router, "topic/a", :client1)
+      clients = Enum.map(matches, fn {c, _} -> c end)
+      refute :client1 in clients
+      assert :client2 in clients
+    end
+  end
 end

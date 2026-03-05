@@ -1,10 +1,10 @@
 # Performance & Scaling
 
-MqttX is designed to handle 10,000 to 100,000+ concurrent device connections on a single BEAM node. This guide explains the architectural decisions and optimizations that make this possible.
+MqttX is architected to scale from tens of thousands to hundreds of thousands of concurrent device connections on a single BEAM node, depending on hardware and workload. This guide explains the architectural decisions and optimizations that make this possible.
 
 ## Architecture Overview
 
-Each MQTT connection is a lightweight Erlang process (~2KB initial heap). The BEAM VM's preemptive scheduler distributes these processes across all available CPU cores. At 100k connections, memory overhead from the connection processes alone is roughly 200MB — well within reach of a modest server.
+Each MQTT connection is a lightweight Erlang process (~2KB initial heap, ~20KB total with connection state and socket overhead). The BEAM VM's preemptive scheduler distributes these processes across all available CPU cores. At 100k connections, total memory overhead is roughly 2GB — well within reach of a modest server.
 
 The key bottlenecks at scale are not the number of connections, but the **hot paths** that execute on every message:
 
@@ -85,16 +85,16 @@ end
 
 ## Flow Control
 
-MQTT 5.0's `receive_maximum` limits how many unacknowledged QoS 1/2 messages a client can have in flight. Instead of counting `{:tx, _}` entries in the `pending_acks` map on every publish (O(N) where N = pending messages), MqttX maintains a direct counter:
+MQTT 5.0's `receive_maximum` limits how many unacknowledged QoS 2 messages can be in flight simultaneously. Both client and server enforce this with a direct counter:
 
 ```elixir
-defp can_send_qos_message?(state) do
-  max_inflight = state.receive_maximum || 65535
-  state.inflight_tx_count < max_inflight
+# Server-side: check before accepting incoming QoS 2 PUBLISH
+if state.inflight_count >= state.server_receive_maximum do
+  # Send PUBREC with reason code 0x93 (Receive Maximum exceeded)
 end
 ```
 
-The counter is incremented when adding a pending ack and decremented when receiving PUBACK/PUBCOMP or dropping expired messages.
+The counter is incremented when sending PUBREC (QoS 2 received) and decremented when sending PUBCOMP (QoS 2 complete) or when entries are dropped after max retries.
 
 ## Retained Message Delivery
 
@@ -111,16 +111,28 @@ The primary bottleneck depends on your device activity pattern. For most IoT dep
 
 ### Per-device resource usage
 
-Each connected device consumes approximately **~20KB of RAM** (process heap + connection state + socket). CPU usage depends entirely on message frequency.
+Each connected device consumes approximately **~20KB of RAM** (process heap + connection state + socket). This breaks down as:
+
+- Process heap: ~2KB (BEAM base allocation)
+- State map (client_id, protocol flags, will message, timers): ~1KB
+- Socket + TCP buffers: ~2–5KB
+- Handler state (application-defined): ~0.5–5KB
+- Session data, pending acks, optional features: ~1–5KB
+
+CPU usage depends entirely on message frequency.
+
+> **Note:** These are theoretical estimates based on architectural analysis and codec benchmarks. The project does not yet include end-to-end load tests validating these numbers under production conditions. Actual performance will vary with hardware, OS tuning, message sizes, subscription patterns, and application logic in your handler callbacks.
 
 ### Device counts by workload
 
 | Device activity | Per vCPU | Bottleneck |
 |-----------------|----------|------------|
-| Sleepy sensors (1 msg/min) | ~300K–500K | RAM |
-| Normal IoT (1 msg/30s) | ~200K–500K | RAM |
+| Sleepy sensors (1 msg/min) | ~50K–100K | RAM |
+| Normal IoT (1 msg/30s) | ~30K–80K | RAM |
 | Chatty devices (1 msg/sec) | ~10K–15K | CPU |
 | Real-time streaming (10 msg/sec) | ~1K–2K | CPU |
+
+These per-vCPU numbers are not meant to be multiplied linearly — scaling is sub-linear due to ETS contention, scheduler rebalancing, per-process GC pauses, and OS-level limits (file descriptors, kernel socket buffer memory).
 
 ### Instance sizing
 
@@ -142,11 +154,18 @@ For active workloads (1 msg/sec per device), CPU becomes the constraint:
 | 4 vCPU | ~60,000 | ~6,000 |
 | 8 vCPU | ~100,000 | ~10,000 |
 
-CPU scaling is not perfectly linear due to ETS contention, scheduler rebalancing, and per-process GC pauses.
+### System-level constraints
+
+At high connection counts, OS and kernel limits often become the bottleneck before BEAM limits:
+
+- **File descriptors**: Each connection consumes one fd. Set `ulimit -n` accordingly (see [OS Tuning](#os-tuning)).
+- **Ephemeral ports**: A single IP address supports ~64K outbound ports. For more connections, bind multiple IPs.
+- **Kernel socket buffer memory**: Each TCP socket reserves kernel buffer space (~4–8KB default). At 500K connections this alone can consume several GB of kernel memory.
+- **BEAM process/port limits**: Default limits are 262,144 processes and 65,536 ports. Increase with `+P` and `+Q` flags (see [VM Tuning](#vm-tuning)).
 
 ### Beyond a single node
 
-Past ~500K connections, consider clustering multiple BEAM nodes behind a load balancer. The constraint is not CPU but process registry memory and fault isolation — a single node crash affects all connected devices. A multi-node setup with 3–5 nodes provides both capacity and redundancy.
+Past ~500K connections, consider clustering multiple BEAM nodes behind a load balancer. The constraints at this scale are fault isolation (a single node crash affects all connected devices) and system-level limits described above. A multi-node setup with 3–5 nodes provides both capacity and redundancy.
 
 ## Deployment Guidelines
 
@@ -159,10 +178,10 @@ A single BEAM node with MqttX can handle:
 | Concurrent connections | 50,000 | 200,000 |
 | Messages/second (QoS 0) | 100,000 | 500,000+ |
 | Messages/second (QoS 1) | 50,000 | 200,000 |
-| Memory per connection | ~2-5 KB | ~2-5 KB |
-| Total memory (100k conns) | ~500 MB | ~500 MB |
+| Memory per connection | ~20 KB | ~20 KB |
+| Total memory (100k conns) | ~2 GB | ~2 GB |
 
-These numbers depend on hardware, message sizes, and subscription patterns. QoS 2 has higher overhead due to the 4-step handshake.
+These are theoretical estimates based on codec throughput benchmarks and architectural analysis — not measured under end-to-end load. Actual numbers depend on hardware, OS tuning, message sizes, subscription patterns, and handler callback complexity. QoS 2 has higher overhead due to the 4-step handshake.
 
 ### VM Tuning
 

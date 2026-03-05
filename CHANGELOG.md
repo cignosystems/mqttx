@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-03-05
+
+### Added
+
+- **Full MQTT 3.1/3.1.1/5.0 Compliance**: Closed all remaining spec compliance gaps
+  - **Pre-CONNECT packet rejection**: Non-CONNECT/AUTH packets before CONNECT now trigger DISCONNECT 0x82 (Protocol Error) per spec
+  - **Topic alias validation**: Incoming topic aliases are validated against `topic_alias_maximum`; out-of-range aliases trigger DISCONNECT 0x94
+  - **MQTT 5.0 property forwarding**: Outgoing PUBLISH packets now forward properties (user_properties, content_type, correlation_data, etc.) from handler callbacks
+  - **CONNACK capability properties**: Server advertises `retain_available`, `wildcard_subscription_available`, and `subscription_identifier_available` in CONNACK for MQTT 5.0 connections
+  - **retain_handling support**: Subscription option `retain_handling: 2` suppresses retained message delivery on subscribe
+  - **no_local support**: `Router.match/3` and `Router.match_and_advance/3` accept optional `publisher` parameter to filter out subscriptions with `no_local: true`
+  - **Client server DISCONNECT handling**: Client now handles server-initiated DISCONNECT packets, notifying the handler with `{:server_disconnect, reason_code}`
+- **QoS 2 Retransmission & DUP Handling** (Server): Periodic retry timer re-sends PUBREC/PUBLISH(dup)/PUBREL for stale in-flight QoS 2 messages; drops after configurable max retries. DUP incoming PUBLISH re-sends PUBREC without re-delivering.
+- **Topic Aliases** (MQTT 5.0 Server): Incoming PUBLISH with `topic_alias` property resolved automatically. Server advertises `topic_alias_maximum` in CONNACK. Alias-only publishes (empty topic) look up stored mapping.
+- **Flow Control / Receive Maximum** (MQTT 5.0 Server): Server enforces `receive_maximum` for incoming QoS 2 messages. Excess publishes receive PUBREC with reason code `0x93` (Receive Maximum exceeded). Server advertises `receive_maximum` in CONNACK.
+- **Maximum Packet Size** (MQTT 5.0 Server): Configurable `max_packet_size` option. Oversized incoming packets trigger DISCONNECT with reason code `0x95` (Packet too large). Outgoing publishes exceeding client's `maximum_packet_size` are silently dropped. Server advertises `maximum_packet_size` in CONNACK when configured.
+- **WebSocket Transport**: MQTT over WebSocket via Bandit, supporting all MQTT protocol features over `ws://` and `wss://` connections.
+- **Mosquitto Validation Suite**: 104 automated tests against Mosquitto clients across TCP and WebSocket transports, covering all protocol versions and MQTT 5.0 features.
+- **Handler tests**: 30+ new tests covering compliance features, QoS 2 full flow, DUP handling, retry timer, CONNACK properties, topic aliases, flow control, max packet size, and server-initiated DISCONNECT.
+
+### Changed
+
+- **Codec**: MQTT 5.0 PUBLISH with empty topic is now valid when `topic_alias` property is present (per MQTT 5.0 spec section 3.3.2.1)
+- **QoS 2 pending entries**: `pending_qos2_rx` entries now include timestamps and retry counts; `pending_qos2_tx` entries are enriched maps with phase, packet, timestamp, and retry info
+- **Router API**: `match/2` → `match/3` and `match_and_advance/2` → `match_and_advance/3` with optional `publisher` parameter (backward compatible, defaults to `nil`)
+
+### Fixed
+
+- Server PUBREL handler now correctly extracts packet/opts from both legacy 2-tuple and new 4-tuple `pending_qos2_rx` entries
+
 ## [0.6.1] - 2026-03-02
 
 ### Fixed

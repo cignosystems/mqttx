@@ -93,9 +93,12 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.6.0"},
+    {:mqttx, "~> 0.7.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
+    # Optional: WebSocket transport
+    {:bandit, "~> 1.6"},
+    {:websock_adapter, "~> 0.5"},
     # Optional: Payload codecs
     {:protox, "~> 2.0"}
   ]
@@ -248,6 +251,17 @@ MqttX.Server.start_link(
 )
 ```
 
+### WebSocket
+
+```elixir
+MqttX.Server.start_link(
+  MyHandler,
+  [],
+  transport: MqttX.Transport.WebSocket,
+  port: 8083
+)
+```
+
 ## Payload Codecs
 
 Built-in payload codecs for message encoding/decoding:
@@ -306,9 +320,13 @@ All 15 packet types are supported:
 - DISCONNECT
 - AUTH (MQTT 5.0)
 
+### Compliance
+
+Fully compliant with MQTT 3.1, 3.1.1, and 5.0 specifications. The server advertises all capability properties in CONNACK, enforces protocol ordering, validates topic aliases, forwards MQTT 5.0 properties, and supports subscription options (no_local, retain_handling). Validated against Mosquitto clients across both TCP and WebSocket transports with 100+ automated protocol tests.
+
 ## Performance
 
-Designed to scale to **10k-100k+ concurrent devices** on a single BEAM node. Each connection is a lightweight Erlang process (~2-5KB), and the hot paths are optimized for high message throughput:
+Architected to scale from tens of thousands to **hundreds of thousands of concurrent devices** on a single BEAM node, depending on hardware and workload. Each connection is a lightweight Erlang process (~20KB total with connection state and socket), and the hot paths are optimized for high message throughput:
 
 - **Trie-based topic router**: O(L+K) matching where L = topic depth, K = matching subscriptions — independent of total subscription count
 - **iodata encoding**: Socket sends use iodata directly, avoiding binary copies on every packet
@@ -323,7 +341,7 @@ Designed to scale to **10k-100k+ concurrent devices** on a single BEAM node. Eac
 | Concurrent connections | 50,000 | 200,000 |
 | Messages/second (QoS 0) | 100,000 | 500,000+ |
 | Messages/second (QoS 1) | 50,000 | 200,000 |
-| Memory per connection | ~2-5 KB | ~2-5 KB |
+| Memory per connection | ~20 KB | ~20 KB |
 
 **Codec benchmarks vs mqtt_packet_map** (Apple M4 Pro):
 
@@ -418,18 +436,14 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 
 ## Roadmap
 
-### Next Up
-
-| Feature | Description |
-|---------|-------------|
-| **WebSocket Transport** | MQTT over WebSocket for browser-based clients |
-
-### Future
-
-| Feature | Description |
-|---------|-------------|
-| **Clustering** | Distributed router across Erlang nodes via `pg` |
-| **Property-based Tests** | StreamData for fuzzing the packet codec |
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Full MQTT 5.0 Compliance** | Done | Pre-CONNECT rejection, topic alias validation, property forwarding, CONNACK capabilities, retain_handling, no_local |
+| **WebSocket Transport** | Done | MQTT over WebSocket via Bandit (`ws://` and `wss://`) |
+| **Mosquitto Validation** | Done | 104 automated protocol tests across TCP and WebSocket |
+| **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
+| **Property-based Tests** | Planned | StreamData for fuzzing the packet codec |
+| **End-to-end Load Tests** | Planned | Benchee-based throughput validation under realistic workloads |
 
 ## License
 

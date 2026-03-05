@@ -9,10 +9,13 @@ Add `mqttx` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.6.0"},
+    {:mqttx, "~> 0.7.0"},
 
     # Pick a transport for the server (optional)
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
+    # WebSocket transport (optional)
+    {:bandit, "~> 1.6"},
+    {:websock_adapter, "~> 0.5"},
 
     # Payload codecs (optional)
     {:protox, "~> 2.0"}
@@ -110,4 +113,4 @@ See the [Codec & Payloads Guide](codec.md) for payload codecs and protocol detai
 - [Server Guide](server.md) - Transport adapters, topic routing, will messages
 - [Codec & Payloads](codec.md) - Standalone codec, JSON/Protobuf/Raw payloads
 - [Telemetry](telemetry.md) - Observability and metrics
-- [Performance](performance.md) - Scaling to 10k-100k devices, architecture decisions
+- [Performance](performance.md) - Scaling to hundreds of thousands of devices, architecture decisions

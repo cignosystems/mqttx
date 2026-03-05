@@ -436,6 +436,32 @@ defmodule MqttX.IntegrationTest do
       ThousandIsland.stop(server_pid)
       Agent.stop(agent)
     end
+
+    test "client publishes QoS 2 message to server" do
+      {:ok, agent} = Agent.start_link(fn -> [] end)
+      {server_pid, port} = start_server(TestHandler, agent: agent)
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "pub-qos2",
+          protocol_version: 4
+        )
+
+      Process.sleep(200)
+      assert MqttX.Client.connected?(client)
+
+      :ok = MqttX.Client.publish(client, "test/qos2", "qos2 payload", qos: 2)
+
+      events = wait_for_events(agent, 2, 3000)
+
+      assert Enum.any?(events, &match?({:publish, "test/qos2", "qos2 payload", %{qos: 2}}, &1))
+
+      GenServer.stop(client, :normal, 1000)
+      ThousandIsland.stop(server_pid)
+      Agent.stop(agent)
+    end
   end
 
   describe "subscribe flow" do
@@ -1497,6 +1523,41 @@ defmodule MqttX.IntegrationTest do
       assert Enum.any?(events, &match?({:session_expired, "session-graceful-test"}, &1))
 
       :gen_tcp.close(socket)
+      ThousandIsland.stop(server_pid)
+      Agent.stop(agent)
+    end
+  end
+
+  describe "shared subscriptions" do
+    test "client subscribes to $share/ topic filter" do
+      {:ok, agent} = Agent.start_link(fn -> [] end)
+      {server_pid, port} = start_server(TestHandler, agent: agent)
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "shared-sub-client",
+          protocol_version: 5
+        )
+
+      Process.sleep(200)
+      assert MqttX.Client.connected?(client)
+
+      :ok = MqttX.Client.subscribe(client, "$share/workers/jobs/#", qos: 1)
+
+      events = wait_for_events(agent, 2)
+
+      assert Enum.any?(events, fn
+        {:subscribe, topics} ->
+          Enum.any?(topics, fn t ->
+            topic = if is_list(t.topic), do: Enum.join(t.topic, "/"), else: t.topic
+            String.starts_with?(topic, "$share/")
+          end)
+        _ -> false
+      end)
+
+      GenServer.stop(client, :normal, 1000)
       ThousandIsland.stop(server_pid)
       Agent.stop(agent)
     end

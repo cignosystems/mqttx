@@ -91,7 +91,20 @@ Any callback that returns `{:disconnect, reason_code, state}` or `{:disconnect, 
 )
 ```
 
-Both adapters support TCP and TLS. See `MqttX.Transport` for implementing custom adapters.
+### WebSocket
+
+```elixir
+# mix.exs: {:bandit, "~> 1.6"}, {:websock_adapter, "~> 0.5"}
+
+{:ok, _pid} = MqttX.Server.start_link(
+  MyApp.MqttHandler,
+  [],
+  transport: MqttX.Transport.WebSocket,
+  port: 8083
+)
+```
+
+All transports support TCP and TLS. See `MqttX.Transport` for implementing custom adapters.
 
 ## Topic Routing
 
@@ -219,3 +232,85 @@ end
 ```
 
 DISCONNECT packets are only sent for MQTT 5.0 connections. For MQTT 3.1.1, the connection is simply closed.
+
+## MQTT 5.0 Protocol Features
+
+The server automatically handles these MQTT 5.0 features when clients connect with protocol version 5:
+
+### Topic Aliases
+
+Clients can use topic aliases to reduce bandwidth by replacing repeated topic strings with short integer aliases. The server:
+
+- Advertises `topic_alias_maximum: 100` in CONNACK (configurable via `transport_opts`)
+- Resolves incoming topic aliases: first publish with alias + topic stores the mapping, subsequent publishes with alias only use the stored topic
+- No application code needed — alias resolution is transparent to your handler callbacks
+
+### Flow Control (Receive Maximum)
+
+The server enforces `receive_maximum` for incoming QoS 2 messages:
+
+- Advertises `receive_maximum` in CONNACK (default: 65535, configurable via `transport_opts`)
+- Tracks in-flight QoS 2 messages (between PUBREC and PUBCOMP)
+- Rejects excess QoS 2 publishes with PUBREC reason code `0x93` (Receive Maximum exceeded)
+
+### Maximum Packet Size
+
+Configure a maximum incoming packet size to protect against oversized messages:
+
+```elixir
+MqttX.Server.start_link(MyApp.MqttHandler, [],
+  transport: MqttX.Transport.ThousandIsland,
+  port: 1883,
+  transport_opts: %{max_packet_size: 1_048_576}  # 1MB limit
+)
+```
+
+- Server sends DISCONNECT with reason code `0x95` (Packet too large) for oversized incoming packets
+- Outgoing publishes exceeding the client's advertised `maximum_packet_size` are silently dropped
+- Server advertises its `maximum_packet_size` in CONNACK when configured
+
+### QoS 2 Retransmission
+
+The server automatically retries stale QoS 2 handshake messages:
+
+- Re-sends PUBREC if no PUBREL received within the retry interval (default: 5 seconds)
+- Re-sends PUBLISH with `dup: true` for outgoing QoS 2 awaiting PUBREC
+- Re-sends PUBREL for outgoing QoS 2 awaiting PUBCOMP
+- Drops entries after max retries (default: 3)
+- Handles DUP incoming PUBLISH by re-sending PUBREC without re-storing
+
+### Shared Subscriptions
+
+Distribute messages across a group of subscribers with `$share/group/topic` patterns. The server advertises `shared_subscription_available: 1` in CONNACK. See the [Topic Routing](#shared-subscriptions-mqtt-50) section above for usage.
+
+### CONNACK Properties
+
+For MQTT 5.0 connections, the server automatically includes these properties in CONNACK:
+
+| Property | Value | Description |
+|----------|-------|-------------|
+| `shared_subscription_available` | `1` | Shared subscriptions supported |
+| `topic_alias_maximum` | `100` | Max topic aliases the server accepts |
+| `receive_maximum` | `65535` | Max in-flight QoS 2 messages |
+| `maximum_packet_size` | *(if configured)* | Max incoming packet size in bytes |
+| `retain_available` | `1` | Retained messages supported |
+| `wildcard_subscription_available` | `1` | Wildcard subscriptions supported |
+| `subscription_identifier_available` | `0` | Subscription identifiers not supported |
+
+### MQTT 5.0 Publish Properties
+
+The `opts` map passed to `handle_publish/4` includes a `:properties` key containing any MQTT 5.0 publish properties sent by the client (e.g., `user_properties`, `content_type`, `correlation_data`, `response_topic`, `payload_format_indicator`, `message_expiry_interval`). These properties are also forwarded when the server sends outgoing PUBLISH messages via `handle_info/2`.
+
+### Session Handling
+
+The server operates in clean-session mode: `session_present` is always `false` in CONNACK. Session state (subscriptions, queued messages) is not persisted across reconnections. If your application requires session resumption, implement it at the handler level using `handle_connect/3` and a session store.
+
+### Subscription Options (MQTT 5.0)
+
+The server supports MQTT 5.0 subscription options:
+
+- **`no_local`**: When set to `true`, messages published by a client are not delivered back to that client's own matching subscriptions. Requires passing the publisher identity to `Router.match/3`.
+- **`retain_handling`**: Controls retained message delivery on subscribe:
+  - `0` — Send retained messages (default)
+  - `1` — Send retained messages if the subscription does not already exist
+  - `2` — Do not send retained messages on subscribe

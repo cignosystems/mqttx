@@ -750,6 +750,12 @@ defmodule MqttX.Client.Connection do
     state
   end
 
+  defp handle_packet(%{type: :disconnect} = packet, state) do
+    reason_code = Map.get(packet, :reason_code, 0)
+    state = notify_handler(state, :disconnected, {:server_disconnect, reason_code})
+    %{state | connected: false}
+  end
+
   defp handle_packet(_packet, state) do
     state
   end

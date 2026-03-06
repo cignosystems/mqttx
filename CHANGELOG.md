@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.7.1] - 2026-03-06
+## [0.8.0] - 2026-03-06
 
 ### Added
 
@@ -13,11 +13,17 @@ All notable changes to this project will be documented in this file.
   - **server_reference**: Client parses and logs server redirect on CONNACK rejection and server DISCONNECT (§3.2.2.3.18)
   - **Enhanced AUTH**: Client handles multi-step AUTH exchange during and after CONNECT via `handle_auth/3` callback (§4.12)
 - **EMQX Cloud Interop**: 49 automated interop tests against EMQX Cloud broker
+- **SUBACK Reason Code Checking**: `subscribe/3` now returns `{:ok, [granted_qos]}` or `{:error, {:subscription_refused, acks}}` based on actual SUBACK response
+- **Outgoing Topic Aliases** (MQTT 5.0): Client automatically assigns and reuses topic aliases for repeated publish topics, reducing bandwidth
+- **DISCONNECT with Reason Code**: `disconnect/2` accepts `:reason_code` and `:properties` options for MQTT 5.0 graceful disconnect
+- **WebSocket Client Transport**: Connect to brokers over WebSocket with `transport: :ws` or `transport: :wss` (RFC 6455 binary framing)
+- **Reason String Surfacing**: Server reason strings from SUBACK, UNSUBACK, PUBACK, DISCONNECT are logged automatically
 
 ### Fixed
 
 - Formatting issues across multiple files (CI compliance)
 - Dialyzer `callback_type_mismatch` in WebSocket transport `close/1` (now returns `:ok` per behaviour spec)
+- WebSocket frame decoder byte-alignment bug in `decode_one_frame` (mask_bit extraction)
 
 ## [0.7.0] - 2026-03-05
 

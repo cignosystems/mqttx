@@ -58,6 +58,35 @@ The supervisor uses a `:one_for_one` strategy — each connection is independent
 
 When `:transport` is `:ssl`, the default port changes to `8883`.
 
+## WebSocket Transport
+
+Connect to brokers that expose MQTT over WebSocket:
+
+```elixir
+{:ok, client} = MqttX.Client.connect(
+  host: "broker.example.com",
+  port: 8083,
+  client_id: "ws_client",
+  transport: :ws,
+  ws_path: "/mqtt"
+)
+```
+
+For secure WebSocket (WSS):
+
+```elixir
+{:ok, client} = MqttX.Client.connect(
+  host: "broker.example.com",
+  port: 8084,
+  client_id: "wss_client",
+  transport: :wss,
+  ws_path: "/mqtt",
+  ssl_opts: [verify: :verify_peer, cacerts: :public_key.cacerts_get()]
+)
+```
+
+Default ports: `8083` for `:ws`, `8084` for `:wss`. The `:ws_path` defaults to `"/mqtt"`.
+
 ## Session Persistence
 
 For QoS 1/2 reliability across reconnects, disable clean sessions and provide a session store:
@@ -192,14 +221,15 @@ MqttX.Client.publish(client, "events/alert", payload,
 | Option | Description | Default |
 |--------|-------------|---------|
 | `:host` | Broker hostname | *required* |
-| `:port` | Broker port | `1883` / `8883` (SSL) |
+| `:port` | Broker port | `1883` / `8883` / `8083` / `8084` |
 | `:client_id` | Client identifier | *required* |
 | `:username` | Authentication username | `nil` |
 | `:password` | Authentication password | `nil` |
 | `:clean_session` | Start fresh session | `true` |
 | `:keepalive` | Keep-alive interval (seconds) | `60` |
-| `:transport` | `:tcp` or `:ssl` | `:tcp` |
-| `:ssl_opts` | SSL options for `:ssl` transport | `[]` |
+| `:transport` | `:tcp`, `:ssl`, `:ws`, or `:wss` | `:tcp` |
+| `:ssl_opts` | SSL options for `:ssl` or `:wss` transport | `[]` |
+| `:ws_path` | WebSocket path for `:ws` or `:wss` transport | `"/mqtt"` |
 | `:retry_interval` | QoS retry interval (ms) | `5000` |
 | `:max_inflight` | Max pending QoS 1/2 messages | `100` |
 | `:connect_properties` | MQTT 5.0 CONNECT properties map | `%{}` |

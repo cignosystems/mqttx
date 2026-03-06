@@ -154,7 +154,8 @@ defmodule MqttX.Client do
 
   - `:qos` - QoS level 0, 1, or 2 (default: 0)
   """
-  @spec subscribe(pid(), binary() | [binary()], keyword()) :: :ok | {:error, term()}
+  @spec subscribe(pid(), binary() | [binary()], keyword()) ::
+          {:ok, [integer()]} | {:error, term()}
   def subscribe(client, topics, opts \\ []) do
     Connection.subscribe(client, topics, opts)
   end
@@ -169,10 +170,15 @@ defmodule MqttX.Client do
 
   @doc """
   Disconnect from the broker.
+
+  ## Options (MQTT 5.0)
+
+  - `:reason_code` - Disconnect reason code (default: 0x00 Normal)
+  - `:properties` - Disconnect properties map, e.g. `%{session_expiry_interval: 0}`
   """
-  @spec disconnect(pid()) :: :ok
-  def disconnect(client) do
-    Connection.disconnect(client)
+  @spec disconnect(pid(), keyword()) :: :ok
+  def disconnect(client, opts \\ []) do
+    Connection.disconnect(client, opts)
   end
 
   @doc """
@@ -231,7 +237,7 @@ defmodule MqttX.Client do
 
     # Subscribe to response topic, then publish the request
     case subscribe(client, response_topic, qos: qos) do
-      :ok ->
+      {:ok, _granted_qos} ->
         publish_opts = [
           qos: qos,
           properties: %{

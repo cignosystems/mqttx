@@ -162,7 +162,7 @@ defmodule MqttX.InteropEmqxTest do
       assert MqttX.Client.connected?(client)
 
       topic = "mqttx/test/qos0/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 0)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 0)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "qos0 payload")
 
@@ -179,7 +179,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/empty/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic)
+      {:ok, _} = MqttX.Client.subscribe(client, topic)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "")
 
@@ -197,7 +197,7 @@ defmodule MqttX.InteropEmqxTest do
 
       topic = "mqttx/test/binary/#{uid()}"
       binary_payload = <<0, 1, 2, 255, 254, 253, 128, 0, 0>>
-      :ok = MqttX.Client.subscribe(client, topic)
+      {:ok, _} = MqttX.Client.subscribe(client, topic)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, binary_payload)
 
@@ -215,7 +215,7 @@ defmodule MqttX.InteropEmqxTest do
 
       topic = "mqttx/test/large/#{uid()}"
       large_payload = :crypto.strong_rand_bytes(65536)
-      :ok = MqttX.Client.subscribe(client, topic)
+      {:ok, _} = MqttX.Client.subscribe(client, topic)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, large_payload)
 
@@ -238,7 +238,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/qos1/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "qos1 payload", qos: 1)
 
@@ -255,7 +255,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/burst/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
 
       for i <- 1..20 do
@@ -279,7 +279,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/qos2/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 2)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 2)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "qos2 exactly once", qos: 2)
 
@@ -298,7 +298,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       base = "mqttx/test/wild/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, "#{base}/#")
+      {:ok, _} = MqttX.Client.subscribe(client, "#{base}/#")
       Process.sleep(500)
 
       :ok = MqttX.Client.publish(client, "#{base}/a", "w1")
@@ -318,7 +318,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       base = "mqttx/test/plus/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, "#{base}/+/data")
+      {:ok, _} = MqttX.Client.subscribe(client, "#{base}/+/data")
       Process.sleep(500)
 
       :ok = MqttX.Client.publish(client, "#{base}/sensor1/data", "s1")
@@ -342,7 +342,7 @@ defmodule MqttX.InteropEmqxTest do
 
       t1 = "mqttx/test/multi/#{uid()}/a"
       t2 = "mqttx/test/multi/#{uid()}/b"
-      :ok = MqttX.Client.subscribe(client, [t1, t2], qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, [t1, t2], qos: 1)
       Process.sleep(500)
 
       :ok = MqttX.Client.publish(client, t1, "msg-a", qos: 1)
@@ -362,7 +362,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/unsub/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic)
+      {:ok, _} = MqttX.Client.subscribe(client, topic)
       Process.sleep(500)
 
       :ok = MqttX.Client.publish(client, topic, "before")
@@ -389,7 +389,7 @@ defmodule MqttX.InteropEmqxTest do
 
       # MQTT allows most UTF-8 in topics (except +, #, null)
       topic = "mqttx/test/spécial/über-tøpic/日本語/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic)
+      {:ok, _} = MqttX.Client.subscribe(client, topic)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "unicode topic")
 
@@ -419,7 +419,7 @@ defmodule MqttX.InteropEmqxTest do
       # New subscriber should receive the retained message
       {:ok, subscriber} = connect_emqx(sub_id, agent: sub_agent)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, topic, qos: 0)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, topic, qos: 0)
 
       events = wait_for_events(sub_agent, 2, 5000)
       assert Enum.any?(events, &match?({:message, ^topic, "retained data", _}, &1))
@@ -453,7 +453,7 @@ defmodule MqttX.InteropEmqxTest do
       {:ok, sub_agent} = Agent.start_link(fn -> [] end)
       {:ok, client2} = connect_emqx("mqttx-retc2-#{uid()}", agent: sub_agent)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(client2, topic)
+      {:ok, _} = MqttX.Client.subscribe(client2, topic)
       Process.sleep(2000)
 
       events = Agent.get(sub_agent, & &1)
@@ -475,7 +475,7 @@ defmodule MqttX.InteropEmqxTest do
       # Subscriber listens for the will topic
       {:ok, subscriber} = connect_emqx("mqttx-willsub-#{uid()}", agent: sub_agent)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
       Process.sleep(500)
 
       # Publisher connects WITH a will message
@@ -521,7 +521,7 @@ defmodule MqttX.InteropEmqxTest do
 
       {:ok, subscriber} = connect_emqx("mqttx-wgsub-#{uid()}", agent: sub_agent)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
       Process.sleep(500)
 
       {:ok, will_client} =
@@ -564,7 +564,7 @@ defmodule MqttX.InteropEmqxTest do
       {:ok, publisher} = connect_emqx("mqttx-2cpub-#{uid()}")
       Process.sleep(2000)
 
-      :ok = MqttX.Client.subscribe(subscriber, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, topic, qos: 1)
       Process.sleep(500)
 
       :ok = MqttX.Client.publish(publisher, topic, "cross-client", qos: 1)
@@ -598,7 +598,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/v5/qos0/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 0)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 0)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "v5 qos0")
 
@@ -615,7 +615,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/v5/qos1/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "v5 qos1", qos: 1)
 
@@ -632,7 +632,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/v5/qos2/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 2)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 2)
       Process.sleep(500)
       :ok = MqttX.Client.publish(client, topic, "v5 qos2", qos: 2)
 
@@ -651,7 +651,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/v5/userprops/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
 
       props = %{
@@ -688,7 +688,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/v5/content/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
 
       props = %{
@@ -722,7 +722,7 @@ defmodule MqttX.InteropEmqxTest do
       # "Server" listens on request topic
       {:ok, server} = connect_emqx("mqttx-v5srv-#{uid()}", agent: req_agent, protocol_version: 5)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(server, request_topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(server, request_topic, qos: 1)
       Process.sleep(500)
 
       # "Client" listens on response topic
@@ -730,7 +730,7 @@ defmodule MqttX.InteropEmqxTest do
         connect_emqx("mqttx-v5req-#{uid()}", agent: resp_agent, protocol_version: 5)
 
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(requester, response_topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(requester, response_topic, qos: 1)
       Process.sleep(500)
 
       # Send request with response_topic and correlation_data
@@ -785,7 +785,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/v5/expiry/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
 
       props = %{message_expiry_interval: 3600}
@@ -816,7 +816,7 @@ defmodule MqttX.InteropEmqxTest do
       {:ok, publisher} = connect_emqx("mqttx-v5xp-#{uid()}", protocol_version: 5)
       Process.sleep(2000)
 
-      :ok = MqttX.Client.subscribe(subscriber, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, topic, qos: 1)
       Process.sleep(500)
 
       props = %{user_properties: [{"sender", "publisher"}]}
@@ -852,7 +852,7 @@ defmodule MqttX.InteropEmqxTest do
       {:ok, client1} = connect_emqx(client_id, agent: sub_agent, clean_session: false)
       Process.sleep(2000)
       assert MqttX.Client.connected?(client1)
-      :ok = MqttX.Client.subscribe(client1, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client1, topic, qos: 1)
       Process.sleep(500)
 
       # Disconnect gracefully
@@ -897,7 +897,7 @@ defmodule MqttX.InteropEmqxTest do
       # Connect subscriber with clean_session: false and subscribe QoS 1
       {:ok, subscriber} = connect_emqx(client_id, agent: sub_agent, clean_session: false)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, topic, qos: 1)
       Process.sleep(500)
 
       # Disconnect subscriber
@@ -1008,7 +1008,7 @@ defmodule MqttX.InteropEmqxTest do
 
       # QoS 1 publishes should work within limits
       topic = "mqttx/test/flow/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
 
       for i <- 1..5 do
@@ -1055,7 +1055,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/nolocal/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1, no_local: true)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1, no_local: true)
       Process.sleep(500)
 
       # Publish to own subscribed topic — should NOT be received
@@ -1097,7 +1097,7 @@ defmodule MqttX.InteropEmqxTest do
         connect_emqx("mqttx-rh-sub-#{uid()}", agent: sub_agent, protocol_version: 5)
 
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, topic, qos: 1, retain_handling: 2)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, topic, qos: 1, retain_handling: 2)
       Process.sleep(2000)
 
       # Should NOT receive the retained message
@@ -1192,7 +1192,7 @@ defmodule MqttX.InteropEmqxTest do
       {:ok, sub_agent} = Agent.start_link(fn -> [] end)
       {:ok, subscriber} = connect_emqx("mqttx-willret-sub-#{uid()}", agent: sub_agent)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
 
       events = wait_for_events(sub_agent, 2, 5000)
       assert Enum.any?(events, &match?({:message, ^will_topic, "retained will", _}, &1))
@@ -1221,7 +1221,7 @@ defmodule MqttX.InteropEmqxTest do
         connect_emqx("mqttx-wdsub-#{uid()}", agent: sub_agent, protocol_version: 5)
 
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, will_topic, qos: 1)
       Process.sleep(500)
 
       # Publisher connects with will_delay_interval of 5 seconds
@@ -1303,7 +1303,7 @@ defmodule MqttX.InteropEmqxTest do
 
       # Subscribe
       topic = "mqttx/test/telem/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
       assert_received {:telemetry, [:mqttx, :client, :subscribe], _, _}
 
@@ -1379,7 +1379,7 @@ defmodule MqttX.InteropEmqxTest do
       # Connect with persistent session, subscribe
       {:ok, client} = connect_emqx(client_id, agent: agent, clean_session: false)
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
 
       # Verify initial message delivery works
@@ -1424,7 +1424,7 @@ defmodule MqttX.InteropEmqxTest do
       Process.sleep(2000)
 
       topic = "mqttx/test/talias/#{uid()}"
-      :ok = MqttX.Client.subscribe(client, topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, topic, qos: 1)
       Process.sleep(500)
 
       # Publish multiple messages to the same topic
@@ -1465,7 +1465,7 @@ defmodule MqttX.InteropEmqxTest do
         connect_emqx("mqttx-reqsrv-#{uid()}", agent: req_agent, protocol_version: 5)
 
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(server, request_topic, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(server, request_topic, qos: 1)
       Process.sleep(500)
 
       # "Client" uses request/4 helper
@@ -1539,8 +1539,8 @@ defmodule MqttX.InteropEmqxTest do
 
       Process.sleep(2000)
 
-      :ok = MqttX.Client.subscribe(sub1, shared_filter, qos: 1)
-      :ok = MqttX.Client.subscribe(sub2, shared_filter, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(sub1, shared_filter, qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(sub2, shared_filter, qos: 1)
       Process.sleep(500)
 
       # Publisher sends multiple messages
@@ -1592,7 +1592,7 @@ defmodule MqttX.InteropEmqxTest do
         connect_emqx("mqttx-rap-sub-#{uid()}", agent: sub_agent, protocol_version: 5)
 
       Process.sleep(2000)
-      :ok = MqttX.Client.subscribe(subscriber, topic, qos: 1, retain_as_published: true)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, topic, qos: 1, retain_as_published: true)
       Process.sleep(500)
 
       {:ok, publisher} =

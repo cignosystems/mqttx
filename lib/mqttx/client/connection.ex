@@ -42,6 +42,8 @@ defmodule MqttX.Client.Connection do
 
   @default_port 1883
   @default_ssl_port 8883
+  @default_ws_port 8083
+  @default_wss_port 8084
   @default_keepalive 60
   @default_retry_interval 5000
   @default_max_inflight 100
@@ -87,6 +89,17 @@ defmodule MqttX.Client.Connection do
     clean_session: true,
     # Incoming topic aliases (alias -> topic, MQTT 5.0)
     alias_to_topic: %{},
+    # Outgoing topic aliases (topic -> alias, MQTT 5.0)
+    topic_to_alias: %{},
+    next_alias: 1,
+    # Server's topic_alias_maximum (from CONNACK, for outgoing aliases)
+    server_topic_alias_maximum: 0,
+    # WebSocket path (for :ws/:wss transport)
+    ws_path: "/mqtt",
+    # WebSocket frame buffer (for :ws/:wss transport)
+    ws_buffer: <<>>,
+    # Pending callers waiting for SUBACK/UNSUBACK
+    pending_subs: %{},
     handler_has_handle_mqtt_event: false,
     inflight_tx_count: 0
   ]
@@ -111,8 +124,9 @@ defmodule MqttX.Client.Connection do
   - `:keepalive` - Keepalive interval in seconds (default: 60)
   - `:handler` - Module to receive callbacks
   - `:handler_state` - Initial state for handler
-  - `:transport` - Transport type: `:tcp` or `:ssl` (default: `:tcp`)
-  - `:ssl_opts` - SSL options when transport is `:ssl` (e.g., `[verify: :verify_peer]`)
+  - `:transport` - Transport type: `:tcp`, `:ssl`, `:ws`, or `:wss` (default: `:tcp`)
+  - `:ssl_opts` - SSL options when transport is `:ssl` or `:wss` (e.g., `[verify: :verify_peer]`)
+  - `:ws_path` - WebSocket path when transport is `:ws` or `:wss` (default: "/mqtt")
   - `:retry_interval` - Retry interval for unacknowledged QoS 1/2 messages in ms (default: 5000)
   - `:max_inflight` - Maximum pending QoS 1/2 messages before backpressure (default: 100)
   - `:will_topic` - Will message topic (enables Last Will & Testament)
@@ -152,7 +166,8 @@ defmodule MqttX.Client.Connection do
   - `:retain_handling` - Retained message behavior: 0=send on subscribe, 1=send if new, 2=don't send (MQTT 5.0, default: 0)
   - `:properties` - SUBSCRIBE packet properties map (MQTT 5.0), e.g. `%{subscription_identifier: 1}`
   """
-  @spec subscribe(GenServer.server(), binary() | [binary()], keyword()) :: :ok | {:error, term()}
+  @spec subscribe(GenServer.server(), binary() | [binary()], keyword()) ::
+          {:ok, [integer()]} | {:error, term()}
   def subscribe(pid, topics, opts \\ []) do
     topics = if is_binary(topics), do: [topics], else: topics
     GenServer.call(pid, {:subscribe, topics, opts})
@@ -169,10 +184,15 @@ defmodule MqttX.Client.Connection do
 
   @doc """
   Disconnect from the broker.
+
+  ## Options (MQTT 5.0)
+
+  - `:reason_code` - Disconnect reason code (default: 0x00 Normal)
+  - `:properties` - Disconnect properties map, e.g. `%{session_expiry_interval: 0}`
   """
-  @spec disconnect(GenServer.server()) :: :ok
-  def disconnect(pid) do
-    GenServer.cast(pid, :disconnect)
+  @spec disconnect(GenServer.server(), keyword()) :: :ok
+  def disconnect(pid, opts \\ []) do
+    GenServer.cast(pid, {:disconnect, opts})
   end
 
   @doc """
@@ -190,7 +210,15 @@ defmodule MqttX.Client.Connection do
   @impl true
   def init(opts) do
     transport = Keyword.get(opts, :transport, :tcp)
-    default_port = if transport == :ssl, do: @default_ssl_port, else: @default_port
+
+    default_port =
+      case transport do
+        :ssl -> @default_ssl_port
+        :ws -> @default_ws_port
+        :wss -> @default_wss_port
+        _ -> @default_port
+      end
+
     client_id = Keyword.fetch!(opts, :client_id)
     clean_session = Keyword.get(opts, :clean_session, true)
 
@@ -220,6 +248,7 @@ defmodule MqttX.Client.Connection do
       protocol_version: Keyword.get(opts, :protocol_version, 4),
       transport: transport,
       ssl_opts: Keyword.get(opts, :ssl_opts, []),
+      ws_path: Keyword.get(opts, :ws_path, "/mqtt"),
       retry_interval: Keyword.get(opts, :retry_interval, @default_retry_interval),
       session_store: session_store,
       session_store_state: session_store_state,
@@ -257,15 +286,19 @@ defmodule MqttX.Client.Connection do
       else
         {packet_id, state} = if qos > 0, do: next_packet_id(state), else: {nil, state}
 
+        # Apply outgoing topic alias (MQTT 5.0)
+        {publish_topic, publish_properties, state} =
+          apply_outgoing_topic_alias(topic, properties, state)
+
         packet = %{
           type: :publish,
-          topic: topic,
+          topic: publish_topic,
           payload: payload,
           qos: qos,
           retain: retain,
           dup: false,
           packet_id: packet_id,
-          properties: properties
+          properties: publish_properties
         }
 
         # Emit telemetry for publish
@@ -329,7 +362,7 @@ defmodule MqttX.Client.Connection do
     end
   end
 
-  def handle_call({:subscribe, topics, opts}, _from, state) do
+  def handle_call({:subscribe, topics, opts}, from, state) do
     if state.connected do
       qos = Keyword.get(opts, :qos, 0)
       no_local = Keyword.get(opts, :no_local, false)
@@ -361,15 +394,20 @@ defmodule MqttX.Client.Connection do
       Telemetry.client_subscribe(%{client_id: state.client_id, topics: topics})
 
       case send_packet(state, packet) do
-        :ok -> {:reply, :ok, state}
-        {:error, _} = err -> {:reply, err, state}
+        :ok ->
+          # Wait for SUBACK asynchronously
+          pending = Map.put(state.pending_subs, packet_id, {:subscribe, from})
+          {:noreply, %{state | pending_subs: pending}}
+
+        {:error, _} = err ->
+          {:reply, err, state}
       end
     else
       {:reply, {:error, :not_connected}, state}
     end
   end
 
-  def handle_call({:unsubscribe, topics}, _from, state) do
+  def handle_call({:unsubscribe, topics}, from, state) do
     if state.connected do
       {packet_id, state} = next_packet_id(state)
 
@@ -380,8 +418,12 @@ defmodule MqttX.Client.Connection do
       }
 
       case send_packet(state, packet) do
-        :ok -> {:reply, :ok, state}
-        {:error, _} = err -> {:reply, err, state}
+        :ok ->
+          pending = Map.put(state.pending_subs, packet_id, {:unsubscribe, from})
+          {:noreply, %{state | pending_subs: pending}}
+
+        {:error, _} = err ->
+          {:reply, err, state}
       end
     else
       {:reply, {:error, :not_connected}, state}
@@ -393,11 +435,19 @@ defmodule MqttX.Client.Connection do
   end
 
   @impl true
-  def handle_cast(:disconnect, state) do
+  def handle_cast({:disconnect, opts}, state) do
+    reason_code = Keyword.get(opts, :reason_code, 0)
+    properties = Keyword.get(opts, :properties, %{})
+
     Telemetry.client_disconnect(%{client_id: state.client_id, reason: :normal})
-    send_packet(state, %{type: :disconnect})
+
+    send_packet(state, %{
+      type: :disconnect,
+      reason_code: reason_code,
+      properties: properties
+    })
+
     close_socket(state)
-    # Save session before stopping
     save_session(state)
     {:stop, :normal, %{state | connected: false, socket: nil}}
   end
@@ -461,19 +511,25 @@ defmodule MqttX.Client.Connection do
   # Handle incoming data from both TCP and SSL sockets
   def handle_info({proto, socket, data}, %{socket: socket} = state)
       when proto in [:tcp, :ssl] do
-    buffer =
-      case state.buffer do
-        <<>> -> data
-        buf -> buf <> data
+    state =
+      if state.transport in [:ws, :wss] do
+        handle_ws_data(data, state)
+      else
+        buffer =
+          case state.buffer do
+            <<>> -> data
+            buf -> buf <> data
+          end
+
+        %{state | buffer: buffer}
       end
 
-    state = %{state | buffer: buffer}
     state = process_buffer(state)
     set_socket_active(state)
     {:noreply, state}
   end
 
-  # Handle socket closed for both TCP and SSL
+  # Handle socket closed for TCP, SSL, WS, WSS
   def handle_info({closed, socket}, %{socket: socket} = state)
       when closed in [:tcp_closed, :ssl_closed] do
     Logger.info("[MqttX.Client] Connection closed")
@@ -534,6 +590,49 @@ defmodule MqttX.Client.Connection do
     end
   end
 
+  defp do_connect(%{transport: :ws} = state) do
+    host = to_charlist(state.host)
+
+    case :gen_tcp.connect(host, state.port, [:binary, active: false], @connect_timeout) do
+      {:ok, socket} ->
+        case MqttX.Client.WebSocket.upgrade(socket, :tcp, state.host, state.ws_path) do
+          :ok ->
+            :inet.setopts(socket, active: :once)
+            state = %{state | socket: socket, ws_buffer: <<>>}
+            send_connect(state)
+
+          {:error, _} = err ->
+            :gen_tcp.close(socket)
+            err
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp do_connect(%{transport: :wss} = state) do
+    host = to_charlist(state.host)
+    ssl_opts = [:binary, {:active, false}] ++ (state.ssl_opts || [])
+
+    case :ssl.connect(host, state.port, ssl_opts, @connect_timeout) do
+      {:ok, socket} ->
+        case MqttX.Client.WebSocket.upgrade(socket, :ssl, state.host, state.ws_path) do
+          :ok ->
+            :ssl.setopts(socket, active: :once)
+            state = %{state | socket: socket, ws_buffer: <<>>}
+            send_connect(state)
+
+          {:error, _} = err ->
+            :ssl.close(socket)
+            err
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
   defp send_connect(state) do
     packet = %{
       type: :connect,
@@ -556,6 +655,17 @@ defmodule MqttX.Client.Connection do
   defp wait_for_connack(state) do
     receive do
       {proto, socket, data} when proto in [:tcp, :ssl] and socket == state.socket ->
+        # Unwrap WebSocket frames if ws/wss transport
+        data =
+          if state.transport in [:ws, :wss] do
+            case MqttX.Client.WebSocket.decode_frames(data) do
+              {:ok, payloads, _rest} -> IO.iodata_to_binary(payloads)
+              {:close, payloads} -> IO.iodata_to_binary(payloads)
+            end
+          else
+            data
+          end
+
         case Codec.decode(state.protocol_version, data) do
           {:ok, {%{type: :connack, reason_code: 0} = connack, rest}} ->
             Logger.info("[MqttX.Client] Connected to #{state.host}:#{state.port}")
@@ -584,6 +694,9 @@ defmodule MqttX.Client.Connection do
             retry_timer = Process.send_after(self(), :check_inflight, state.retry_interval)
             set_socket_active(state)
 
+            # Server's topic_alias_maximum tells us how many outgoing aliases we can use
+            server_tam = Map.get(props, :topic_alias_maximum, 0)
+
             state = %{
               state
               | connected: true,
@@ -594,7 +707,10 @@ defmodule MqttX.Client.Connection do
                 client_id: client_id,
                 topic_alias_maximum: topic_alias_max,
                 receive_maximum: receive_max,
-                server_maximum_packet_size: max_packet_size
+                server_maximum_packet_size: max_packet_size,
+                server_topic_alias_maximum: server_tam,
+                topic_to_alias: %{},
+                next_alias: 1
             }
 
             state = notify_handler(state, :connected, %{properties: props})
@@ -603,6 +719,7 @@ defmodule MqttX.Client.Connection do
           {:ok, {%{type: :connack, reason_code: code} = connack, _rest}} ->
             props = Map.get(connack, :properties, %{})
             server_ref = Map.get(props, :server_reference)
+            log_reason_string(props)
 
             if server_ref do
               Logger.info("[MqttX.Client] Server reference: #{server_ref}")
@@ -708,6 +825,8 @@ defmodule MqttX.Client.Connection do
   end
 
   defp handle_packet(%{type: :puback} = packet, state) do
+    log_reason_string(Map.get(packet, :properties, %{}))
+
     # QoS 1 complete: emit telemetry and remove from pending acks
     case Map.get(state.pending_acks, {:tx, packet.packet_id}) do
       %{timestamp: ts, telemetry_meta: meta} ->
@@ -787,12 +906,43 @@ defmodule MqttX.Client.Connection do
     %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
   end
 
-  defp handle_packet(%{type: :suback}, state) do
-    state
+  defp handle_packet(%{type: :suback} = packet, state) do
+    packet_id = packet.packet_id
+    acks = Map.get(packet, :acks, [])
+    props = Map.get(packet, :properties, %{})
+    log_reason_string(props)
+
+    case Map.pop(state.pending_subs, packet_id) do
+      {{:subscribe, from}, pending} ->
+        # Check if any subscription was rejected
+        reply =
+          if Enum.all?(acks, &match?({:ok, _}, &1)) do
+            {:ok, Enum.map(acks, fn {:ok, qos} -> qos end)}
+          else
+            {:error, {:subscription_refused, acks}}
+          end
+
+        GenServer.reply(from, reply)
+        %{state | pending_subs: pending}
+
+      {nil, _} ->
+        state
+    end
   end
 
-  defp handle_packet(%{type: :unsuback}, state) do
-    state
+  defp handle_packet(%{type: :unsuback} = packet, state) do
+    packet_id = packet.packet_id
+    props = Map.get(packet, :properties, %{})
+    log_reason_string(props)
+
+    case Map.pop(state.pending_subs, packet_id) do
+      {{:unsubscribe, from}, pending} ->
+        GenServer.reply(from, :ok)
+        %{state | pending_subs: pending}
+
+      {nil, _} ->
+        state
+    end
   end
 
   defp handle_packet(%{type: :pingresp}, state) do
@@ -826,6 +976,7 @@ defmodule MqttX.Client.Connection do
     reason_code = Map.get(packet, :reason_code, 0)
     props = Map.get(packet, :properties, %{})
     server_ref = Map.get(props, :server_reference)
+    log_reason_string(props)
 
     if server_ref do
       Logger.info("[MqttX.Client] Server reference on disconnect: #{server_ref}")
@@ -867,6 +1018,14 @@ defmodule MqttX.Client.Connection do
 
   defp socket_send(%{transport: :ssl, socket: socket}, data) do
     :ssl.send(socket, data)
+  end
+
+  defp socket_send(%{transport: :ws, socket: socket}, data) do
+    :gen_tcp.send(socket, MqttX.Client.WebSocket.encode_frame(data))
+  end
+
+  defp socket_send(%{transport: :wss, socket: socket}, data) do
+    :ssl.send(socket, MqttX.Client.WebSocket.encode_frame(data))
   end
 
   defp next_packet_id(state) do
@@ -973,11 +1132,23 @@ defmodule MqttX.Client.Connection do
     :ssl.close(socket)
   end
 
-  defp set_socket_active(%{transport: :tcp, socket: socket}) do
+  defp close_socket(%{transport: :ws, socket: socket}) do
+    :gen_tcp.send(socket, MqttX.Client.WebSocket.encode_close())
+    :gen_tcp.close(socket)
+  end
+
+  defp close_socket(%{transport: :wss, socket: socket}) do
+    :ssl.send(socket, MqttX.Client.WebSocket.encode_close())
+    :ssl.close(socket)
+  end
+
+  defp set_socket_active(%{transport: transport, socket: socket})
+       when transport in [:tcp, :ws] do
     :inet.setopts(socket, active: :once)
   end
 
-  defp set_socket_active(%{transport: :ssl, socket: socket}) do
+  defp set_socket_active(%{transport: transport, socket: socket})
+       when transport in [:ssl, :wss] do
     :ssl.setopts(socket, active: :once)
   end
 
@@ -1091,6 +1262,69 @@ defmodule MqttX.Client.Connection do
   # ============================================================================
   # Topic Alias Helpers (MQTT 5.0)
   # ============================================================================
+
+  # Apply outgoing topic alias for PUBLISH (MQTT 5.0)
+  # If server supports topic aliases, reuse alias for repeated topics to save bandwidth
+  defp apply_outgoing_topic_alias(topic, properties, %{server_topic_alias_maximum: max} = state)
+       when max > 0 and not is_map_key(properties, :topic_alias) do
+    case Map.get(state.topic_to_alias, topic) do
+      nil when state.next_alias <= max ->
+        # Assign new alias: send topic + alias (server learns the mapping)
+        alias_id = state.next_alias
+        new_props = Map.put(properties, :topic_alias, alias_id)
+        new_map = Map.put(state.topic_to_alias, topic, alias_id)
+        {topic, new_props, %{state | topic_to_alias: new_map, next_alias: alias_id + 1}}
+
+      nil ->
+        # All aliases used, send normally
+        {topic, properties, state}
+
+      alias_id ->
+        # Reuse existing alias: send empty topic + alias
+        new_props = Map.put(properties, :topic_alias, alias_id)
+        {"", new_props, state}
+    end
+  end
+
+  defp apply_outgoing_topic_alias(topic, properties, state) do
+    {topic, properties, state}
+  end
+
+  # Handle WebSocket framed data — decode frames and append payloads to MQTT buffer
+  defp handle_ws_data(data, state) do
+    ws_buf = state.ws_buffer <> data
+
+    case MqttX.Client.WebSocket.decode_frames(ws_buf) do
+      {:ok, payloads, rest} ->
+        mqtt_data = IO.iodata_to_binary(payloads)
+
+        buffer =
+          case state.buffer do
+            <<>> -> mqtt_data
+            buf -> buf <> mqtt_data
+          end
+
+        %{state | buffer: buffer, ws_buffer: rest}
+
+      {:close, payloads} ->
+        mqtt_data = IO.iodata_to_binary(payloads)
+
+        buffer =
+          case state.buffer do
+            <<>> -> mqtt_data
+            buf -> buf <> mqtt_data
+          end
+
+        %{state | buffer: buffer, ws_buffer: <<>>}
+    end
+  end
+
+  # Log reason_string from server responses (MQTT 5.0)
+  defp log_reason_string(%{reason_string: reason}) when is_binary(reason) and reason != "" do
+    Logger.info("[MqttX.Client] Server reason: #{reason}")
+  end
+
+  defp log_reason_string(_props), do: :ok
 
   # Resolve topic alias for incoming PUBLISH messages
   defp resolve_incoming_topic_alias(packet, state) do

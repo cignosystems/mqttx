@@ -480,7 +480,7 @@ defmodule MqttX.IntegrationTest do
       Process.sleep(200)
       assert MqttX.Client.connected?(client)
 
-      :ok = MqttX.Client.subscribe(client, "test/sub/#", qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, "test/sub/#", qos: 1)
 
       events = wait_for_events(agent, 2)
 
@@ -507,7 +507,7 @@ defmodule MqttX.IntegrationTest do
       Process.sleep(200)
       assert MqttX.Client.connected?(client)
 
-      :ok = MqttX.Client.subscribe(client, "unsub/topic")
+      {:ok, _} = MqttX.Client.subscribe(client, "unsub/topic")
       Process.sleep(100)
       :ok = MqttX.Client.unsubscribe(client, "unsub/topic")
 
@@ -733,7 +733,7 @@ defmodule MqttX.IntegrationTest do
       Process.sleep(200)
       assert MqttX.Client.connected?(sub_client)
 
-      :ok = MqttX.Client.subscribe(sub_client, "retained/topic")
+      {:ok, _} = MqttX.Client.subscribe(sub_client, "retained/topic")
 
       # Wait for retained message delivery
       events = wait_for_events(client_agent, 2, 3000)
@@ -860,7 +860,7 @@ defmodule MqttX.IntegrationTest do
 
       Process.sleep(200)
 
-      :ok = MqttX.Client.subscribe(client, "telem/topic", qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, "telem/topic", qos: 1)
       Process.sleep(100)
 
       assert_received {:telemetry, [:mqttx, :server, :subscribe], _,
@@ -1783,6 +1783,48 @@ defmodule MqttX.IntegrationTest do
     end
   end
 
+  describe "WebSocket client transport" do
+    test "connects, subscribes, publishes over WebSocket" do
+      {:ok, agent} = Agent.start_link(fn -> [] end)
+
+      # Start a WebSocket server
+      port = get_free_port()
+
+      {:ok, server_pid} =
+        MqttX.Server.start_link(TestHandler, [agent: agent],
+          port: port,
+          transport: MqttX.Transport.WebSocket
+        )
+
+      # Bandit needs a bit more startup time
+      Process.sleep(50)
+
+      Process.sleep(100)
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "ws-client-test",
+          transport: :ws,
+          protocol_version: 5
+        )
+
+      Process.sleep(300)
+      assert MqttX.Client.connected?(client)
+
+      {:ok, _} = MqttX.Client.subscribe(client, "ws/test/#", qos: 1)
+      Process.sleep(100)
+
+      events = Agent.get(agent, & &1)
+      assert Enum.any?(events, &match?({:subscribe, _}, &1))
+
+      GenServer.stop(client, :normal, 1000)
+      ThousandIsland.stop(server_pid)
+      Agent.stop(agent)
+    end
+  end
+
   describe "shared subscriptions" do
     test "client subscribes to $share/ topic filter" do
       {:ok, agent} = Agent.start_link(fn -> [] end)
@@ -1799,7 +1841,7 @@ defmodule MqttX.IntegrationTest do
       Process.sleep(200)
       assert MqttX.Client.connected?(client)
 
-      :ok = MqttX.Client.subscribe(client, "$share/workers/jobs/#", qos: 1)
+      {:ok, _} = MqttX.Client.subscribe(client, "$share/workers/jobs/#", qos: 1)
 
       events = wait_for_events(agent, 2)
 

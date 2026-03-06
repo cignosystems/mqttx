@@ -108,8 +108,8 @@ The handler receives three event types:
 | Event | Data | Description |
 |-------|------|-------------|
 | `:message` | `{topic, payload, packet}` | Incoming PUBLISH message |
-| `:connected` | `nil` | Connection established |
-| `:disconnected` | reason | Connection lost |
+| `:connected` | `%{properties: props}` | Connection established (props contains CONNACK properties) |
+| `:disconnected` | reason | Connection lost (may be `{:server_disconnect, code, %{server_reference: ref}}`) |
 
 ## MQTT 5.0 Features
 
@@ -130,6 +130,50 @@ def handle_mqtt_event(:message, {_topic, payload, packet}, state) do
   state
 end
 ```
+
+### Enhanced Authentication
+
+For brokers that require multi-step authentication (SASL-style), implement `handle_auth/3` in your handler:
+
+```elixir
+defmodule MyAuthHandler do
+  def handle_mqtt_event(_event, _data, state), do: state
+
+  def handle_auth(0x18, %{auth_method: "SCRAM-SHA-256", auth_data: challenge}, state) do
+    response = compute_scram_response(challenge, state.credentials)
+    {:continue, response, state}
+  end
+
+  def handle_auth(_reason_code, _props, state) do
+    {:ok, state}
+  end
+end
+```
+
+Include `auth_method` in connect properties to initiate enhanced auth:
+
+```elixir
+{:ok, client} = MqttX.Client.connect(
+  host: "broker.example.com",
+  client_id: "my_client",
+  protocol_version: 5,
+  connect_properties: %{auth_method: "SCRAM-SHA-256", auth_data: initial_data},
+  handler: MyAuthHandler,
+  handler_state: %{credentials: my_creds}
+)
+```
+
+### Server-Negotiated Settings
+
+The client automatically applies MQTT 5.0 CONNACK properties from the broker:
+
+| Property | Behavior |
+|----------|----------|
+| `server_keep_alive` | Overrides the client's keepalive timer |
+| `assigned_client_identifier` | Replaces the client's ID when connecting with empty `client_id` |
+| `maximum_packet_size` | Enforced on outgoing packets; oversized sends return `{:error, :packet_too_large}` |
+| `receive_maximum` | Limits concurrent in-flight QoS 1/2 publishes |
+| `server_reference` | Logged on CONNACK rejection or server DISCONNECT (for redirect) |
 
 ### Publishing with Properties
 
@@ -157,6 +201,8 @@ MqttX.Client.publish(client, "events/alert", payload,
 | `:transport` | `:tcp` or `:ssl` | `:tcp` |
 | `:ssl_opts` | SSL options for `:ssl` transport | `[]` |
 | `:retry_interval` | QoS retry interval (ms) | `5000` |
+| `:max_inflight` | Max pending QoS 1/2 messages | `100` |
+| `:connect_properties` | MQTT 5.0 CONNECT properties map | `%{}` |
 | `:session_store` | Session store module | `nil` |
 | `:handler` | Callback module for messages | `nil` |
 | `:handler_state` | Initial handler state | `nil` |

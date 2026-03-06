@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-03-06
+
+### Added
+
+- **Complete MQTT 5.0 Client Compliance**: Closed all remaining client-side spec gaps
+  - **server_keep_alive**: Client applies server's keepalive override from CONNACK (§3.2.2.3.14)
+  - **assigned_client_identifier**: Client adopts server-assigned client ID from CONNACK (§3.2.2.3.7)
+  - **maximum_packet_size**: Client enforces server's maximum packet size from CONNACK; oversized outgoing packets return `{:error, :packet_too_large}` (§3.2.2.3.6)
+  - **server_reference**: Client parses and logs server redirect on CONNACK rejection and server DISCONNECT (§3.2.2.3.18)
+  - **Enhanced AUTH**: Client handles multi-step AUTH exchange during and after CONNECT via `handle_auth/3` callback (§4.12)
+- **EMQX Cloud Interop**: 49 automated interop tests against EMQX Cloud broker
+
+### Fixed
+
+- Formatting issues across multiple files (CI compliance)
+- Dialyzer `callback_type_mismatch` in WebSocket transport `close/1` (now returns `:ok` per behaviour spec)
+
 ## [0.7.0] - 2026-03-05
 
 ### Added

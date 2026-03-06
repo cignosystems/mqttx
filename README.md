@@ -93,7 +93,7 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.7.0"},
+    {:mqttx, "~> 0.7.1"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: WebSocket transport
@@ -322,7 +322,12 @@ All 15 packet types are supported:
 
 ### Compliance
 
-Fully compliant with MQTT 3.1, 3.1.1, and 5.0 specifications. The server advertises all capability properties in CONNACK, enforces protocol ordering, validates topic aliases, forwards MQTT 5.0 properties, and supports subscription options (no_local, retain_handling). Validated against Mosquitto clients across both TCP and WebSocket transports with 100+ automated protocol tests.
+Fully compliant with MQTT 3.1, 3.1.1, and 5.0 specifications:
+
+- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_handling)
+- **Client**: server_keep_alive override, assigned_client_identifier, maximum_packet_size enforcement, server_reference handling, enhanced AUTH (multi-step), flow control (receive_maximum)
+
+Validated against Mosquitto (104 automated protocol tests across TCP and WebSocket) and EMQX Cloud (49 interop tests covering all QoS levels, properties, session persistence, and subscription options).
 
 ## Performance
 
@@ -383,6 +388,8 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 | `:transport` | `:tcp` or `:ssl` | `:tcp` |
 | `:ssl_opts` | SSL options for `:ssl` transport | `[]` |
 | `:retry_interval` | QoS retry interval (ms) | 5000 |
+| `:max_inflight` | Max pending QoS 1/2 messages | 100 |
+| `:connect_properties` | MQTT 5.0 CONNECT properties (e.g. `%{session_expiry_interval: 3600}`) | `%{}` |
 | `:session_store` | Session store module | `nil` |
 | `:handler` | Callback module for messages | `nil` |
 | `:handler_state` | Initial handler state | `nil` |
@@ -438,9 +445,9 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 
 | Feature | Status | Description |
 |---------|--------|-------------|
-| **Full MQTT 5.0 Compliance** | Done | Pre-CONNECT rejection, topic alias validation, property forwarding, CONNACK capabilities, retain_handling, no_local |
+| **Full MQTT 5.0 Compliance** | Done | Complete server and client compliance — all CONNACK properties, enhanced AUTH, flow control, server redirect |
 | **WebSocket Transport** | Done | MQTT over WebSocket via Bandit (`ws://` and `wss://`) |
-| **Mosquitto Validation** | Done | 104 automated protocol tests across TCP and WebSocket |
+| **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
 | **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
 | **Property-based Tests** | Planned | StreamData for fuzzing the packet codec |
 | **End-to-end Load Tests** | Planned | Benchee-based throughput validation under realistic workloads |

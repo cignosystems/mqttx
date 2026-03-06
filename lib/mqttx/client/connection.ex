@@ -75,6 +75,8 @@ defmodule MqttX.Client.Connection do
     :receive_maximum,
     # Local cap on pending QoS 1/2 messages (prevents unbounded memory growth)
     :max_inflight,
+    # Maximum outgoing packet size (MQTT 5.0, from CONNACK)
+    :server_maximum_packet_size,
     # Will message (Last Will & Testament)
     :will,
     # CONNECT properties (MQTT 5.0: session_expiry_interval, topic_alias_maximum, etc.)
@@ -557,14 +559,30 @@ defmodule MqttX.Client.Connection do
         case Codec.decode(state.protocol_version, data) do
           {:ok, {%{type: :connack, reason_code: 0} = connack, rest}} ->
             Logger.info("[MqttX.Client] Connected to #{state.host}:#{state.port}")
-            keepalive_timer = Process.send_after(self(), :keepalive, state.keepalive * 1000)
-            retry_timer = Process.send_after(self(), :check_inflight, state.retry_interval)
-            set_socket_active(state)
 
             # Extract MQTT 5.0 properties from CONNACK
             props = Map.get(connack, :properties, %{})
             topic_alias_max = Map.get(props, :topic_alias_maximum)
             receive_max = Map.get(props, :receive_maximum, 65535)
+            max_packet_size = Map.get(props, :maximum_packet_size)
+
+            # Server may override keepalive (MQTT 5.0 §3.2.2.3.14)
+            keepalive =
+              case Map.get(props, :server_keep_alive) do
+                nil -> state.keepalive
+                val -> val
+              end
+
+            # Server may assign a client identifier (MQTT 5.0 §3.2.2.3.7)
+            client_id =
+              case Map.get(props, :assigned_client_identifier) do
+                nil -> state.client_id
+                val -> val
+              end
+
+            keepalive_timer = Process.send_after(self(), :keepalive, keepalive * 1000)
+            retry_timer = Process.send_after(self(), :check_inflight, state.retry_interval)
+            set_socket_active(state)
 
             state = %{
               state
@@ -572,16 +590,47 @@ defmodule MqttX.Client.Connection do
                 buffer: rest,
                 keepalive_timer: keepalive_timer,
                 retry_timer: retry_timer,
+                keepalive: keepalive,
+                client_id: client_id,
                 topic_alias_maximum: topic_alias_max,
-                receive_maximum: receive_max
+                receive_maximum: receive_max,
+                server_maximum_packet_size: max_packet_size
             }
 
             state = notify_handler(state, :connected, %{properties: props})
             {:ok, state}
 
-          {:ok, {%{type: :connack, reason_code: code}, _rest}} ->
+          {:ok, {%{type: :connack, reason_code: code} = connack, _rest}} ->
+            props = Map.get(connack, :properties, %{})
+            server_ref = Map.get(props, :server_reference)
+
+            if server_ref do
+              Logger.info("[MqttX.Client] Server reference: #{server_ref}")
+            end
+
             close_socket(state)
-            {:error, {:connack_error, code}}
+            {:error, {:connack_error, code, %{server_reference: server_ref}}}
+
+          # Enhanced AUTH continuation during connect (MQTT 5.0 §4.12)
+          {:ok, {%{type: :auth, reason_code: 0x18} = auth_packet, rest}} ->
+            props = Map.get(auth_packet, :properties, %{})
+
+            case notify_handler_auth(state, 0x18, props) do
+              {:continue, auth_data, state} ->
+                send_packet(state, %{
+                  type: :auth,
+                  reason_code: 0x18,
+                  properties: %{
+                    auth_method: Map.get(props, :auth_method),
+                    auth_data: auth_data
+                  }
+                })
+
+                wait_for_connack(%{state | buffer: rest})
+
+              {:ok, state} ->
+                wait_for_connack(%{state | buffer: rest})
+            end
 
           {:error, :incomplete} ->
             # Need more data
@@ -750,9 +799,45 @@ defmodule MqttX.Client.Connection do
     state
   end
 
+  # Enhanced authentication (MQTT 5.0 §4.12)
+  defp handle_packet(%{type: :auth} = packet, state) do
+    reason_code = Map.get(packet, :reason_code, 0)
+    props = Map.get(packet, :properties, %{})
+
+    case notify_handler_auth(state, reason_code, props) do
+      {:continue, auth_data, state} ->
+        send_packet(state, %{
+          type: :auth,
+          reason_code: 0x18,
+          properties: %{
+            auth_method: Map.get(props, :auth_method),
+            auth_data: auth_data
+          }
+        })
+
+        state
+
+      {:ok, state} ->
+        state
+    end
+  end
+
   defp handle_packet(%{type: :disconnect} = packet, state) do
     reason_code = Map.get(packet, :reason_code, 0)
-    state = notify_handler(state, :disconnected, {:server_disconnect, reason_code})
+    props = Map.get(packet, :properties, %{})
+    server_ref = Map.get(props, :server_reference)
+
+    if server_ref do
+      Logger.info("[MqttX.Client] Server reference on disconnect: #{server_ref}")
+    end
+
+    state =
+      notify_handler(
+        state,
+        :disconnected,
+        {:server_disconnect, reason_code, %{server_reference: server_ref}}
+      )
+
     %{state | connected: false}
   end
 
@@ -763,7 +848,13 @@ defmodule MqttX.Client.Connection do
   defp send_packet(state, packet) do
     case Codec.encode_iodata(state.protocol_version, packet) do
       {:ok, data} ->
-        socket_send(state, data)
+        # Enforce server's maximum_packet_size (MQTT 5.0 §3.2.2.3.6)
+        if state.server_maximum_packet_size &&
+             :erlang.iolist_size(data) > state.server_maximum_packet_size do
+          {:error, :packet_too_large}
+        else
+          socket_send(state, data)
+        end
 
       {:error, _} = err ->
         err
@@ -902,6 +993,24 @@ defmodule MqttX.Client.Connection do
   end
 
   defp notify_handler(state, _event, _data), do: state
+
+  # Enhanced AUTH callback — handler can return {:continue, auth_data} or :ok
+  defp notify_handler_auth(%{handler: handler, handler_state: hstate} = state, reason_code, props)
+       when not is_nil(handler) do
+    if function_exported?(handler, :handle_auth, 3) do
+      case handler.handle_auth(reason_code, props, hstate) do
+        {:continue, auth_data, new_hstate} ->
+          {:continue, auth_data, %{state | handler_state: new_hstate}}
+
+        {:ok, new_hstate} ->
+          {:ok, %{state | handler_state: new_hstate}}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  defp notify_handler_auth(state, _reason_code, _props), do: {:ok, state}
 
   # Session store helpers
   defp init_session_store(nil), do: {nil, nil}

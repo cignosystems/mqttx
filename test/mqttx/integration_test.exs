@@ -1528,6 +1528,261 @@ defmodule MqttX.IntegrationTest do
     end
   end
 
+  describe "MQTT 5.0 CONNACK property handling" do
+    test "client applies server_keep_alive from CONNACK" do
+      # Start a raw TCP listener that sends a CONNACK with server_keep_alive
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+
+      test_pid = self()
+
+      spawn(fn ->
+        {:ok, sock} = :gen_tcp.accept(listen)
+        # Read CONNECT packet
+        {:ok, _data} = :gen_tcp.recv(sock, 0, 5000)
+        # Send CONNACK with server_keep_alive=10
+        connack =
+          encode_packet!(5, %{
+            type: :connack,
+            session_present: false,
+            reason_code: 0,
+            properties: %{server_keep_alive: 10}
+          })
+
+        :gen_tcp.send(sock, connack)
+        send(test_pid, :connack_sent)
+        # Keep socket open
+        Process.sleep(2000)
+        :gen_tcp.close(sock)
+      end)
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "keepalive-test",
+          protocol_version: 5,
+          keepalive: 60
+        )
+
+      assert_receive :connack_sent, 5000
+      Process.sleep(100)
+
+      # The client's keepalive should now be 10, not 60
+      state = :sys.get_state(client)
+      assert state.keepalive == 10
+
+      GenServer.stop(client, :normal, 1000)
+      :gen_tcp.close(listen)
+    end
+
+    test "client applies assigned_client_identifier from CONNACK" do
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+
+      test_pid = self()
+
+      spawn(fn ->
+        {:ok, sock} = :gen_tcp.accept(listen)
+        {:ok, _data} = :gen_tcp.recv(sock, 0, 5000)
+
+        connack =
+          encode_packet!(5, %{
+            type: :connack,
+            session_present: false,
+            reason_code: 0,
+            properties: %{assigned_client_identifier: "server-assigned-id"}
+          })
+
+        :gen_tcp.send(sock, connack)
+        send(test_pid, :connack_sent)
+        Process.sleep(2000)
+        :gen_tcp.close(sock)
+      end)
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "original-id",
+          protocol_version: 5
+        )
+
+      assert_receive :connack_sent, 5000
+      Process.sleep(100)
+
+      state = :sys.get_state(client)
+      assert state.client_id == "server-assigned-id"
+
+      GenServer.stop(client, :normal, 1000)
+      :gen_tcp.close(listen)
+    end
+
+    test "client applies maximum_packet_size from CONNACK and rejects oversized packets" do
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+
+      test_pid = self()
+
+      spawn(fn ->
+        {:ok, sock} = :gen_tcp.accept(listen)
+        {:ok, _data} = :gen_tcp.recv(sock, 0, 5000)
+
+        connack =
+          encode_packet!(5, %{
+            type: :connack,
+            session_present: false,
+            reason_code: 0,
+            properties: %{maximum_packet_size: 128}
+          })
+
+        :gen_tcp.send(sock, connack)
+        send(test_pid, :connack_sent)
+        Process.sleep(2000)
+        :gen_tcp.close(sock)
+      end)
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "maxpkt-test",
+          protocol_version: 5
+        )
+
+      assert_receive :connack_sent, 5000
+      Process.sleep(100)
+
+      state = :sys.get_state(client)
+      assert state.server_maximum_packet_size == 128
+
+      # Publishing a large payload should fail with :packet_too_large
+      result = MqttX.Client.publish(client, "test/topic", String.duplicate("x", 200))
+      assert result == {:error, :packet_too_large}
+
+      GenServer.stop(client, :normal, 1000)
+      :gen_tcp.close(listen)
+    end
+
+    test "client receives server_reference on CONNACK rejection" do
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+
+      test_pid = self()
+
+      spawn(fn ->
+        {:ok, sock} = :gen_tcp.accept(listen)
+        {:ok, _data} = :gen_tcp.recv(sock, 0, 5000)
+
+        connack =
+          encode_packet!(5, %{
+            type: :connack,
+            session_present: false,
+            reason_code: 0x9C,
+            properties: %{server_reference: "other-broker:1883"}
+          })
+
+        :gen_tcp.send(sock, connack)
+        send(test_pid, :connack_sent)
+        :gen_tcp.close(sock)
+      end)
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "ref-test",
+          protocol_version: 5
+        )
+
+      assert_receive :connack_sent, 5000
+      Process.sleep(200)
+
+      # Client should not be connected (rejected)
+      refute MqttX.Client.connected?(client)
+
+      GenServer.stop(client, :normal, 1000)
+      :gen_tcp.close(listen)
+    end
+
+    test "client handles server DISCONNECT with server_reference" do
+      {:ok, agent} = Agent.start_link(fn -> [] end)
+
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+
+      test_pid = self()
+
+      spawn(fn ->
+        {:ok, sock} = :gen_tcp.accept(listen)
+        {:ok, _data} = :gen_tcp.recv(sock, 0, 5000)
+
+        connack =
+          encode_packet!(5, %{
+            type: :connack,
+            session_present: false,
+            reason_code: 0,
+            properties: %{}
+          })
+
+        :gen_tcp.send(sock, connack)
+        send(test_pid, :connected)
+        Process.sleep(200)
+
+        # Send server DISCONNECT with server_reference
+        disconnect =
+          encode_packet!(5, %{
+            type: :disconnect,
+            reason_code: 0x9C,
+            properties: %{server_reference: "backup-broker:1883"}
+          })
+
+        :gen_tcp.send(sock, disconnect)
+        send(test_pid, :disconnect_sent)
+        Process.sleep(1000)
+        :gen_tcp.close(sock)
+      end)
+
+      defmodule ServerRefHandler do
+        def handle_mqtt_event(:disconnected, reason, state) do
+          Agent.update(state.agent, fn events -> [{:disconnected, reason} | events] end)
+          state
+        end
+
+        def handle_mqtt_event(_event, _data, state), do: state
+      end
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "disc-ref-test",
+          protocol_version: 5,
+          handler: ServerRefHandler,
+          handler_state: %{agent: agent}
+        )
+
+      assert_receive :connected, 5000
+      assert_receive :disconnect_sent, 5000
+      Process.sleep(300)
+
+      events = Agent.get(agent, & &1)
+
+      assert Enum.any?(events, fn
+               {:disconnected,
+                {:server_disconnect, 0x9C, %{server_reference: "backup-broker:1883"}}} ->
+                 true
+
+               _ ->
+                 false
+             end)
+
+      GenServer.stop(client, :normal, 1000)
+      :gen_tcp.close(listen)
+      Agent.stop(agent)
+    end
+  end
+
   describe "shared subscriptions" do
     test "client subscribes to $share/ topic filter" do
       {:ok, agent} = Agent.start_link(fn -> [] end)

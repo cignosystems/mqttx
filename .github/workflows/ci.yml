@@ -24,16 +24,16 @@ jobs:
           - elixir: '1.19'
             otp: '28'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v2
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: deps
           key: deps-${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
@@ -55,23 +55,23 @@ jobs:
     name: Dialyzer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v2
         with:
           elixir-version: '1.19'
           otp-version: '28'
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: deps
           key: deps-${{ runner.os }}-28-1.19-${{ hashFiles('**/mix.lock') }}
           restore-keys: deps-${{ runner.os }}-28-1.19-
 
       - name: Cache PLT
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: _build/dev/*.plt
           key: plt-${{ runner.os }}-28-1.19-${{ hashFiles('**/mix.lock') }}
@@ -89,16 +89,16 @@ jobs:
     needs: [test, dialyzer]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v2
         with:
           elixir-version: '1.19'
           otp-version: '28'
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: deps
           key: deps-${{ runner.os }}-28-1.19-${{ hashFiles('**/mix.lock') }}

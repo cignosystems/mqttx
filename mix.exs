@@ -28,7 +28,7 @@ defmodule MqttX.MixProject do
   defp deps do
     [
       # Telemetry for observability
-      {:telemetry, "~> 1.3"},
+      {:telemetry, "~> 1.4"},
 
       # Transport adapters (optional - user picks one or more)
       {:thousand_island, "~> 1.4", optional: true},
@@ -40,7 +40,7 @@ defmodule MqttX.MixProject do
       {:protox, "~> 2.0", optional: true},
 
       # Dev/test
-      {:ex_doc, "~> 0.30", only: :dev, runtime: false},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false}
     ]
   end

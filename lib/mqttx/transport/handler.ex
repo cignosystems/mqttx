@@ -418,6 +418,7 @@ defmodule MqttX.Transport.Handler do
           else
             keep_alive
           end
+
         session_expiry_interval = get_in(packet, [:properties, :session_expiry_interval])
 
         new_state = %{

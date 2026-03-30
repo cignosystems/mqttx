@@ -59,6 +59,13 @@ defmodule MqttX.Transport.Handler do
       # Max packet size
       server_max_packet_size: Map.get(transport_opts, :max_packet_size, nil),
       client_max_packet_size: nil,
+      # Server keepalive override (MQTT 5.0) — must be positive integer or nil
+      server_keep_alive:
+        case Map.get(transport_opts, :server_keep_alive) do
+          val when is_integer(val) and val > 0 -> val
+          _ -> nil
+        end,
+      handler_has_handle_connect4: function_exported?(handler, :handle_connect, 4),
       handler_has_handle_info: function_exported?(handler, :handle_info, 2),
       handler_has_handle_puback: function_exported?(handler, :handle_puback, 2),
       handler_has_handle_auth: function_exported?(handler, :handle_auth, 3),
@@ -367,13 +374,25 @@ defmodule MqttX.Transport.Handler do
       password: packet.password
     }
 
+    connect_info = %{
+      protocol_version: protocol_version,
+      keep_alive: Map.get(packet, :keep_alive, 0)
+    }
+
     # Extract client properties (MQTT 5.0)
     connect_props = Map.get(packet, :properties, %{}) || %{}
     client_topic_alias_max = Map.get(connect_props, :topic_alias_maximum, 0)
     client_receive_max = Map.get(connect_props, :receive_maximum, 65535)
     client_max_packet_size = Map.get(connect_props, :maximum_packet_size, nil)
 
-    case handler.handle_connect(packet.client_id, credentials, state.handler_state) do
+    connect_result =
+      if state.handler_has_handle_connect4 do
+        handler.handle_connect(packet.client_id, credentials, connect_info, state.handler_state)
+      else
+        handler.handle_connect(packet.client_id, credentials, state.handler_state)
+      end
+
+    case connect_result do
       {:ok, new_handler_state} ->
         duration = System.monotonic_time() - start_time
         Telemetry.server_client_connect_stop(duration, telemetry_meta)
@@ -391,6 +410,14 @@ defmodule MqttX.Transport.Handler do
 
         will_message = extract_will_message(packet)
         keep_alive = Map.get(packet, :keep_alive, 0) || 0
+
+        # If server overrides keepalive (MQTT 5.0), use that for the timer
+        keep_alive =
+          if state.server_keep_alive && protocol_version >= 5 do
+            state.server_keep_alive
+          else
+            keep_alive
+          end
         session_expiry_interval = get_in(packet, [:properties, :session_expiry_interval])
 
         new_state = %{
@@ -944,6 +971,13 @@ defmodule MqttX.Transport.Handler do
     props =
       if state.server_max_packet_size do
         Map.put(props, :maximum_packet_size, state.server_max_packet_size)
+      else
+        props
+      end
+
+    props =
+      if state.server_keep_alive do
+        Map.put(props, :server_keep_alive, state.server_keep_alive)
       else
         props
       end

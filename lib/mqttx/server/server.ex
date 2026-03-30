@@ -100,6 +100,23 @@ defmodule MqttX.Server do
   @callback handle_connect(client_id(), credentials(), state()) ::
               {:ok, state()} | {:error, reason_code(), state()}
 
+  @type connect_info :: %{protocol_version: 3 | 4 | 5, keep_alive: non_neg_integer()}
+
+  @doc """
+  Handle a client connection with connection metadata.
+
+  Same as `handle_connect/3` but receives an additional `connect_info` map
+  with protocol metadata:
+
+    - `protocol_version` — 3 (MQTT 3.1), 4 (MQTT 3.1.1), or 5 (MQTT 5.0)
+    - `keep_alive` — client's requested keepalive in seconds
+
+  If both `handle_connect/4` and `handle_connect/3` are defined,
+  `handle_connect/4` takes precedence.
+  """
+  @callback handle_connect(client_id(), credentials(), connect_info(), state()) ::
+              {:ok, state()} | {:error, reason_code(), state()}
+
   @doc """
   Handle an incoming PUBLISH message.
 
@@ -194,6 +211,7 @@ defmodule MqttX.Server do
   @callback handle_session_expired(client_id(), state()) :: :ok
 
   @optional_callbacks [
+    handle_connect: 4,
     handle_unsubscribe: 2,
     handle_puback: 2,
     handle_info: 2,

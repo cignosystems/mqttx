@@ -86,6 +86,31 @@ The codec has been tested for interoperability with:
 - **Mosquitto** broker
 - Standard MQTT test suites
 
+### Connecting Nordic Thingy91 / nRF9160 (Zephyr MQTT)
+
+Key Zephyr MQTT settings for MqttX compatibility:
+
+```
+CONFIG_MQTT_KEEPALIVE=30        # Must be < cloud proxy idle timeout (e.g. Fly.io 60s)
+CONFIG_MQTT_LIB_TLS=y           # TLS required for production
+CONFIG_MQTT_CLEAN_SESSION=1     # Or use MQTT 5.0 session_expiry
+```
+
+Important notes:
+
+- Zephyr's MQTT library supports MQTT 3.1.1 and 5.0
+- For MQTT 5.0: `server_keep_alive` in CONNACK overrides the client's `CONFIG_MQTT_KEEPALIVE` — set it server-side for fleet control
+- For cellular (LTE-M/NB-IoT): use keepalive ≤ 30s to survive cloud proxy idle timeouts (Fly.io, AWS IoT, Azure)
+- Protobuf payloads recommended for cellular bandwidth savings
+
+### Cloud Deployment with TLS Proxy
+
+When deploying behind a TLS-terminating proxy (Fly.io, AWS NLB, Azure Front Door), ensure:
+
+- Client keepalive < proxy idle timeout (usually 60s)
+- Use `server_keep_alive` transport opt to enforce this server-side for all clients
+- Fly.io: `internal_port` 8883, TLS terminated by Fly proxy
+
 ## Installation
 
 Add `mqttx` to your dependencies:
@@ -93,7 +118,7 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.8.0"},
+    {:mqttx, "~> 0.9.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: WebSocket transport
@@ -121,8 +146,10 @@ defmodule MyApp.MqttHandler do
   end
 
   @impl true
-  def handle_connect(client_id, credentials, state) do
-    IO.puts("Client connected: #{client_id}")
+  def handle_connect(client_id, credentials, connect_info, state) do
+    # credentials:  %{username: String.t(), password: String.t()}
+    # connect_info: %{protocol_version: 3 | 4 | 5, keep_alive: non_neg_integer()}
+    IO.puts("[MQTT] CONNECT #{client_id} v#{connect_info.protocol_version} keepalive=#{connect_info.keep_alive}")
     {:ok, state}
   end
 
@@ -151,7 +178,12 @@ Start the server:
 ```elixir
 {:ok, _pid} = MqttX.Server.start_link(
   MyApp.MqttHandler,
-  [],
+  [transport_opts: %{
+    server_keep_alive: 30,           # override client keepalive (v5)
+    topic_alias_maximum: 100,        # max topic aliases
+    receive_maximum: 65535,          # max inflight QoS>0
+    max_packet_size: 256_000         # reject oversized packets
+  }],
   transport: MqttX.Transport.ThousandIsland,
   port: 1883
 )
@@ -324,10 +356,57 @@ All 15 packet types are supported:
 
 Fully compliant with MQTT 3.1, 3.1.1, and 5.0 specifications:
 
-- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_handling)
+- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_handling), server keepalive override
 - **Client**: server_keep_alive override, assigned_client_identifier, maximum_packet_size enforcement, server_reference handling, enhanced AUTH (multi-step), flow control (receive_maximum)
 
 Validated against Mosquitto (104 automated protocol tests across TCP and WebSocket) and EMQX Cloud (49 interop tests covering all QoS levels, properties, session persistence, and subscription options).
+
+### MQTT 5.0 Server Features
+
+**Server CONNACK properties** (sent to MQTT 5.0 clients):
+
+| Property | Default | Configurable |
+|----------|---------|--------------|
+| `shared_subscription_available` | `1` | No |
+| `topic_alias_maximum` | `100` | Yes (`transport_opts`) |
+| `receive_maximum` | `65535` | Yes (`transport_opts`) |
+| `retain_available` | `1` | No |
+| `wildcard_subscription_available` | `1` | No |
+| `subscription_identifier_available` | `0` | No |
+| `server_keep_alive` | Not sent | Yes (`transport_opts`) |
+| `maximum_packet_size` | Not sent | Yes (`transport_opts`) |
+
+**`transport_opts` configuration:**
+
+```elixir
+MqttX.Server.start_link(
+  MyHandler,
+  [transport_opts: %{
+    server_keep_alive: 30,           # override client keepalive (v5)
+    topic_alias_maximum: 100,        # max topic aliases
+    receive_maximum: 65535,          # max inflight QoS>0
+    max_packet_size: 256_000,        # reject oversized packets
+    qos2_retry_interval: 5000,      # QoS 2 retry timer (ms)
+    qos2_max_retries: 3             # QoS 2 max retries before drop
+  }],
+  transport: MqttX.Transport.ThousandIsland,
+  port: 1883
+)
+```
+
+**`handle_connect` callback:**
+
+The optional 4-arity `handle_connect/4` receives connection metadata separately from credentials:
+
+```elixir
+# credentials (both arities):
+%{username: "device_imei", password: "secret"}
+
+# connect_info (4-arity only):
+%{protocol_version: 5, keep_alive: 50}
+```
+
+Use `handle_connect/4` to log protocol version or make version-specific decisions. Existing `handle_connect/3` handlers continue to work unchanged.
 
 ## Performance
 
@@ -406,6 +485,7 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 |----------|-------------|
 | `init(opts)` | Initialize handler state |
 | `handle_connect(client_id, credentials, state)` | Handle client connection. Return `{:ok, state}` or `{:error, reason_code, state}` |
+| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as above with connection metadata (`protocol_version`, `keep_alive`). Takes precedence over 3-arity when defined |
 | `handle_publish(topic, payload, opts, state)` | Handle incoming PUBLISH. Return `{:ok, state}` |
 | `handle_subscribe(topics, state)` | Handle SUBSCRIBE. Return `{:ok, granted_qos_list, state}` |
 | `handle_unsubscribe(topics, state)` | Handle UNSUBSCRIBE. Return `{:ok, state}` |
@@ -449,6 +529,9 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 | **WebSocket Transport** | Done | MQTT over WebSocket via Bandit (`ws://` and `wss://`) |
 | **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
 | **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
+| **Session Persistence (Server)** | Planned | Server-side session persistence (currently client-only) |
+| **MQTT 5.0 Enhanced Auth** | Planned | SCRAM-SHA, external auth providers |
+| **Telemetry Docs** | Planned | Document telemetry events for observability integration |
 | **Property-based Tests** | Planned | StreamData for fuzzing the packet codec |
 | **End-to-end Load Tests** | Planned | Benchee-based throughput validation under realistic workloads |
 

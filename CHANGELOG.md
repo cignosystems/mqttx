@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-03-30
+
+### Added
+
+- **Server keepalive override** (MQTT 5.0): Configurable `server_keep_alive` in `transport_opts` — server sends keepalive override in CONNACK and uses it for the keepalive timer when protocol version >= 5
+- **`handle_connect/4` callback** (optional): New `handle_connect(client_id, credentials, connect_info, state)` callback that receives connection metadata (`protocol_version`, `keep_alive`) separately from credentials. Existing `handle_connect/3` continues to work unchanged — `handle_connect/4` takes precedence when defined
+
 ## [0.8.0] - 2026-03-11
 
 ### Added

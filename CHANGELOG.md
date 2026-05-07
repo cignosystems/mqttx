@@ -2,6 +2,149 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-05-07
+
+Spec-compliance and correctness sweep against MQTT 5.0 (OASIS), plus server/
+client robustness fixes. EMQX interop suite (49 tests against a live broker)
+remains 100% green; no public API changes.
+
+### Changed (potentially breaking at the wire level — stricter spec compliance)
+
+- **Default `protocol_version` is now `5`** (was `4`). Library is
+  marketed "MQTT 5.0" and v5 features (topic aliases, AUTH, properties,
+  reason codes) were silently dropped under the v3.1.1 default.
+  `MqttX.Client.connect(protocol_version: 4)` to opt in to v3.1.1.
+- **Server now rejects unsupported protocol versions** with CONNACK
+  `0x84` (v5) / `0x01` (v3.x). Default allowlist `[3, 4, 5]` configurable
+  via `:supported_versions` in `transport_opts`.
+
+### Fixed (codec — `MqttX.Packet.Codec` / `MqttX.Packet.Properties`)
+
+- PUBLISH with QoS=3 rejected as Malformed Packet (§3.3.1.2)
+- PUBLISH with DUP=1 + QoS=0 rejected (§3.3.1.1)
+- CONNECT reserved bit must be 0 (§3.1.2.3); non-zero fixed-header flags rejected (§3.1.1)
+- Will Flag=0 with non-zero Will QoS or Will Retain rejected (§3.1.2.6/7)
+- Will QoS=3 rejected (§3.1.2.6)
+- v3.x username flag=0 with password flag=1 rejected (§3.1.2.9)
+- Empty SUBSCRIBE / UNSUBSCRIBE payload rejected as Protocol Error (§3.8.3 / §3.10.3)
+- Subscription Options reserved bits non-zero, QoS=3, RH=3 rejected (§3.8.3.1)
+- DISCONNECT and AUTH 1-byte forms (reason code only, no property length) accepted per §3.14.2.2.1 / §3.15.2.2.1
+- UTF-8 strings now reject U+0000 (null) and U+D800–U+DFFF (surrogates) per §1.5.4
+- Malformed CONNECT no longer crashes the codec with `MatchError`; surfaces `:malformed_packet`
+- Invalid SUBACK/UNSUBACK reason bytes return `:malformed_packet` instead of crashing
+- **Properties** — duplicate non-User-Property properties rejected as Protocol Error (§2.2.2.2)
+- Property value-0 rejection: Subscription Identifier (§3.8.2.1.2), Receive Maximum (§3.1.2.11.3), Maximum Packet Size (§3.1.2.11.4)
+- Boolean properties (Payload Format Indicator, Request Problem Information, Retain Available, etc.) reject non-0/1 byte values
+- Maximum QoS rejects values > 2
+- User-Property accumulation switched from O(n²) `++ [val]` to prepend + reverse-once
+- Subscription-Identifier list switched from O(n²) `++ [val]` to prepend + reverse-once
+
+### Fixed (topic — `MqttX.Topic`)
+
+- `+`/`#` filters at the first level no longer match `$SYS/...`-style topics (§4.7.2)
+- Topic length capped at 65535 bytes (§1.5.4)
+- Shared subscription `$share/<group>/...` rejects `+` or `#` in ShareName (§4.8.2)
+- `flatten/1` switched from O(n²) binary concat to iolist + `Enum.intersperse`
+
+### Fixed (server — `MqttX.Transport.Handler` / `MqttX.Server.Router` / `MqttX.Server.RateLimiter`)
+
+- **Outgoing QoS 1 retransmission on the server** (§4.4). Outbound QoS 1
+  PUBLISHes are now tracked in `pending_qos1_tx`; the existing periodic retry
+  timer re-sends with `DUP=true` after `qos2_retry_interval` ms, dropping
+  after `qos2_max_retries` attempts. PUBACK arrival clears the entry.
+  Previously QoS 1 outbound was fire-and-forget — a lost PUBACK silently
+  dropped the message.
+- **Receive Maximum applies to QoS 1 inbound** as well as QoS 2 (§3.1.2.11.3).
+  Previously the limit was only checked for QoS 2; a client could fill the
+  flow-control window with un-PUBCOMP'd QoS 2 messages and then push QoS 1
+  publishes through unbounded. The handler now responds to a QoS 1 PUBLISH
+  exceeding the limit with `PUBACK` reason `0x93` (Receive Maximum exceeded).
+  QoS 2 excess continues to receive `PUBREC 0x93` (spec permits either
+  per-message ack or DISCONNECT).
+
+- **Critical:** retained-publish packet IDs now come from `next_packet_id` instead of `:rand.uniform/1` — was colliding with the QoS sequence allocator and breaking ack matching
+- Will message published exactly once on keepalive timeout / `handle_close` / `handle_error` (was double-publishing through two paths)
+- DISCONNECT reason code 0x04 publishes the Will; other reason codes suppress it (§3.14.4) — previously the reason code was ignored
+- Empty topic with un-mapped Topic Alias triggers DISCONNECT 0x94 (§3.3.4) — previously dispatched an empty-topic PUBLISH to the user handler
+- Outbound oversize-drop rolls back the packet_id allocation (was leaking)
+- Duplicate PUBREC after PUBREL no longer re-sends PUBREL (§4.3.3 fig 4.4)
+- AUTH-before-CONNECT now sends DISCONNECT 0x82 instead of leaving the handler in a broken state (CONNACK with `protocol_version: nil`)
+- Will Delay Interval timers (§3.1.3.2.2) now owned by a supervised `MqttX.Server.WillDelay` GenServer under the application supervisor; cancelled on same-`client_id` reconnect
+- Rate-limiter ETS table now created with `read_concurrency: true`
+
+### Fixed (client — `MqttX.Client.Connection`)
+
+- **Critical:** retry-loop reducer arity bug fixed — was crashing with
+  `MatchError` once both `{:rx, _}` and `{:tx, _}` `pending_acks` entries
+  coexisted on the same connection
+- `keepalive == 0` correctly disables the keepalive timer (was scheduling a
+  zero-millisecond tight loop)
+- **PINGRESP timeout**: client now arms a deadline at `keepalive*1500ms` on
+  every PINGREQ; if PINGRESP doesn't arrive, the socket is torn down and
+  reconnect is scheduled. Half-dead brokers no longer require TCP teardown to
+  detect.
+- `session_present` from CONNACK now surfaced to the handler in the
+  `:connected` event; warns on MQTT-3.2.2-2 violation (`clean_session=true`
+  but `session_present=true`)
+- Server-initiated DISCONNECT now closes the socket immediately and schedules
+  reconnect (was waiting for `:tcp_closed` to land separately)
+- AUTH continuation in `wait_for_connack` re-arms `set_socket_active/1` so
+  multi-step AUTH doesn't hang after the first packet
+- AUTH packet property names corrected: `:auth_method` / `:auth_data` →
+  `:authentication_method` / `:authentication_data`
+- `next_packet_id` skips IDs currently in `pending_acks` (§2.2.1)
+- `schedule_reconnect` cancels any existing reconnect timer (no more stacked
+  timers when several disconnect events fire)
+- `set_socket_active` guards against `nil` socket (server-disconnect race)
+- Pending SUBACK/UNSUBACK callers monitored via `Process.monitor`; entry
+  dropped on `:DOWN` (was leaking after `GenServer.call` timeouts)
+
+### Fixed (WebSocket client — `MqttX.Client.WebSocket`)
+
+- `Sec-WebSocket-Accept` now validated as `Base64(SHA1(client_key + magic GUID))`
+  per RFC 6455 §4.1; status line strictly matched as `HTTP/1.x 101 …`
+- `Sec-WebSocket-Protocol` echo checked (warn-only on missing — common with
+  MQTT brokers that nonetheless speak it correctly)
+- FIN-bit fragmentation: opaque `frag_state` threaded across `decode_frames/2`
+  calls so multi-frame messages split across TCP reads reassemble correctly
+- Frame masking switched from byte-by-byte recursion to `:crypto.exor/2`
+  against a pre-padded mask buffer (orders-of-magnitude faster on large
+  payloads)
+
+### Added
+
+- `MqttX.Session.ETSOwner` — a long-lived owner of the default
+  `:mqttx_sessions` ETS table under the application supervisor. Previously
+  the table was owned by whichever client first called
+  `MqttX.Session.ETSStore.init/1`, so all sessions were lost when that
+  process exited. The table is now created with `read_concurrency: true,
+  write_concurrency: true`.
+- `MqttX.Server.WillDelay` — supervised GenServer that owns Will Delay
+  Interval timers across connection lifecycles, with per-`client_id`
+  cancellation.
+- `:supported_versions` server transport option (default `[3, 4, 5]`).
+
+### Documentation
+
+- `AGENTS.md` — usage guide for AI coding assistants integrating MqttX into
+  projects: mental model (client vs broker), transport selection, idiomatic
+  patterns (receive-on-client, broker↔PubSub bridge, persistent sessions,
+  custom auth), and a curated list of mistakes commonly made (publishing
+  wildcards, confusing `handle_publish` with `handle_mqtt_event`, random
+  `client_id` per connect, default-to-QoS-2, `$SYS` exclusion). Shipped in
+  the hex package and rendered on hexdocs.
+- `CONTRIBUTING.md` — repo orientation for contributors: layout, test
+  commands, known test-environment couplings, and the deferred TODO carried
+  over from the v0.9.0 spec sweep. `CLAUDE.md` is now a symlink to
+  `AGENTS.md` for tool compatibility.
+- README "Common Patterns" section with worked examples for receiving
+  messages on the client (`handle_mqtt_event/3`), broadcasting from the
+  server via `handle_info/2`, and resuming MQTT 5.0 sessions with
+  `session_expiry_interval`.
+- README "Common Pitfalls" section covering session-store / `clean_session`
+  interaction, server keepalive override, max-packet-size enforcement,
+  publish-vs-subscribe wildcard rules, and `$SYS` topic exclusion.
+
 ## [0.9.0] - 2026-03-30
 
 ### Added

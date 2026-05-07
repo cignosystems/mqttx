@@ -13,7 +13,7 @@
   password: "secret"       # optional
 )
 
-:ok = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
+{:ok, [1]} = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
 :ok = MqttX.Client.publish(client, "sensors/temp", "25.5")
 :ok = MqttX.Client.disconnect(client)
 ```

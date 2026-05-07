@@ -43,6 +43,9 @@ defmodule MqttX.Transport.Handler do
       session_expiry_interval: nil,
       pending_qos2_rx: %{},
       pending_qos2_tx: %{},
+      # Outgoing QoS 1 packets awaiting PUBACK (§4.4 / §4.6).
+      # Each entry: {packet, sent_at_ms, retries}.
+      pending_qos1_tx: %{},
       next_packet_id: 1,
       # QoS 2 retry
       qos2_retry_timer: nil,
@@ -65,6 +68,9 @@ defmodule MqttX.Transport.Handler do
           val when is_integer(val) and val > 0 -> val
           _ -> nil
         end,
+      # Versions this server will accept — anything outside the list gets
+      # CONNACK with Unacceptable Protocol Version (§3.2.2.2).
+      supported_versions: Map.get(transport_opts, :supported_versions, [3, 4, 5]),
       handler_has_handle_connect4: function_exported?(handler, :handle_connect, 4),
       handler_has_handle_info: function_exported?(handler, :handle_info, 2),
       handler_has_handle_puback: function_exported?(handler, :handle_puback, 2),
@@ -112,9 +118,13 @@ defmodule MqttX.Transport.Handler do
       Telemetry.server_client_disconnect(%{client_id: state.client_id, reason: :closed})
     end
 
-    if connected and not is_nil(Map.get(state, :will_message)) and not graceful do
-      maybe_publish_will(state)
-    end
+    state =
+      if connected and not is_nil(Map.get(state, :will_message)) and not graceful do
+        maybe_publish_will(state)
+        %{state | will_message: nil}
+      else
+        state
+      end
 
     if connected and state.handler do
       state.handler.handle_disconnect(:closed, state.handler_state)
@@ -133,9 +143,13 @@ defmodule MqttX.Transport.Handler do
   def handle_error(reason, state) do
     Logger.warning("[MqttX.Transport] Connection error: #{inspect(reason)}")
 
-    if state.connected and not is_nil(state.will_message) and not state.graceful_disconnect do
-      maybe_publish_will(state)
-    end
+    state =
+      if state.connected and not is_nil(state.will_message) and not state.graceful_disconnect do
+        maybe_publish_will(state)
+        %{state | will_message: nil}
+      else
+        state
+      end
 
     if state.connected and state.handler do
       state.handler.handle_disconnect({:error, reason}, state.handler_state)
@@ -241,6 +255,25 @@ defmodule MqttX.Transport.Handler do
         end
       end)
 
+    # Retry pending QoS 1 TX (re-send PUBLISH with DUP=true).
+    # §4.4: a session that resumes outstanding QoS 1 PUBLISH packets MUST
+    # set the DUP flag on retransmission. Drop after qos2_max_retries.
+    {new_qos1_tx, _dropped_qos1_tx} =
+      Enum.reduce(state.pending_qos1_tx, {%{}, []}, fn {pid, {packet, ts, retries}},
+                                                       {keep, dropped} ->
+        if now - ts >= interval do
+          if retries >= max_retries do
+            {keep, [pid | dropped]}
+          else
+            dup_packet = %{packet | dup: true}
+            send_packet(state, dup_packet, state.protocol_version)
+            {Map.put(keep, pid, {packet, now, retries + 1}), dropped}
+          end
+        else
+          {Map.put(keep, pid, {packet, ts, retries}), dropped}
+        end
+      end)
+
     inflight_adj = length(dropped_rx)
     new_inflight = max(state.inflight_count - inflight_adj, 0)
 
@@ -250,6 +283,7 @@ defmodule MqttX.Transport.Handler do
       state
       | pending_qos2_rx: new_rx,
         pending_qos2_tx: new_tx,
+        pending_qos1_tx: new_qos1_tx,
         inflight_count: new_inflight
     }
 
@@ -259,9 +293,15 @@ defmodule MqttX.Transport.Handler do
   def handle_info(:keepalive_timeout, state) do
     Logger.debug("[MqttX.Transport] Keepalive timeout for #{state.client_id}")
 
-    if state.connected and not is_nil(state.will_message) do
-      maybe_publish_will(state)
-    end
+    state =
+      if state.connected and not is_nil(state.will_message) do
+        maybe_publish_will(state)
+        # Clear the will so handle_close/terminate doesn't publish it a second
+        # time (§3.1.2.5 — Will is delivered exactly once on abnormal close).
+        %{state | will_message: nil}
+      else
+        state
+      end
 
     if state.connected and state.handler do
       state.handler.handle_disconnect(:keepalive_timeout, state.handler_state)
@@ -362,98 +402,42 @@ defmodule MqttX.Transport.Handler do
 
   # Handle CONNECT
   defp handle_packet(%{type: :connect} = packet, state) do
-    handler = state.handler
     protocol_version = packet.protocol_version
+
+    # §3.1.3.2.2: a fresh CONNECT cancels any in-flight Will Delay for this
+    # client_id from the previous abnormal disconnect.
+    if packet.client_id not in [nil, ""] do
+      MqttX.Server.WillDelay.cancel(packet.client_id)
+    end
 
     telemetry_meta = %{client_id: packet.client_id, protocol_version: protocol_version}
     start_time = System.monotonic_time()
     Telemetry.server_client_connect_start(telemetry_meta)
 
-    credentials = %{
-      username: packet.username,
-      password: packet.password
-    }
+    if protocol_version not in state.supported_versions do
+      # §3.2.2.2: reject with Unacceptable Protocol Version. v5 uses 0x84;
+      # earlier versions use 0x01.
+      reason_code = if protocol_version >= 5, do: 0x84, else: 0x01
 
-    connect_info = %{
-      protocol_version: protocol_version,
-      keep_alive: Map.get(packet, :keep_alive, 0)
-    }
+      connack = %{
+        type: :connack,
+        session_present: false,
+        reason_code: reason_code,
+        properties: %{}
+      }
 
-    # Extract client properties (MQTT 5.0)
-    connect_props = Map.get(packet, :properties, %{}) || %{}
-    client_topic_alias_max = Map.get(connect_props, :topic_alias_maximum, 0)
-    client_receive_max = Map.get(connect_props, :receive_maximum, 65535)
-    client_max_packet_size = Map.get(connect_props, :maximum_packet_size, nil)
+      send_packet(state, connack, protocol_version)
 
-    connect_result =
-      if state.handler_has_handle_connect4 do
-        handler.handle_connect(packet.client_id, credentials, connect_info, state.handler_state)
-      else
-        handler.handle_connect(packet.client_id, credentials, state.handler_state)
-      end
+      duration = System.monotonic_time() - start_time
 
-    case connect_result do
-      {:ok, new_handler_state} ->
-        duration = System.monotonic_time() - start_time
-        Telemetry.server_client_connect_stop(duration, telemetry_meta)
+      Telemetry.server_client_connect_exception(
+        duration,
+        Map.put(telemetry_meta, :reason_code, reason_code)
+      )
 
-        connack_props = build_connack_properties(protocol_version, state)
-
-        connack = %{
-          type: :connack,
-          session_present: false,
-          reason_code: 0,
-          properties: connack_props
-        }
-
-        send_packet(state, connack, protocol_version)
-
-        will_message = extract_will_message(packet)
-        keep_alive = Map.get(packet, :keep_alive, 0) || 0
-
-        # If server overrides keepalive (MQTT 5.0), use that for the timer
-        keep_alive =
-          if state.server_keep_alive && protocol_version >= 5 do
-            state.server_keep_alive
-          else
-            keep_alive
-          end
-
-        session_expiry_interval = get_in(packet, [:properties, :session_expiry_interval])
-
-        new_state = %{
-          state
-          | protocol_version: protocol_version,
-            client_id: packet.client_id,
-            handler_state: new_handler_state,
-            will_message: will_message,
-            connected: true,
-            keep_alive: keep_alive,
-            session_expiry_interval: session_expiry_interval,
-            client_topic_alias_maximum: client_topic_alias_max,
-            client_receive_maximum: client_receive_max,
-            client_max_packet_size: client_max_packet_size
-        }
-
-        {:ok, start_keepalive_timer(start_qos2_retry_timer(new_state))}
-
-      {:error, reason_code, new_handler_state} ->
-        duration = System.monotonic_time() - start_time
-
-        Telemetry.server_client_connect_exception(
-          duration,
-          Map.put(telemetry_meta, :reason_code, reason_code)
-        )
-
-        connack = %{
-          type: :connack,
-          session_present: false,
-          reason_code: reason_code,
-          properties: %{}
-        }
-
-        send_packet(state, connack, protocol_version)
-        {:close, :auth_failed, %{state | handler_state: new_handler_state}}
+      {:close, :unsupported_protocol_version, state}
+    else
+      do_handle_connect_authorized(packet, state, telemetry_meta, start_time)
     end
   end
 
@@ -525,7 +509,7 @@ defmodule MqttX.Transport.Handler do
 
         send_packet(state, suback, state.protocol_version)
 
-        deliver_retained_messages(state, packet.topics)
+        state = deliver_retained_messages(state, packet.topics)
 
         {:ok, %{state | handler_state: new_handler_state}}
 
@@ -586,12 +570,24 @@ defmodule MqttX.Transport.Handler do
     {:ok, state}
   end
 
-  # Handle DISCONNECT
-  defp handle_packet(%{type: :disconnect}, state) do
+  # Handle DISCONNECT — §3.14.4: Will is published on reason 0x04
+  # (Disconnect with Will Message); for any other reason (default 0x00 Normal),
+  # the Will is silently discarded.
+  defp handle_packet(%{type: :disconnect} = packet, state) do
     state = cancel_keepalive_timer(state)
     state = cancel_qos2_retry_timer(state)
 
+    reason_code = Map.get(packet, :reason_code, 0)
+
     Telemetry.server_client_disconnect(%{client_id: state.client_id, reason: :normal})
+
+    state =
+      if reason_code == 0x04 and not is_nil(state.will_message) do
+        maybe_publish_will(state)
+        %{state | will_message: nil}
+      else
+        state
+      end
 
     if state.handler do
       state.handler.handle_disconnect(:normal, state.handler_state)
@@ -604,32 +600,38 @@ defmodule MqttX.Transport.Handler do
 
   # Handle PUBACK (for QoS 1 outgoing messages)
   defp handle_packet(%{type: :puback} = packet, state) do
+    pending_qos1_tx = Map.delete(state.pending_qos1_tx, packet.packet_id)
+
     if state.handler_has_handle_puback do
       case state.handler.handle_puback(packet.packet_id, state.handler_state) do
         {:ok, new_handler_state} ->
-          {:ok, %{state | handler_state: new_handler_state}}
+          {:ok, %{state | handler_state: new_handler_state, pending_qos1_tx: pending_qos1_tx}}
       end
     else
-      {:ok, state}
+      {:ok, %{state | pending_qos1_tx: pending_qos1_tx}}
     end
   end
 
   # Handle PUBREC (client acknowledges receipt of outgoing QoS 2 PUBLISH)
   defp handle_packet(%{type: :pubrec} = packet, state) do
-    case Map.pop(state.pending_qos2_tx, packet.packet_id) do
-      {nil, _} ->
+    case Map.get(state.pending_qos2_tx, packet.packet_id) do
+      nil ->
         # Unknown packet_id, ignore
         {:ok, state}
 
-      {_entry, remaining} ->
+      %{phase: :pubrel_sent} ->
+        # §4.3.3 figure 4.4: a duplicate PUBREC after PUBREL has already been
+        # sent must NOT trigger another PUBREL. Wait for the original PUBCOMP.
+        {:ok, state}
+
+      _entry ->
         # Send PUBREL to complete the QoS 2 handshake
         pubrel = %{type: :pubrel, packet_id: packet.packet_id}
         send_packet(state, pubrel, state.protocol_version)
-        # Keep tracking — wait for PUBCOMP
         now = System.monotonic_time(:millisecond)
 
         pending =
-          Map.put(remaining, packet.packet_id, %{
+          Map.put(state.pending_qos2_tx, packet.packet_id, %{
             phase: :pubrel_sent,
             packet: nil,
             timestamp: now,
@@ -728,6 +730,15 @@ defmodule MqttX.Transport.Handler do
   end
 
   # Handle AUTH (MQTT 5.0 enhanced authentication)
+  # §4.12: AUTH packets are only valid (a) within an in-progress enhanced-auth
+  # exchange started by CONNECT carrying Authentication Method, or (b) for
+  # re-authentication on an already-connected session. Receiving an AUTH packet
+  # with no preceding CONNECT and no enhanced-auth context is a Protocol Error.
+  defp handle_packet(%{type: :auth}, %{connected: false, protocol_version: nil} = state) do
+    send_disconnect(state, 0x82, %{})
+    {:close, :protocol_error, state}
+  end
+
   defp handle_packet(%{type: :auth} = packet, state) do
     if state.handler_has_handle_auth do
       method = get_in(packet, [:properties, :authentication_method]) || ""
@@ -788,6 +799,98 @@ defmodule MqttX.Transport.Handler do
     {:ok, state}
   end
 
+  defp do_handle_connect_authorized(packet, state, telemetry_meta, start_time) do
+    handler = state.handler
+    protocol_version = packet.protocol_version
+
+    credentials = %{
+      username: packet.username,
+      password: packet.password
+    }
+
+    connect_info = %{
+      protocol_version: protocol_version,
+      keep_alive: Map.get(packet, :keep_alive, 0)
+    }
+
+    # Extract client properties (MQTT 5.0)
+    connect_props = Map.get(packet, :properties, %{}) || %{}
+    client_topic_alias_max = Map.get(connect_props, :topic_alias_maximum, 0)
+    client_receive_max = Map.get(connect_props, :receive_maximum, 65535)
+    client_max_packet_size = Map.get(connect_props, :maximum_packet_size, nil)
+
+    connect_result =
+      if state.handler_has_handle_connect4 do
+        handler.handle_connect(packet.client_id, credentials, connect_info, state.handler_state)
+      else
+        handler.handle_connect(packet.client_id, credentials, state.handler_state)
+      end
+
+    case connect_result do
+      {:ok, new_handler_state} ->
+        duration = System.monotonic_time() - start_time
+        Telemetry.server_client_connect_stop(duration, telemetry_meta)
+
+        connack_props = build_connack_properties(protocol_version, state)
+
+        connack = %{
+          type: :connack,
+          session_present: false,
+          reason_code: 0,
+          properties: connack_props
+        }
+
+        send_packet(state, connack, protocol_version)
+
+        will_message = extract_will_message(packet)
+        keep_alive = Map.get(packet, :keep_alive, 0) || 0
+
+        # If server overrides keepalive (MQTT 5.0), use that for the timer
+        keep_alive =
+          if state.server_keep_alive && protocol_version >= 5 do
+            state.server_keep_alive
+          else
+            keep_alive
+          end
+
+        session_expiry_interval = get_in(packet, [:properties, :session_expiry_interval])
+
+        new_state = %{
+          state
+          | protocol_version: protocol_version,
+            client_id: packet.client_id,
+            handler_state: new_handler_state,
+            will_message: will_message,
+            connected: true,
+            keep_alive: keep_alive,
+            session_expiry_interval: session_expiry_interval,
+            client_topic_alias_maximum: client_topic_alias_max,
+            client_receive_maximum: client_receive_max,
+            client_max_packet_size: client_max_packet_size
+        }
+
+        {:ok, start_keepalive_timer(start_qos2_retry_timer(new_state))}
+
+      {:error, reason_code, new_handler_state} ->
+        duration = System.monotonic_time() - start_time
+
+        Telemetry.server_client_connect_exception(
+          duration,
+          Map.put(telemetry_meta, :reason_code, reason_code)
+        )
+
+        connack = %{
+          type: :connack,
+          session_present: false,
+          reason_code: reason_code,
+          properties: %{}
+        }
+
+        send_packet(state, connack, protocol_version)
+        {:close, :auth_failed, %{state | handler_state: new_handler_state}}
+    end
+  end
+
   # Process PUBLISH after topic alias resolution
   defp handle_publish_with_topic(packet, resolved_topic, state) do
     packet = %{packet | topic: resolved_topic}
@@ -819,13 +922,35 @@ defmodule MqttX.Transport.Handler do
       )
     end
 
-    if packet.qos == 2 do
-      # Flow control check for QoS 2
-      if state.inflight_count >= state.server_receive_maximum do
-        pubrec = %{type: :pubrec, packet_id: packet.packet_id, reason_code: 0x93, properties: %{}}
+    cond do
+      # §3.1.2.11.3 / §3.3.4: Receive Maximum bounds the number of in-flight
+      # QoS>0 PUBLISH packets a client may have outstanding. Spec permits
+      # either a per-message ack with reason 0x93 (Receive Maximum exceeded)
+      # or DISCONNECT 0x93. We keep the per-message variant — it preserves
+      # the session and is the established behavior tested below.
+      packet.qos == 2 and state.inflight_count >= state.server_receive_maximum ->
+        pubrec = %{
+          type: :pubrec,
+          packet_id: packet.packet_id,
+          reason_code: 0x93,
+          properties: %{}
+        }
+
         send_packet(state, pubrec, state.protocol_version)
         {:ok, state}
-      else
+
+      packet.qos == 1 and state.inflight_count >= state.server_receive_maximum ->
+        puback = %{
+          type: :puback,
+          packet_id: packet.packet_id,
+          reason_code: 0x93,
+          properties: %{}
+        }
+
+        send_packet(state, puback, state.protocol_version)
+        {:ok, state}
+
+      packet.qos == 2 ->
         # DUP handling: if packet_id already pending, re-send PUBREC without re-storing
         if Map.has_key?(state.pending_qos2_rx, packet.packet_id) do
           pubrec = %{type: :pubrec, packet_id: packet.packet_id}
@@ -839,34 +964,34 @@ defmodule MqttX.Transport.Handler do
           pending = Map.put(state.pending_qos2_rx, packet.packet_id, {packet, opts, now, 0})
           {:ok, %{state | pending_qos2_rx: pending, inflight_count: state.inflight_count + 1}}
         end
-      end
-    else
-      case handler.handle_publish(packet.topic, packet.payload, opts, state.handler_state) do
-        {:ok, new_handler_state} ->
-          if packet.qos == 1 do
-            puback = %{type: :puback, packet_id: packet.packet_id}
-            send_packet(state, puback, state.protocol_version)
-          end
 
-          {:ok, %{state | handler_state: new_handler_state}}
+      true ->
+        case handler.handle_publish(packet.topic, packet.payload, opts, state.handler_state) do
+          {:ok, new_handler_state} ->
+            if packet.qos == 1 do
+              puback = %{type: :puback, packet_id: packet.packet_id}
+              send_packet(state, puback, state.protocol_version)
+            end
 
-        {:error, _reason, new_handler_state} ->
-          {:ok, %{state | handler_state: new_handler_state}}
+            {:ok, %{state | handler_state: new_handler_state}}
 
-        {:disconnect, reason_code, new_handler_state} ->
-          send_disconnect(state, reason_code, %{})
-          handler.handle_disconnect({:server_disconnect, reason_code}, new_handler_state)
+          {:error, _reason, new_handler_state} ->
+            {:ok, %{state | handler_state: new_handler_state}}
 
-          {:close, {:server_disconnect, reason_code},
-           %{state | handler_state: new_handler_state, graceful_disconnect: true}}
+          {:disconnect, reason_code, new_handler_state} ->
+            send_disconnect(state, reason_code, %{})
+            handler.handle_disconnect({:server_disconnect, reason_code}, new_handler_state)
 
-        {:disconnect, reason_code, properties, new_handler_state} ->
-          send_disconnect(state, reason_code, properties)
-          handler.handle_disconnect({:server_disconnect, reason_code}, new_handler_state)
+            {:close, {:server_disconnect, reason_code},
+             %{state | handler_state: new_handler_state, graceful_disconnect: true}}
 
-          {:close, {:server_disconnect, reason_code},
-           %{state | handler_state: new_handler_state, graceful_disconnect: true}}
-      end
+          {:disconnect, reason_code, properties, new_handler_state} ->
+            send_disconnect(state, reason_code, properties)
+            handler.handle_disconnect({:server_disconnect, reason_code}, new_handler_state)
+
+            {:close, {:server_disconnect, reason_code},
+             %{state | handler_state: new_handler_state, graceful_disconnect: true}}
+        end
     end
   end
 
@@ -927,26 +1052,38 @@ defmodule MqttX.Transport.Handler do
         encoded_size = IO.iodata_length(data)
 
         if state.client_max_packet_size && encoded_size > state.client_max_packet_size do
-          # Silently drop — client can't handle this packet
-          state
+          # Silently drop — client can't handle this packet. Roll back the
+          # packet_id allocation so the next outbound message reuses this slot
+          # rather than leaking it.
+          if qos > 0, do: %{state | next_packet_id: packet_id}, else: state
         else
           state.send_fn.(data)
 
-          # For QoS 2 outgoing, track in pending_qos2_tx with retry info
-          if qos == 2 do
-            now = System.monotonic_time(:millisecond)
+          # Track outgoing QoS>0 publishes for retransmission. The shared
+          # `:check_qos2_retry` timer (despite the name) walks both maps and
+          # re-sends with DUP=true on stale entries, dropping after
+          # qos2_max_retries.
+          case qos do
+            1 ->
+              now = System.monotonic_time(:millisecond)
+              pending = Map.put(state.pending_qos1_tx, packet_id, {packet, now, 0})
+              %{state | pending_qos1_tx: pending}
 
-            pending =
-              Map.put(state.pending_qos2_tx, packet_id, %{
-                phase: :pubrec_pending,
-                packet: packet,
-                timestamp: now,
-                retries: 0
-              })
+            2 ->
+              now = System.monotonic_time(:millisecond)
 
-            %{state | pending_qos2_tx: pending}
-          else
-            state
+              pending =
+                Map.put(state.pending_qos2_tx, packet_id, %{
+                  phase: :pubrec_pending,
+                  packet: packet,
+                  timestamp: now,
+                  retries: 0
+                })
+
+              %{state | pending_qos2_tx: pending}
+
+            _ ->
+              state
           end
         end
 
@@ -1007,7 +1144,10 @@ defmodule MqttX.Transport.Handler do
       true ->
         # Alias only: look up stored mapping
         case Map.get(state.topic_alias_to_topic, alias_val) do
-          nil -> {:ok, topic, state}
+          # §3.3.4: empty topic with alias that has no recorded mapping is
+          # Protocol Error; close the connection rather than deliver an
+          # empty-topic PUBLISH to the user handler.
+          nil -> {:error, :topic_alias_invalid, state}
           stored_topic -> {:ok, stored_topic, state}
         end
     end
@@ -1110,13 +1250,16 @@ defmodule MqttX.Transport.Handler do
   defp maybe_publish_will(%{will_message: nil}), do: :ok
 
   defp maybe_publish_will(%{will_message: %{delay_interval: delay}} = state) when delay > 0 do
-    state_snapshot = Map.take(state, [:will_message, :handler, :handler_state, :retained_table])
+    # Hand off to MqttX.Server.WillDelay so the timer survives this connection
+    # process exiting AND can be cancelled if the same client_id reconnects
+    # within delay_interval (§3.1.3.2.2).
+    ctx = %{
+      retained_table: state.retained_table,
+      handler: state.handler,
+      handler_state: state.handler_state
+    }
 
-    Task.start(fn ->
-      Process.sleep(delay * 1000)
-      do_publish_will(state_snapshot)
-    end)
-
+    MqttX.Server.WillDelay.schedule(state.client_id, state.will_message, delay * 1000, ctx)
     :ok
   end
 
@@ -1168,7 +1311,10 @@ defmodule MqttX.Transport.Handler do
   defp normalize_topic_key(topic) when is_list(topic), do: Enum.join(topic, "/")
   defp normalize_topic_key(topic) when is_binary(topic), do: topic
 
-  # Deliver retained messages matching subscribed topics
+  # Deliver retained messages matching subscribed topics. State is threaded so
+  # we can allocate packet IDs from the real next_packet_id counter rather than
+  # `:rand.uniform/1` (which used to collide with the QoS sequence allocator
+  # and break ack matching).
   defp deliver_retained_messages(state, topics) do
     now = System.system_time(:second)
 
@@ -1184,47 +1330,44 @@ defmodule MqttX.Transport.Handler do
         not Enum.any?(normalized, fn seg -> seg == :single_level or seg == :multi_level end)
       end)
 
-    expired_keys = []
-
-    expired_keys =
-      Enum.reduce(exact_subs, expired_keys, fn {sub, _normalized}, exp_acc ->
+    {state, expired_keys} =
+      Enum.reduce(exact_subs, {state, []}, fn {sub, _normalized}, {st, exp_acc} ->
         topic_key = get_topic_filter(sub)
 
         topic_key =
           if is_list(topic_key), do: Enum.join(topic_key, "/"), else: to_string(topic_key)
 
-        case :ets.lookup(state.retained_table, topic_key) do
+        case :ets.lookup(st.retained_table, topic_key) do
           [{^topic_key, _norm_list, payload, qos, timestamp, expiry_interval}] ->
             if expired?(timestamp, expiry_interval, now) do
-              [topic_key | exp_acc]
+              {st, [topic_key | exp_acc]}
             else
-              send_retained(state, topic_key, payload, qos, timestamp, expiry_interval, sub, now)
-              exp_acc
+              {send_retained(st, topic_key, payload, qos, timestamp, expiry_interval, sub, now),
+               exp_acc}
             end
 
           [{^topic_key, payload, qos, timestamp, expiry_interval}] ->
             if expired?(timestamp, expiry_interval, now) do
-              [topic_key | exp_acc]
+              {st, [topic_key | exp_acc]}
             else
-              send_retained(state, topic_key, payload, qos, timestamp, expiry_interval, sub, now)
-              exp_acc
+              {send_retained(st, topic_key, payload, qos, timestamp, expiry_interval, sub, now),
+               exp_acc}
             end
 
           [{^topic_key, payload, qos}] ->
-            send_retained(state, topic_key, payload, qos, nil, nil, sub, now)
-            exp_acc
+            {send_retained(st, topic_key, payload, qos, nil, nil, sub, now), exp_acc}
 
           [] ->
-            exp_acc
+            {st, exp_acc}
         end
       end)
 
-    expired_keys =
+    {state, expired_keys} =
       if wildcard_subs == [] do
-        expired_keys
+        {state, expired_keys}
       else
         :ets.foldl(
-          fn entry, expired_acc ->
+          fn entry, {st, expired_acc} ->
             {retained_topic, normalized_topic, payload, qos, timestamp, expiry_interval} =
               case entry do
                 {topic, norm, payload, qos, ts, exp} ->
@@ -1238,32 +1381,36 @@ defmodule MqttX.Transport.Handler do
               end
 
             if expired?(timestamp, expiry_interval, now) do
-              [retained_topic | expired_acc]
+              {st, [retained_topic | expired_acc]}
             else
-              Enum.each(wildcard_subs, fn {sub, sub_normalized} ->
-                if MqttX.Topic.matches?(sub_normalized, normalized_topic) do
-                  send_retained(
-                    state,
-                    retained_topic,
-                    payload,
-                    qos,
-                    timestamp,
-                    expiry_interval,
-                    sub,
-                    now
-                  )
-                end
-              end)
+              st =
+                Enum.reduce(wildcard_subs, st, fn {sub, sub_normalized}, st ->
+                  if MqttX.Topic.matches?(sub_normalized, normalized_topic) do
+                    send_retained(
+                      st,
+                      retained_topic,
+                      payload,
+                      qos,
+                      timestamp,
+                      expiry_interval,
+                      sub,
+                      now
+                    )
+                  else
+                    st
+                  end
+                end)
 
-              expired_acc
+              {st, expired_acc}
             end
           end,
-          expired_keys,
+          {state, expired_keys},
           state.retained_table
         )
       end
 
     Enum.each(expired_keys, fn key -> :ets.delete(state.retained_table, key) end)
+    state
   end
 
   defp expired?(nil, _, _now), do: false
@@ -1274,7 +1421,9 @@ defmodule MqttX.Transport.Handler do
     # Check retain_handling: 2 = don't send retained messages on subscribe
     retain_handling = Map.get(sub, :retain_handling, 0)
 
-    unless retain_handling == 2 do
+    if retain_handling == 2 do
+      state
+    else
       sub_qos = Map.get(sub, :qos, 0)
       effective_qos = min(qos, sub_qos)
 
@@ -1290,6 +1439,15 @@ defmodule MqttX.Transport.Handler do
           do: %{message_expiry_interval: remaining_expiry},
           else: %{}
 
+      {packet_id, state} =
+        if effective_qos > 0 do
+          id = state.next_packet_id
+          next = if id >= 65_535, do: 1, else: id + 1
+          {id, %{state | next_packet_id: next}}
+        else
+          {nil, state}
+        end
+
       packet = %{
         type: :publish,
         topic: topic,
@@ -1297,11 +1455,12 @@ defmodule MqttX.Transport.Handler do
         qos: effective_qos,
         retain: true,
         dup: false,
-        packet_id: if(effective_qos > 0, do: :rand.uniform(65535), else: nil),
+        packet_id: packet_id,
         properties: properties
       }
 
       send_packet(state, packet, state.protocol_version)
+      state
     end
   end
 

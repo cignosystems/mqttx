@@ -9,7 +9,7 @@ Add `mqttx` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.9.0"},
+    {:mqttx, "~> 0.10.0"},
 
     # Pick a transport for the server (optional)
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
@@ -34,8 +34,8 @@ The core codec has **zero external dependencies** - you only need a transport ad
   client_id: "my_client"
 )
 
-# Subscribe to a topic
-:ok = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
+# Subscribe to a topic (returns {:ok, granted_qos_list})
+{:ok, [1]} = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
 
 # Publish a message
 :ok = MqttX.Client.publish(client, "sensors/temp", "25.5")

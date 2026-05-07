@@ -1129,7 +1129,7 @@ defmodule MqttX.InteropEmqxTest do
 
       topic = "mqttx/test/subid/#{uid()}"
 
-      :ok =
+      {:ok, [1]} =
         MqttX.Client.subscribe(client, topic,
           qos: 1,
           properties: %{subscription_identifier: 42}

@@ -43,13 +43,22 @@ defmodule MqttX.Session.ETSStore do
   def init(opts) do
     table = Keyword.get(opts, :table, @default_table)
 
-    # Create table if it doesn't exist
+    # The default :mqttx_sessions table is pre-created by MqttX.Session.ETSOwner
+    # under the application supervisor so it outlives transient callers. For
+    # custom tables (passed via opts) we fall back to creating-on-demand; the
+    # caller is responsible for ensuring its lifetime if longer-lived storage
+    # is needed.
     case :ets.whereis(table) do
       :undefined ->
-        :ets.new(table, [:named_table, :public, :set])
+        :ets.new(table, [
+          :named_table,
+          :public,
+          :set,
+          {:read_concurrency, true},
+          {:write_concurrency, true}
+        ])
 
       _ref ->
-        # Table already exists
         :ok
     end
 

@@ -604,6 +604,90 @@ defmodule MqttX.Transport.HandlerTest do
     end
   end
 
+  describe "QoS 1 outbound retransmission" do
+    test "retry timer resends QoS 1 PUBLISH with DUP=true and increments retries", ctx do
+      state = connect_client(ctx, "qos1-retry")
+      drain_mailbox()
+
+      past = System.monotonic_time(:millisecond) - 10_000
+
+      packet = %{
+        type: :publish,
+        topic: "qos1/retry",
+        payload: "msg",
+        qos: 1,
+        retain: false,
+        dup: false,
+        packet_id: 50,
+        properties: %{}
+      }
+
+      state = %{state | pending_qos1_tx: %{50 => {packet, past, 0}}}
+
+      {:noreply, new_state} = Proto.handle_info(:check_qos2_retry, state)
+
+      assert_received {:sent, publish_data}
+      {:ok, {resent, <<>>}} = Codec.decode(4, IO.iodata_to_binary(publish_data))
+      assert resent.type == :publish
+      assert resent.qos == 1
+      assert resent.dup == true
+      assert resent.packet_id == 50
+
+      {_p, _ts, retries} = new_state.pending_qos1_tx[50]
+      assert retries == 1
+    end
+
+    test "drops QoS 1 entry after max retries", ctx do
+      state = connect_client(ctx, "qos1-drop")
+      drain_mailbox()
+
+      past = System.monotonic_time(:millisecond) - 10_000
+
+      packet = %{
+        type: :publish,
+        topic: "qos1/drop",
+        payload: "drop",
+        qos: 1,
+        retain: false,
+        dup: false,
+        packet_id: 60,
+        properties: %{}
+      }
+
+      state = %{state | pending_qos1_tx: %{60 => {packet, past, 3}}}
+
+      {:noreply, new_state} = Proto.handle_info(:check_qos2_retry, state)
+
+      assert new_state.pending_qos1_tx == %{}
+    end
+
+    test "PUBACK clears the pending_qos1_tx entry", ctx do
+      state = connect_client(ctx, "qos1-puback")
+      drain_mailbox()
+
+      now = System.monotonic_time(:millisecond)
+
+      packet = %{
+        type: :publish,
+        topic: "qos1/puback",
+        payload: "msg",
+        qos: 1,
+        retain: false,
+        dup: false,
+        packet_id: 70,
+        properties: %{}
+      }
+
+      state = %{state | pending_qos1_tx: %{70 => {packet, now, 0}}}
+
+      puback = %{type: :puback, packet_id: 70}
+      {:ok, data} = Codec.encode(4, puback)
+      {:ok, new_state} = Proto.handle_data(data, state)
+
+      assert new_state.pending_qos1_tx == %{}
+    end
+  end
+
   describe "PUBREL with unknown packet_id" do
     test "sends PUBCOMP with reason_code 0x92 (MQTT 5.0)", ctx do
       state = connect_client_v5(ctx, "pubrel-unknown")
@@ -869,6 +953,74 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, {pubrec2, <<>>}} = Codec.decode(5, IO.iodata_to_binary(pubrec2_data))
       assert pubrec2.type == :pubrec
       assert pubrec2.reason_code == 0x93
+    end
+
+    test "rejects QoS 1 publish with PUBACK 0x93 when inflight reaches receive_maximum",
+         ctx do
+      # §3.1.2.11.3: Receive Maximum bounds QoS 1 AND QoS 2 inbound. Once the
+      # limit is filled (e.g. by un-PUBCOMP'd QoS 2 messages), a subsequent
+      # QoS 1 must also be refused — current handler answers with PUBACK 0x93.
+      {:ok, state} =
+        Proto.init(
+          TestHandler,
+          [agent: ctx.agent, transport_opts: %{receive_maximum: 1}],
+          ctx.retained_table,
+          nil,
+          ctx.send_fn
+        )
+
+      connect = %{
+        type: :connect,
+        protocol_version: 5,
+        client_id: "fc-qos1-client",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
+      }
+
+      {:ok, data} = Codec.encode(5, connect)
+      {:ok, state} = Proto.handle_data(data, state)
+      drain_mailbox()
+
+      # Fill the limit with one un-completed QoS 2 (no PUBREL → inflight stays 1)
+      qos2 = %{
+        type: :publish,
+        topic: "fc/q1",
+        payload: "fill",
+        qos: 2,
+        retain: false,
+        dup: false,
+        packet_id: 1,
+        properties: %{}
+      }
+
+      {:ok, d_qos2} = Codec.encode(5, qos2)
+      {:ok, state} = Proto.handle_data(d_qos2, state)
+      assert_received {:sent, _pubrec}
+      assert state.inflight_count == 1
+
+      # Now a QoS 1 must be refused with PUBACK 0x93
+      qos1 = %{
+        type: :publish,
+        topic: "fc/q1",
+        payload: "blocked",
+        qos: 1,
+        retain: false,
+        dup: false,
+        packet_id: 2,
+        properties: %{}
+      }
+
+      {:ok, d_qos1} = Codec.encode(5, qos1)
+      {:ok, _state} = Proto.handle_data(d_qos1, state)
+
+      assert_received {:sent, puback_data}
+      {:ok, {puback, <<>>}} = Codec.decode(5, IO.iodata_to_binary(puback_data))
+      assert puback.type == :puback
+      assert puback.reason_code == 0x93
     end
   end
 

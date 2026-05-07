@@ -71,7 +71,7 @@ defmodule MqttX.Packet.Properties do
         <<props_bin::binary-size(len), remaining::binary>> = rest
 
         case decode_properties(props_bin, %{}) do
-          {:ok, props} -> {:ok, props, remaining}
+          {:ok, props} -> {:ok, finalize_props(props), remaining}
           {:error, _} = err -> err
         end
 
@@ -88,6 +88,21 @@ defmodule MqttX.Packet.Properties do
 
   def decode(_version, data) do
     {:ok, %{}, data}
+  end
+
+  # Reverse the multi-occurrence accumulators that we built via prepend
+  defp finalize_props(props) do
+    props =
+      case Map.get(props, :user_properties) do
+        nil -> props
+        list -> Map.put(props, :user_properties, Enum.reverse(list))
+      end
+
+    case Map.get(props, :subscription_identifier) do
+      [single] -> Map.put(props, :subscription_identifier, single)
+      list when is_list(list) -> Map.put(props, :subscription_identifier, Enum.reverse(list))
+      _ -> props
+    end
   end
 
   # Encode individual properties
@@ -222,154 +237,280 @@ defmodule MqttX.Packet.Properties do
   end
 
   # Decode properties from binary
+  #
+  # MQTT §2.2.2.2: every non-User-Property property MUST appear at most once;
+  # repeats are Protocol Error 0x82. Subscription Identifier may appear multiple
+  # times only on PUBLISH; we accept the list and let upstream layers gate by packet.
+  # Boolean-typed properties MUST be 0 or 1 (Malformed Packet otherwise).
+  # Integer-typed properties with reserved value 0 (Sub-ID, Receive-Max, Topic-Alias,
+  # Max-Packet-Size) MUST be rejected.
   defp decode_properties(<<>>, props) do
     {:ok, props}
   end
 
   defp decode_properties(<<@prop_payload_format_indicator, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :payload_format_indicator, val == 1))
+    cond do
+      val > 1 -> {:error, :malformed_packet}
+      Map.has_key?(props, :payload_format_indicator) -> {:error, :protocol_error}
+      true -> decode_properties(rest, Map.put(props, :payload_format_indicator, val == 1))
+    end
   end
 
   defp decode_properties(<<@prop_message_expiry_interval, val::32-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :message_expiry_interval, val))
+    if Map.has_key?(props, :message_expiry_interval) do
+      {:error, :protocol_error}
+    else
+      decode_properties(rest, Map.put(props, :message_expiry_interval, val))
+    end
   end
 
   defp decode_properties(<<@prop_content_type, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_utf8(rest) do
-      decode_properties(rest2, Map.put(props, :content_type, val))
+      if Map.has_key?(props, :content_type) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :content_type, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_response_topic, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_utf8(rest) do
-      decode_properties(rest2, Map.put(props, :response_topic, val))
+      if Map.has_key?(props, :response_topic) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :response_topic, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_correlation_data, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_binary(rest) do
-      decode_properties(rest2, Map.put(props, :correlation_data, val))
+      if Map.has_key?(props, :correlation_data) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :correlation_data, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_subscription_identifier, rest::binary>>, props) do
     with {:ok, val, rest2} <- Varint.decode(rest) do
-      existing = Map.get(props, :subscription_identifier)
-
-      new_val =
-        case existing do
-          nil -> val
-          list when is_list(list) -> list ++ [val]
-          single -> [single, val]
-        end
-
-      decode_properties(rest2, Map.put(props, :subscription_identifier, new_val))
+      if val == 0 do
+        # §3.8.2.1.2: Subscription Identifier value 0 is Protocol Error
+        {:error, :protocol_error}
+      else
+        # Internally we always store as a reversed list; finalize_props/1 reverses
+        # and unwraps singletons. Prepend is O(1) vs O(n²) `++ [val]`.
+        existing = Map.get(props, :subscription_identifier, [])
+        decode_properties(rest2, Map.put(props, :subscription_identifier, [val | existing]))
+      end
     end
   end
 
   defp decode_properties(<<@prop_session_expiry_interval, val::32-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :session_expiry_interval, val))
+    if Map.has_key?(props, :session_expiry_interval) do
+      {:error, :protocol_error}
+    else
+      decode_properties(rest, Map.put(props, :session_expiry_interval, val))
+    end
   end
 
   defp decode_properties(<<@prop_assigned_client_identifier, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_utf8(rest) do
-      decode_properties(rest2, Map.put(props, :assigned_client_identifier, val))
+      if Map.has_key?(props, :assigned_client_identifier) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :assigned_client_identifier, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_server_keep_alive, val::16-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :server_keep_alive, val))
+    if Map.has_key?(props, :server_keep_alive) do
+      {:error, :protocol_error}
+    else
+      decode_properties(rest, Map.put(props, :server_keep_alive, val))
+    end
   end
 
   defp decode_properties(<<@prop_authentication_method, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_utf8(rest) do
-      decode_properties(rest2, Map.put(props, :authentication_method, val))
+      if Map.has_key?(props, :authentication_method) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :authentication_method, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_authentication_data, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_binary(rest) do
-      decode_properties(rest2, Map.put(props, :authentication_data, val))
+      if Map.has_key?(props, :authentication_data) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :authentication_data, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_request_problem_information, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :request_problem_information, val == 1))
+    cond do
+      val > 1 -> {:error, :malformed_packet}
+      Map.has_key?(props, :request_problem_information) -> {:error, :protocol_error}
+      true -> decode_properties(rest, Map.put(props, :request_problem_information, val == 1))
+    end
   end
 
   defp decode_properties(<<@prop_will_delay_interval, val::32-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :will_delay_interval, val))
+    if Map.has_key?(props, :will_delay_interval) do
+      {:error, :protocol_error}
+    else
+      decode_properties(rest, Map.put(props, :will_delay_interval, val))
+    end
   end
 
   defp decode_properties(<<@prop_request_response_information, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :request_response_information, val == 1))
+    cond do
+      val > 1 -> {:error, :malformed_packet}
+      Map.has_key?(props, :request_response_information) -> {:error, :protocol_error}
+      true -> decode_properties(rest, Map.put(props, :request_response_information, val == 1))
+    end
   end
 
   defp decode_properties(<<@prop_response_information, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_utf8(rest) do
-      decode_properties(rest2, Map.put(props, :response_information, val))
+      if Map.has_key?(props, :response_information) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :response_information, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_server_reference, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_utf8(rest) do
-      decode_properties(rest2, Map.put(props, :server_reference, val))
+      if Map.has_key?(props, :server_reference) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :server_reference, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_reason_string, rest::binary>>, props) do
     with {:ok, val, rest2} <- decode_utf8(rest) do
-      decode_properties(rest2, Map.put(props, :reason_string, val))
+      if Map.has_key?(props, :reason_string) do
+        {:error, :protocol_error}
+      else
+        decode_properties(rest2, Map.put(props, :reason_string, val))
+      end
     end
   end
 
   defp decode_properties(<<@prop_receive_maximum, val::16-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :receive_maximum, val))
+    cond do
+      # §3.1.2.11.3: Receive Maximum value 0 is Protocol Error
+      val == 0 -> {:error, :protocol_error}
+      Map.has_key?(props, :receive_maximum) -> {:error, :protocol_error}
+      true -> decode_properties(rest, Map.put(props, :receive_maximum, val))
+    end
   end
 
   defp decode_properties(<<@prop_topic_alias_maximum, val::16-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :topic_alias_maximum, val))
+    if Map.has_key?(props, :topic_alias_maximum) do
+      {:error, :protocol_error}
+    else
+      decode_properties(rest, Map.put(props, :topic_alias_maximum, val))
+    end
   end
 
   defp decode_properties(<<@prop_topic_alias, val::16-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :topic_alias, val))
+    # §3.3.2.3.4: Topic Alias value 0 is a Protocol Error, but the canonical
+    # broker response is DISCONNECT 0x94 (Topic Alias Invalid) which lives in
+    # the handler layer. Pass the value through; handler validates.
+    if Map.has_key?(props, :topic_alias) do
+      {:error, :protocol_error}
+    else
+      decode_properties(rest, Map.put(props, :topic_alias, val))
+    end
   end
 
   defp decode_properties(<<@prop_maximum_qos, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :maximum_qos, val))
+    cond do
+      val > 2 -> {:error, :malformed_packet}
+      Map.has_key?(props, :maximum_qos) -> {:error, :protocol_error}
+      true -> decode_properties(rest, Map.put(props, :maximum_qos, val))
+    end
   end
 
   defp decode_properties(<<@prop_retain_available, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :retain_available, val == 1))
+    cond do
+      val > 1 -> {:error, :malformed_packet}
+      Map.has_key?(props, :retain_available) -> {:error, :protocol_error}
+      true -> decode_properties(rest, Map.put(props, :retain_available, val == 1))
+    end
   end
 
   defp decode_properties(<<@prop_user_property, rest::binary>>, props) do
     with {:ok, key, rest2} <- decode_utf8(rest),
          {:ok, val, rest3} <- decode_utf8(rest2) do
-      # User properties accumulate into a list (MQTT 5.0 allows repeated keys)
+      # User Property may repeat (§2.2.2.2). Prepend; finalize_props/1 reverses.
       existing = Map.get(props, :user_properties, [])
-      decode_properties(rest3, Map.put(props, :user_properties, existing ++ [{key, val}]))
+      decode_properties(rest3, Map.put(props, :user_properties, [{key, val} | existing]))
     end
   end
 
   defp decode_properties(<<@prop_maximum_packet_size, val::32-big, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :maximum_packet_size, val))
+    cond do
+      # §3.1.2.11.4 / §3.2.2.3.6: Maximum Packet Size value 0 is Protocol Error
+      val == 0 -> {:error, :protocol_error}
+      Map.has_key?(props, :maximum_packet_size) -> {:error, :protocol_error}
+      true -> decode_properties(rest, Map.put(props, :maximum_packet_size, val))
+    end
   end
 
   defp decode_properties(<<@prop_wildcard_subscription_available, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :wildcard_subscription_available, val == 1))
+    cond do
+      val > 1 ->
+        {:error, :malformed_packet}
+
+      Map.has_key?(props, :wildcard_subscription_available) ->
+        {:error, :protocol_error}
+
+      true ->
+        decode_properties(rest, Map.put(props, :wildcard_subscription_available, val == 1))
+    end
   end
 
   defp decode_properties(<<@prop_subscription_identifier_available, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :subscription_identifier_available, val == 1))
+    cond do
+      val > 1 ->
+        {:error, :malformed_packet}
+
+      Map.has_key?(props, :subscription_identifier_available) ->
+        {:error, :protocol_error}
+
+      true ->
+        decode_properties(rest, Map.put(props, :subscription_identifier_available, val == 1))
+    end
   end
 
   defp decode_properties(<<@prop_shared_subscription_available, val::8, rest::binary>>, props) do
-    decode_properties(rest, Map.put(props, :shared_subscription_available, val == 1))
+    cond do
+      val > 1 ->
+        {:error, :malformed_packet}
+
+      Map.has_key?(props, :shared_subscription_available) ->
+        {:error, :protocol_error}
+
+      true ->
+        decode_properties(rest, Map.put(props, :shared_subscription_available, val == 1))
+    end
   end
 
   defp decode_properties(_invalid, _props) do
-    {:error, :invalid_property}
+    {:error, :malformed_packet}
   end
 
   # Helper functions
@@ -387,11 +528,23 @@ defmodule MqttX.Packet.Properties do
   end
 
   defp decode_utf8(<<len::16-big, str::binary-size(len), rest::binary>>) do
-    {:ok, str, rest}
+    if valid_mqtt_utf8?(str), do: {:ok, str, rest}, else: {:error, :malformed_packet}
   end
 
   defp decode_utf8(_) do
     {:error, :incomplete}
+  end
+
+  # MQTT §1.5.4: UTF-8 strings MUST NOT contain U+0000 (null) or surrogates
+  # (U+D800..U+DFFF). `:unicode.characters_to_binary/1` rejects standalone surrogates
+  # and any ill-formed UTF-8 sequence. The null byte requires a separate scan.
+  defp valid_mqtt_utf8?(<<>>), do: true
+
+  defp valid_mqtt_utf8?(bin) when is_binary(bin) do
+    case :binary.match(bin, <<0>>) do
+      :nomatch -> :unicode.characters_to_binary(bin) == bin
+      _ -> false
+    end
   end
 
   defp decode_binary(<<len::16-big, bin::binary-size(len), rest::binary>>) do

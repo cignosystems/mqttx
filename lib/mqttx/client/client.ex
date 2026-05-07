@@ -13,8 +13,8 @@ defmodule MqttX.Client do
         client_id: "my_app"
       )
 
-      # Subscribe
-      :ok = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
+      # Subscribe (returns {:ok, granted_qos_list})
+      {:ok, _granted} = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
 
       # Publish
       :ok = MqttX.Client.publish(client, "sensors/temp", "25.5")
@@ -27,7 +27,8 @@ defmodule MqttX.Client do
   To receive messages, provide a handler module:
 
       defmodule MyHandler do
-        def handle_mqtt_event(:message, {topic, payload, _opts}, state) do
+        def handle_mqtt_event(:message, {topic, payload, _packet}, state) do
+          # topic is a list of segments, e.g. ["sensors", "room1", "temp"]
           IO.puts("Received: " <> inspect({topic, payload}))
           state
         end

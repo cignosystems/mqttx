@@ -109,51 +109,58 @@ defmodule MqttX.Packet.Codec do
          @connect,
          0,
          <<proto_len::16-big, proto::binary-size(proto_len), protocol_level::8, user_flag::1,
-           pass_flag::1, will_retain::1, will_qos::2, will_flag::1, clean::1, _reserved::1,
+           pass_flag::1, will_retain::1, will_qos::2, will_flag::1, clean::1, reserved::1,
            keepalive::16-big, rest::binary>>
        ) do
-    with {:ok, protocol_version} <- validate_protocol(proto, protocol_level),
-         {:ok, props, rest2} <- Properties.decode(protocol_version, rest) do
-      {client_id, rest3} = decode_utf8(rest2)
+    with :ok <- validate_connect_flags(reserved, will_flag, will_qos, will_retain),
+         {:ok, protocol_version} <- validate_protocol(proto, protocol_level),
+         :ok <- validate_user_pass_flags(protocol_version, user_flag, pass_flag),
+         {:ok, props, rest2} <- Properties.decode(protocol_version, rest),
+         {:ok, client_id, rest3} <- decode_utf8_safe(rest2),
+         {:ok, will_props, rest4} <-
+           if(will_flag == 1,
+             do: Properties.decode(protocol_version, rest3),
+             else: {:ok, %{}, rest3}
+           ),
+         {:ok, will_topic, rest5} <- decode_utf8_optional_safe(rest4, will_flag),
+         {:ok, will_payload, rest6} <- decode_binary_optional_safe(rest5, will_flag),
+         {:ok, username, rest7} <- decode_utf8_optional_safe(rest6, user_flag),
+         {:ok, password, <<>>} <- decode_utf8_optional_safe(rest7, pass_flag) do
+      will =
+        if will_flag == 1 do
+          %{
+            topic: will_topic,
+            payload: will_payload,
+            qos: will_qos,
+            retain: will_retain == 1,
+            properties: will_props
+          }
+        else
+          nil
+        end
 
-      with {:ok, will_props, rest4} <-
-             if(will_flag == 1,
-               do: Properties.decode(protocol_version, rest3),
-               else: {:ok, %{}, rest3}
-             ) do
-        {will_topic, rest5} = decode_utf8_optional(rest4, will_flag)
-        {will_payload, rest6} = decode_binary_optional(rest5, will_flag)
-        {username, rest7} = decode_utf8_optional(rest6, user_flag)
-        {password, <<>>} = decode_utf8_optional(rest7, pass_flag)
-
-        will =
-          if will_flag == 1 do
-            %{
-              topic: will_topic,
-              payload: will_payload,
-              qos: will_qos,
-              retain: will_retain == 1,
-              properties: will_props
-            }
-          else
-            nil
-          end
-
-        {:ok,
-         %{
-           type: :connect,
-           protocol_name: proto,
-           protocol_version: protocol_version,
-           client_id: client_id,
-           clean_session: clean == 1,
-           keep_alive: keepalive,
-           properties: props,
-           username: username,
-           password: password,
-           will: will
-         }}
-      end
+      {:ok,
+       %{
+         type: :connect,
+         protocol_name: proto,
+         protocol_version: protocol_version,
+         client_id: client_id,
+         clean_session: clean == 1,
+         keep_alive: keepalive,
+         properties: props,
+         username: username,
+         password: password,
+         will: will
+       }}
+    else
+      {:ok, _, _} -> {:error, :malformed_packet}
+      {:error, _} = err -> err
     end
+  end
+
+  defp decode_packet(_version, @connect, _flags, _payload) do
+    # CONNECT fixed-header flags MUST be 0 (§3.1.1)
+    {:error, :malformed_packet}
   end
 
   # CONNACK
@@ -174,7 +181,13 @@ defmodule MqttX.Packet.Codec do
     end
   end
 
-  # PUBLISH
+  # PUBLISH — §3.3.1.2 forbids QoS=3; §3.3.1.1 forbids DUP=1 with QoS=0
+  defp decode_packet(_version, @publish, flags, _payload)
+       when (flags &&& 0b0110) == 0b0110
+       when (flags &&& 0b1110) == 0b1000 do
+    {:error, :malformed_packet}
+  end
+
   defp decode_packet(
          version,
          @publish,
@@ -185,17 +198,8 @@ defmodule MqttX.Packet.Codec do
     qos = (flags &&& 0b0110) >>> 1
     retain = (flags &&& 0b0001) == 0b0001
 
-    {packet_id, rest2} =
-      case qos do
-        0 ->
-          {nil, rest}
-
-        _ ->
-          <<pid::16-big, r::binary>> = rest
-          {pid, r}
-      end
-
-    with {:ok, props, payload} <- Properties.decode(version, rest2),
+    with {:ok, packet_id, rest2} <- decode_publish_packet_id(qos, rest),
+         {:ok, props, payload} <- Properties.decode(version, rest2),
          {:ok, normalized_topic} <- validate_publish_topic(topic, props) do
       {:ok,
        %{
@@ -208,9 +212,6 @@ defmodule MqttX.Packet.Codec do
          properties: props,
          payload: payload
        }}
-    else
-      {:error, :invalid_topic} -> {:error, :invalid_topic}
-      {:error, _} = err -> err
     end
   end
 
@@ -241,10 +242,11 @@ defmodule MqttX.Packet.Codec do
     end
   end
 
-  # SUBSCRIBE
+  # SUBSCRIBE — payload MUST contain at least one topic filter (§3.8.3)
   defp decode_packet(version, @subscribe, 2, <<packet_id::16-big, rest::binary>>) do
     with {:ok, props, topics_bin} <- Properties.decode(version, rest),
-         {:ok, topics} <- decode_subscribe_topics(topics_bin, []) do
+         {:ok, topics} <- decode_subscribe_topics(topics_bin, []),
+         :ok <- ensure_nonempty_topics(topics) do
       {:ok,
        %{
          type: :subscribe,
@@ -270,10 +272,11 @@ defmodule MqttX.Packet.Codec do
     end
   end
 
-  # UNSUBSCRIBE
+  # UNSUBSCRIBE — payload MUST contain at least one topic filter (§3.10.3)
   defp decode_packet(version, @unsubscribe, 2, <<packet_id::16-big, rest::binary>>) do
     with {:ok, props, topics_bin} <- Properties.decode(version, rest),
-         {:ok, topics} <- decode_unsubscribe_topics(topics_bin, []) do
+         {:ok, topics} <- decode_unsubscribe_topics(topics_bin, []),
+         :ok <- ensure_nonempty_topics(topics) do
       {:ok,
        %{
          type: :unsubscribe,
@@ -309,9 +312,13 @@ defmodule MqttX.Packet.Codec do
     {:ok, %{type: :pingresp}}
   end
 
-  # DISCONNECT
+  # DISCONNECT — §3.14.2.2.1: 1-byte form (reason code only) is valid
   defp decode_packet(_version, @disconnect, 0, <<>>) do
     {:ok, %{type: :disconnect, reason_code: 0, properties: %{}}}
+  end
+
+  defp decode_packet(_version, @disconnect, 0, <<reason_code::8>>) do
+    {:ok, %{type: :disconnect, reason_code: reason_code, properties: %{}}}
   end
 
   defp decode_packet(version, @disconnect, 0, <<reason_code::8, rest::binary>>) do
@@ -325,9 +332,13 @@ defmodule MqttX.Packet.Codec do
     end
   end
 
-  # AUTH (MQTT 5.0 only)
+  # AUTH (MQTT 5.0 only) — §3.15.2.2.1: 1-byte form is valid
   defp decode_packet(5, @auth, 0, <<>>) do
     {:ok, %{type: :auth, reason_code: 0, properties: %{}}}
+  end
+
+  defp decode_packet(5, @auth, 0, <<reason_code::8>>) do
+    {:ok, %{type: :auth, reason_code: reason_code, properties: %{}}}
   end
 
   defp decode_packet(5, @auth, 0, <<reason_code::8, rest::binary>>) do
@@ -574,6 +585,23 @@ defmodule MqttX.Packet.Codec do
   defp validate_protocol(@protocol_name, 0x85), do: {:ok, 5}
   defp validate_protocol(_, _), do: {:error, :unknown_protocol}
 
+  # §3.1.2.3: reserved flag bit MUST be 0
+  defp validate_connect_flags(1, _, _, _), do: {:error, :malformed_packet}
+  # §3.1.2.6/7: if Will Flag = 0, Will QoS and Will Retain MUST be 0
+  defp validate_connect_flags(0, 0, 0, 0), do: :ok
+  defp validate_connect_flags(0, 0, _, _), do: {:error, :malformed_packet}
+  # §3.1.2.6: Will QoS MUST NOT be 3
+  defp validate_connect_flags(0, 1, 3, _), do: {:error, :malformed_packet}
+  defp validate_connect_flags(0, 1, _, _), do: :ok
+
+  # v3.1.1 §3.1.2.9: if username flag is 0, password flag MUST also be 0. v5 lifts this.
+  defp validate_user_pass_flags(4, 0, 1), do: {:error, :malformed_packet}
+  defp validate_user_pass_flags(3, 0, 1), do: {:error, :malformed_packet}
+  defp validate_user_pass_flags(_, _, _), do: :ok
+
+  defp ensure_nonempty_topics([]), do: {:error, :protocol_error}
+  defp ensure_nonempty_topics(_), do: :ok
+
   defp protocol_name(3), do: @protocol_name_3
   defp protocol_name(_), do: @protocol_name
 
@@ -621,17 +649,33 @@ defmodule MqttX.Packet.Codec do
   defp encode_optional_utf8(nil), do: <<>>
   defp encode_optional_utf8(str), do: encode_utf8(str)
 
-  defp decode_utf8(<<len::16-big, str::binary-size(len), rest::binary>>) do
-    {str, rest}
+  # Safe variants used by CONNECT decode — surface malformed inputs as errors instead of MatchError
+  defp decode_utf8_safe(<<len::16-big, str::binary-size(len), rest::binary>>) do
+    if valid_mqtt_utf8?(str), do: {:ok, str, rest}, else: {:error, :malformed_packet}
   end
 
-  defp decode_utf8_optional(data, 0), do: {nil, data}
-  defp decode_utf8_optional(data, 1), do: decode_utf8(data)
+  defp decode_utf8_safe(_), do: {:error, :malformed_packet}
 
-  defp decode_binary_optional(data, 0), do: {nil, data}
+  defp decode_utf8_optional_safe(data, 0), do: {:ok, nil, data}
+  defp decode_utf8_optional_safe(data, 1), do: decode_utf8_safe(data)
 
-  defp decode_binary_optional(<<len::16-big, bin::binary-size(len), rest::binary>>, 1),
-    do: {bin, rest}
+  defp decode_binary_optional_safe(data, 0), do: {:ok, nil, data}
+
+  defp decode_binary_optional_safe(<<len::16-big, bin::binary-size(len), rest::binary>>, 1),
+    do: {:ok, bin, rest}
+
+  defp decode_binary_optional_safe(_, _), do: {:error, :malformed_packet}
+
+  # MQTT §1.5.4: UTF-8 strings MUST NOT contain U+0000 (null) or U+D800..U+DFFF (surrogates)
+  # `:unicode.characters_to_binary/1` rejects standalone surrogates and ill-formed UTF-8.
+  defp valid_mqtt_utf8?(<<>>), do: true
+
+  defp valid_mqtt_utf8?(bin) when is_binary(bin) do
+    case :binary.match(bin, <<0>>) do
+      :nomatch -> :unicode.characters_to_binary(bin) == bin
+      _ -> false
+    end
+  end
 
   # Will message encoding
   defp encode_will(_version, nil), do: <<>>
@@ -679,6 +723,10 @@ defmodule MqttX.Packet.Codec do
     [<<packet_id::16-big>>]
   end
 
+  defp decode_publish_packet_id(0, rest), do: {:ok, nil, rest}
+  defp decode_publish_packet_id(_qos, <<pid::16-big, rest::binary>>), do: {:ok, pid, rest}
+  defp decode_publish_packet_id(_qos, _), do: {:error, :malformed_packet}
+
   # MQTT 5.0: empty topic is valid when topic_alias is present
   defp validate_publish_topic("", %{topic_alias: alias_val})
        when is_integer(alias_val) and alias_val > 0 do
@@ -698,24 +746,33 @@ defmodule MqttX.Packet.Codec do
          <<len::16-big, name::binary-size(len), opts::8, rest::binary>>,
          topics
        ) do
-    <<_reserved::2, rh::2, rap::1, nl::1, qos::2>> = <<opts::8>>
+    <<reserved::2, rh::2, rap::1, nl::1, qos::2>> = <<opts::8>>
 
-    case Topic.validate(name) do
-      {:ok, normalized} ->
-        topic = %{
-          topic: normalized,
-          qos: qos,
-          no_local: nl == 1,
-          retain_as_published: rap == 1,
-          retain_handling: rh
-        }
+    cond do
+      # §3.8.3.1: reserved bits MUST be 0; QoS=3 and RH=3 are Malformed Packet
+      reserved != 0 or qos == 3 or rh == 3 ->
+        {:error, :malformed_packet}
 
-        decode_subscribe_topics(rest, [topic | topics])
+      true ->
+        case Topic.validate(name) do
+          {:ok, normalized} ->
+            topic = %{
+              topic: normalized,
+              qos: qos,
+              no_local: nl == 1,
+              retain_as_published: rap == 1,
+              retain_handling: rh
+            }
 
-      {:error, _} = err ->
-        err
+            decode_subscribe_topics(rest, [topic | topics])
+
+          {:error, _} = err ->
+            err
+        end
     end
   end
+
+  defp decode_subscribe_topics(_other, _topics), do: {:error, :malformed_packet}
 
   defp encode_subscribe_topics(topics) do
     Enum.map(topics, fn topic ->
@@ -748,6 +805,8 @@ defmodule MqttX.Packet.Codec do
     end
   end
 
+  defp decode_unsubscribe_topics(_other, _topics), do: {:error, :malformed_packet}
+
   defp encode_unsubscribe_topics(topics) do
     Enum.map(topics, fn topic ->
       name =
@@ -765,13 +824,22 @@ defmodule MqttX.Packet.Codec do
     Enum.reverse(acks)
   end
 
-  defp decode_suback_acks(<<0::6, qos::2, rest::binary>>, acks) do
-    decode_suback_acks(rest, [{:ok, qos} | acks])
-  end
+  defp decode_suback_acks(<<0, rest::binary>>, acks),
+    do: decode_suback_acks(rest, [{:ok, 0} | acks])
+
+  defp decode_suback_acks(<<1, rest::binary>>, acks),
+    do: decode_suback_acks(rest, [{:ok, 1} | acks])
+
+  defp decode_suback_acks(<<2, rest::binary>>, acks),
+    do: decode_suback_acks(rest, [{:ok, 2} | acks])
 
   defp decode_suback_acks(<<reason::8, rest::binary>>, acks) when reason >= 0x80 do
     decode_suback_acks(rest, [{:error, reason} | acks])
   end
+
+  # Invalid SUBACK byte (0x03..0x7F): surface as error rather than crash
+  defp decode_suback_acks(<<_invalid::8, _rest::binary>>, _acks),
+    do: [{:error, :malformed_packet}]
 
   defp encode_suback_acks(acks) do
     Enum.map(acks, fn
@@ -796,6 +864,10 @@ defmodule MqttX.Packet.Codec do
   defp decode_unsuback_acks(<<reason::8, rest::binary>>, acks) when reason >= 0x80 do
     decode_unsuback_acks(rest, [{:error, reason} | acks])
   end
+
+  # Invalid UNSUBACK byte: surface as error rather than crash
+  defp decode_unsuback_acks(<<_invalid::8, _rest::binary>>, _acks),
+    do: [{:error, :malformed_packet}]
 
   defp encode_unsuback_acks(acks) do
     Enum.map(acks, fn

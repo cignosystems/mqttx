@@ -18,6 +18,10 @@ Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package.
 - 🔌 Pluggable transports (ThousandIsland, Ranch)
 - 📦 Optional payload codecs (JSON, Protobuf)
 
+> **AI coding assistants:** see [`AGENTS.md`](AGENTS.md) for the mental model,
+> idiomatic patterns, and a list of mistakes commonly made when integrating
+> MqttX. Also rendered on [hexdocs](https://hexdocs.pm/mqttx/agents.html).
+
 ## MQTT for Cellular IoT
 
 For IoT devices on cellular networks (LTE-M, NB-IoT), every byte matters. Data transmission costs money, drains batteries, and increases latency. MQTT combined with Protobuf dramatically outperforms WebSocket with JSON:
@@ -118,7 +122,7 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.9.0"},
+    {:mqttx, "~> 0.10.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: WebSocket transport
@@ -201,8 +205,8 @@ Start the server:
   password: "secret"       # optional
 )
 
-# Subscribe
-:ok = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
+# Subscribe (returns {:ok, granted_qos_list})
+{:ok, [1]} = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
 
 # Publish
 :ok = MqttX.Client.publish(client, "sensors/temp", "25.5")
@@ -256,6 +260,110 @@ packet = %{
 # Decode a packet
 {:ok, {decoded, rest}} = MqttX.Packet.Codec.decode(4, binary)
 ```
+
+## Common Patterns
+
+### Receiving messages on the client
+
+Provide a handler module that implements `handle_mqtt_event/3`. The client
+calls it on connect, disconnect, and for every incoming PUBLISH:
+
+```elixir
+defmodule MyApp.MqttClientHandler do
+  def handle_mqtt_event(:connected, _info, state), do: state
+  def handle_mqtt_event(:disconnected, _reason, state), do: state
+
+  def handle_mqtt_event(:message, {topic, payload, _packet}, state) do
+    IO.puts("Got #{payload} on #{Enum.join(topic, "/")}")
+    state
+  end
+end
+
+{:ok, client} = MqttX.Client.connect(
+  host: "broker.example.com",
+  client_id: "subscriber",
+  handler: MyApp.MqttClientHandler,
+  handler_state: %{}
+)
+
+{:ok, _granted} = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
+```
+
+`topic` arrives as a list of segments (`["sensors", "room1", "temp"]`) — use
+`Enum.join(topic, "/")` to get the original string. The `:message` event's
+third element is the full decoded packet — useful for inspecting QoS, the
+retain flag, or MQTT 5.0 user properties.
+
+### Publishing from a server callback (broadcast / fan-out)
+
+To bridge from your application (Phoenix.PubSub, a GenServer, an Oban worker,
+…) to a connected MQTT client, send a message to the connection process and
+return a `{:publish, ...}` tuple from `handle_info/2`:
+
+```elixir
+defmodule MyApp.MqttHandler do
+  use MqttX.Server
+
+  def init(_), do: %{}
+
+  def handle_connect(client_id, _creds, _info, state) do
+    Phoenix.PubSub.subscribe(MyApp.PubSub, "client:#{client_id}")
+    {:ok, state}
+  end
+
+  def handle_publish(_topic, _payload, _opts, state), do: {:ok, state}
+  def handle_subscribe(topics, state), do: {:ok, Enum.map(topics, & &1.qos), state}
+  def handle_disconnect(_reason, _state), do: :ok
+
+  def handle_info({:downlink, topic, payload}, state) do
+    {:publish, topic, payload, %{qos: 1, retain: false}, state}
+  end
+end
+```
+
+Then anywhere in your app:
+
+```elixir
+Phoenix.PubSub.broadcast(MyApp.PubSub, "client:device-123",
+  {:downlink, "device-123/cmd", "reboot"})
+```
+
+### MQTT 5.0 persistent sessions (resume after disconnect)
+
+In MQTT 5.0 the client tells the broker how long to keep its session via
+`:session_expiry_interval` and resumes by reconnecting with the same
+`client_id` and `clean_session: false`:
+
+```elixir
+{:ok, client} = MqttX.Client.connect(
+  host: "broker.example.com",
+  client_id: "device-imei-350457794457489",
+  protocol_version: 5,
+  clean_session: false,
+  connect_properties: %{session_expiry_interval: 3600},
+  session_store: MqttX.Session.ETSStore
+)
+```
+
+The broker queues QoS 1/2 messages while the client is offline (up to 1 hour
+in this example) and replays them on reconnect.
+
+## Common Pitfalls
+
+- **`clean_session: false` does nothing without `:session_store`.** The flag
+  tells the broker to keep state — but for the *client* to resume QoS 1/2
+  in-flight on reconnect, you must also pass a `:session_store` module.
+- **Server's `:server_keep_alive` overrides the client.** When set in
+  `transport_opts`, MQTT 5.0 clients use the broker's value regardless of what
+  they sent in CONNECT. Useful for surviving cloud-proxy idle timeouts.
+- **`:max_packet_size` is enforced both ways.** A client that sends a packet
+  larger than the broker's limit gets DISCONNECT 0x95; the reverse is also
+  true if the client advertises one in CONNECT properties.
+- **Topic wildcards in PUBLISH are illegal.** `+` and `#` are subscribe-only —
+  use `MqttX.Topic.validate_publish/1` on untrusted input.
+- **`$SYS/...` topics need explicit subscription.** Per MQTT §4.7.2, `#` and
+  `+/...` subscribers do *not* receive `$`-prefixed topics; subscribe to
+  `$SYS/#` directly.
 
 ## Transport Adapters
 

@@ -51,7 +51,13 @@ defmodule MqttX.Server.RateLimiter do
     max_messages = Keyword.get(opts, :max_messages)
     interval = Keyword.get(opts, :interval, 1000)
 
-    table = :ets.new(:mqttx_rate_limiter, [:public, :set, {:write_concurrency, true}])
+    table =
+      :ets.new(:mqttx_rate_limiter, [
+        :public,
+        :set,
+        {:read_concurrency, true},
+        {:write_concurrency, true}
+      ])
 
     # Initialize connection counter
     :ets.insert(table, {:connections, 0})

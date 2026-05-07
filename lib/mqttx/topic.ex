@@ -48,7 +48,14 @@ defmodule MqttX.Topic do
 
   Returns `{:ok, normalized_topic}` or `{:error, :invalid_topic}`.
   """
+  # MQTT §1.5.4: 16-bit length-prefixed UTF-8 strings cap at 65535 bytes
+  @max_topic_bytes 65_535
+
   @spec validate(binary() | list()) :: {:ok, normalized_topic()} | {:error, :invalid_topic}
+  def validate(topic) when is_binary(topic) and byte_size(topic) > @max_topic_bytes do
+    {:error, :invalid_topic}
+  end
+
   def validate(topic) when is_binary(topic) do
     topic
     |> normalize()
@@ -131,20 +138,15 @@ defmodule MqttX.Topic do
     <<>>
   end
 
-  def flatten([head | tail]) do
-    flatten_loop(tail, part_to_binary(head))
+  def flatten(topic) when is_list(topic) do
+    topic
+    |> Enum.map(&part_to_binary/1)
+    |> Enum.intersperse("/")
+    |> IO.iodata_to_binary()
   end
 
   def flatten(topic) when is_binary(topic) do
     topic
-  end
-
-  defp flatten_loop([], acc) do
-    acc
-  end
-
-  defp flatten_loop([head | tail], acc) do
-    flatten_loop(tail, <<acc::binary, "/", part_to_binary(head)::binary>>)
   end
 
   defp part_to_binary(:single_level), do: "+"
@@ -192,37 +194,45 @@ defmodule MqttX.Topic do
     matches?(filter, normalize(topic))
   end
 
-  def matches?([], []) do
-    true
+  # §4.7.2: filters starting with a wildcard at the first level MUST NOT match
+  # topic names beginning with '$' (e.g. $SYS/...). Detect at the entry point;
+  # once a literal level is matched, the remainder is structural.
+  def matches?([:single_level | _] = filter, [<<"$", _::binary>> | _] = topic) do
+    matches_inner?(filter, topic, true)
   end
 
-  def matches?([:multi_level], _topic) do
-    true
+  def matches?([:multi_level | _] = filter, [<<"$", _::binary>> | _] = topic) do
+    matches_inner?(filter, topic, true)
   end
 
-  def matches?([:multi_level | _], _topic) do
-    true
+  def matches?(filter, topic) do
+    matches_inner?(filter, topic, false)
   end
 
-  def matches?([:single_level | filter_rest], [_topic_head | topic_rest]) do
-    matches?(filter_rest, topic_rest)
+  # `dollar_blocked` is true while we're still at the head of a topic that begins
+  # with $ AND have not yet consumed a literal first-level filter segment.
+  defp matches_inner?([], [], _), do: true
+  defp matches_inner?([:multi_level], _topic, true), do: false
+  defp matches_inner?([:multi_level], _topic, false), do: true
+  defp matches_inner?([:multi_level | _], _topic, true), do: false
+  defp matches_inner?([:multi_level | _], _topic, false), do: true
+
+  defp matches_inner?([:single_level | _filter_rest], [_topic_head | _topic_rest], true),
+    do: false
+
+  defp matches_inner?([:single_level | filter_rest], [_topic_head | topic_rest], false) do
+    matches_inner?(filter_rest, topic_rest, false)
   end
 
-  def matches?([same | filter_rest], [same | topic_rest]) do
-    matches?(filter_rest, topic_rest)
+  defp matches_inner?([same | filter_rest], [same | topic_rest], _) do
+    # Once a literal filter segment matches a topic segment we're past the
+    # first-level $-guard.
+    matches_inner?(filter_rest, topic_rest, false)
   end
 
-  def matches?([], [_ | _]) do
-    false
-  end
-
-  def matches?([_ | _], []) do
-    false
-  end
-
-  def matches?(_, _) do
-    false
-  end
+  defp matches_inner?([], [_ | _], _), do: false
+  defp matches_inner?([_ | _], [], _), do: false
+  defp matches_inner?(_, _, _), do: false
 
   # Validation helpers
 
@@ -329,7 +339,13 @@ defmodule MqttX.Topic do
   def parse_shared("$share/" <> rest) do
     case String.split(rest, "/", parts: 2) do
       [group, topic_filter] when group != "" and topic_filter != "" ->
-        {:shared, group, topic_filter}
+        # §4.8.2: ShareName MUST NOT contain '/', '+', or '#'. The `parts: 2`
+        # split already excludes '/'. Reject filters that smuggled '+' or '#'.
+        if String.contains?(group, ["+", "#"]) do
+          {:normal, "$share/" <> rest}
+        else
+          {:shared, group, topic_filter}
+        end
 
       _ ->
         {:normal, "$share/" <> rest}

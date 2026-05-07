@@ -42,7 +42,7 @@ defmodule MqttX do
         client_id: "my_client"
       )
 
-      :ok = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
+      {:ok, _granted} = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
       :ok = MqttX.Client.publish(client, "sensors/temp", "25.5", qos: 0)
 
   ### Packet Codec
@@ -82,8 +82,13 @@ defmodule MqttX do
           | :auth
 
   @doc """
-  Returns the library version.
+  Returns the library version (read from the `:mqttx` app spec, never hardcoded).
   """
   @spec version :: String.t()
-  def version, do: "0.9.0"
+  def version do
+    case Application.spec(:mqttx, :vsn) do
+      nil -> "unknown"
+      vsn -> List.to_string(vsn)
+    end
+  end
 end

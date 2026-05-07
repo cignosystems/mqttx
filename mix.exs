@@ -1,7 +1,7 @@
 defmodule MqttX.MixProject do
   use Mix.Project
 
-  @version "0.9.0"
+  @version "0.10.0"
   @source_url "https://github.com/cignosystems/mqttx"
 
   def project do
@@ -53,7 +53,7 @@ defmodule MqttX.MixProject do
         "GitHub" => @source_url,
         "Changelog" => "https://hexdocs.pm/mqttx/changelog.html"
       },
-      files: ~w(lib assets guides .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
+      files: ~w(lib assets guides .formatter.exs mix.exs README.md LICENSE CHANGELOG.md AGENTS.md)
     ]
   end
 
@@ -67,6 +67,7 @@ defmodule MqttX.MixProject do
       source_url: @source_url,
       extras: [
         "README.md",
+        "AGENTS.md",
         "CHANGELOG.md",
         "guides/getting-started.md",
         "guides/client.md",
@@ -85,6 +86,9 @@ defmodule MqttX.MixProject do
           "guides/performance.md"
         ]
       ],
+      # CHANGELOG references internal modules (@moduledoc false) by name to
+      # describe behaviour changes — that's expected and shouldn't warn.
+      skip_undefined_reference_warnings_on: ["CHANGELOG.md"],
       before_closing_head_tag: &before_closing_head_tag/1
     ]
   end

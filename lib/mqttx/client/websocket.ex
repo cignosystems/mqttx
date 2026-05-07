@@ -2,14 +2,35 @@ defmodule MqttX.Client.WebSocket do
   @moduledoc false
   # Minimal WebSocket client for MQTT over WebSocket.
   # Handles HTTP upgrade handshake and WebSocket binary framing (RFC 6455).
-  # Only supports binary frames (opcode 0x02) as required by MQTT.
+  # Supports binary, text, ping/pong, close, and continuation frames.
+
+  require Logger
+
+  # RFC 6455 §1.3
+  @ws_guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+  @typedoc """
+  Opaque fragmentation state threaded across `decode_frames/2` calls. A WebSocket
+  message can be split across multiple frames (FIN=0 starts/continues, FIN=1
+  ends); since one TCP read can land mid-message, we keep the partial buffer
+  here. `{<<>>, nil}` means no message in progress.
+  """
+  @type frag_state :: {binary(), :binary | :text | nil}
+
+  @initial_frag {<<>>, nil}
+
+  @doc """
+  Initial fragmentation state — pass into `decode_frames/2` on first call.
+  """
+  def initial_frag, do: @initial_frag
 
   @doc """
   Perform WebSocket HTTP upgrade over an existing TCP/SSL socket.
   Returns :ok on successful upgrade or {:error, reason}.
   """
   def upgrade(socket, transport, host, path) do
-    key = :crypto.strong_rand_bytes(16) |> Base.encode64()
+    raw_key = :crypto.strong_rand_bytes(16)
+    key = Base.encode64(raw_key)
 
     request =
       "GET #{path} HTTP/1.1\r\n" <>
@@ -22,15 +43,9 @@ defmodule MqttX.Client.WebSocket do
         "\r\n"
 
     with :ok <- send_raw(socket, transport, request),
-         {:ok, response} <- recv_upgrade_response(socket, transport, <<>>) do
-      response_lower = String.downcase(response)
-
-      if String.contains?(response, "101") and
-           String.contains?(response_lower, "upgrade: websocket") do
-        :ok
-      else
-        {:error, :upgrade_failed}
-      end
+         {:ok, response} <- recv_upgrade_response(socket, transport, <<>>),
+         :ok <- validate_upgrade_response(response, key) do
+      :ok
     end
   end
 
@@ -60,39 +75,52 @@ defmodule MqttX.Client.WebSocket do
   end
 
   @doc """
-  Decode WebSocket frames from binary buffer.
-  Returns {:ok, payloads, rest} where payloads is a list of binary payloads,
-  or {:incomplete, buffer} if not enough data.
+  Decode WebSocket frames from a binary buffer, threading fragmentation state.
+
+  Returns `{:ok, payloads, rest, new_frag_state}` for normal data frames or
+  `{:close, payloads}` if a Close frame was seen. Callers that don't need to
+  distinguish fragmented messages can use `decode_frames/1` (initial state).
   """
-  def decode_frames(buffer) do
-    decode_frames(buffer, [])
+  def decode_frames(buffer), do: decode_frames(buffer, @initial_frag)
+
+  def decode_frames(buffer, frag) do
+    decode_frames(buffer, [], frag)
   end
 
-  defp decode_frames(buffer, acc) do
+  defp decode_frames(buffer, acc, {frag_buf, frag_type} = frag) do
     case decode_one_frame(buffer) do
       {:ok, :ping, _payload, rest} ->
-        # Ping handled at connection level
-        decode_frames(rest, acc)
+        decode_frames(rest, acc, frag)
 
       {:ok, :pong, _payload, rest} ->
-        decode_frames(rest, acc)
+        decode_frames(rest, acc, frag)
 
       {:ok, :close, _payload, _rest} ->
         {:close, Enum.reverse(acc)}
 
-      {:ok, :binary, payload, rest} ->
-        decode_frames(rest, [payload | acc])
+      # First fragment (FIN=0, opcode=binary|text)
+      {:ok, {:fragment_start, type}, payload, rest} ->
+        decode_frames(rest, acc, {payload, type})
 
-      {:ok, :text, payload, rest} ->
-        # Treat text as binary for MQTT
-        decode_frames(rest, [payload | acc])
+      # Middle fragment (FIN=0, opcode=continuation 0x00)
+      {:ok, :fragment_middle, payload, rest} ->
+        decode_frames(rest, acc, {frag_buf <> payload, frag_type})
+
+      # Final fragment (FIN=1, opcode=continuation 0x00)
+      {:ok, :fragment_end, payload, rest} ->
+        complete = frag_buf <> payload
+        decode_frames(rest, [complete | acc], @initial_frag)
+
+      # Standalone complete data frame (FIN=1, opcode=binary|text)
+      {:ok, type, payload, rest} when type in [:binary, :text] ->
+        decode_frames(rest, [payload | acc], frag)
 
       :incomplete ->
-        {:ok, Enum.reverse(acc), buffer}
+        {:ok, Enum.reverse(acc), buffer, frag}
     end
   end
 
-  defp decode_one_frame(<<_fin::1, _rsv::3, opcode::4, second_byte, rest::binary>>) do
+  defp decode_one_frame(<<fin::1, _rsv::3, opcode::4, second_byte, rest::binary>>) do
     mask_bit = Bitwise.bsr(second_byte, 7)
     len_tag = Bitwise.band(second_byte, 0x7F)
 
@@ -107,16 +135,7 @@ defmodule MqttX.Client.WebSocket do
             payload
           end
 
-        type =
-          case opcode do
-            0x01 -> :text
-            0x02 -> :binary
-            0x08 -> :close
-            0x09 -> :ping
-            0x0A -> :pong
-            _ -> :binary
-          end
-
+        type = classify_frame(fin, opcode)
         {:ok, type, payload, remaining}
 
       {:ok, _len, _mask_key, _payload_rest} ->
@@ -128,6 +147,18 @@ defmodule MqttX.Client.WebSocket do
   end
 
   defp decode_one_frame(_), do: :incomplete
+
+  defp classify_frame(1, 0x00), do: :fragment_end
+  defp classify_frame(0, 0x00), do: :fragment_middle
+  defp classify_frame(0, 0x01), do: {:fragment_start, :text}
+  defp classify_frame(0, 0x02), do: {:fragment_start, :binary}
+  defp classify_frame(1, 0x01), do: :text
+  defp classify_frame(1, 0x02), do: :binary
+  defp classify_frame(_, 0x08), do: :close
+  defp classify_frame(_, 0x09), do: :ping
+  defp classify_frame(_, 0x0A), do: :pong
+  # Unknown opcode — treat as binary so it surfaces upstream rather than hanging
+  defp classify_frame(_, _), do: :binary
 
   defp decode_length(len, 0, rest) when len < 126 do
     {:ok, len, nil, rest}
@@ -173,23 +204,17 @@ defmodule MqttX.Client.WebSocket do
     [<<1::1, 0::3, 0x08::4, 1::1, 0::7>>, mask_key]
   end
 
-  # XOR masking per RFC 6455
-  defp mask(data, <<k0, k1, k2, k3>>) do
-    mask_bytes(data, {k0, k1, k2, k3}, 0, [])
-  end
+  # XOR masking per RFC 6455. `:crypto.exor/2` is dramatically faster than the
+  # previous byte-by-byte recursion (especially for large MQTT publishes) — it
+  # delegates to the OpenSSL/SIMD path on most VMs.
+  defp mask(<<>>, _key), do: <<>>
 
-  defp mask_bytes(<<>>, _key, _i, acc), do: IO.iodata_to_binary(Enum.reverse(acc))
-
-  defp mask_bytes(<<b, rest::binary>>, {k0, k1, k2, k3} = key, i, acc) do
-    k =
-      case rem(i, 4) do
-        0 -> k0
-        1 -> k1
-        2 -> k2
-        3 -> k3
-      end
-
-    mask_bytes(rest, key, i + 1, [Bitwise.bxor(b, k) | acc])
+  defp mask(data, mask_key) when byte_size(mask_key) == 4 do
+    data_len = byte_size(data)
+    full = div(data_len, 4)
+    rem_bytes = rem(data_len, 4)
+    pad = :binary.copy(mask_key, full) <> binary_part(mask_key, 0, rem_bytes)
+    :crypto.exor(data, pad)
   end
 
   defp send_raw(socket, :tcp, data), do: :gen_tcp.send(socket, data)
@@ -214,6 +239,70 @@ defmodule MqttX.Client.WebSocket do
 
       {:error, _} = err ->
         err
+    end
+  end
+
+  # RFC 6455 §4.1: validate the server's upgrade response. Required:
+  #   - Status line "HTTP/1.x 101 ..."
+  #   - "Upgrade: websocket" header
+  #   - Sec-WebSocket-Accept = Base64(SHA1(client_key + magic GUID))
+  # Strongly recommended:
+  #   - Sec-WebSocket-Protocol echoed as "mqtt" (we only warn if missing —
+  #     several MQTT brokers omit it but otherwise speak the protocol fine).
+  defp validate_upgrade_response(response, client_key) do
+    cond do
+      not status_101?(response) ->
+        {:error, :upgrade_failed}
+
+      not String.contains?(String.downcase(response), "upgrade: websocket") ->
+        {:error, :upgrade_failed}
+
+      not accept_matches?(response, client_key) ->
+        {:error, :sec_websocket_accept_mismatch}
+
+      true ->
+        warn_if_protocol_missing(response)
+        :ok
+    end
+  end
+
+  defp status_101?(response) do
+    case String.split(response, "\r\n", parts: 2) do
+      [status_line | _] ->
+        # "HTTP/1.1 101 Switching Protocols"
+        String.match?(status_line, ~r/^HTTP\/1\.[01]\s+101(\s|$)/)
+
+      _ ->
+        false
+    end
+  end
+
+  defp accept_matches?(response, client_key) do
+    expected = expected_accept(client_key)
+
+    case Regex.run(~r/Sec-WebSocket-Accept:\s*([^\r\n]+)/i, response) do
+      [_, value] -> String.trim(value) == expected
+      nil -> false
+    end
+  end
+
+  defp expected_accept(client_key) do
+    :sha
+    |> :crypto.hash(client_key <> @ws_guid)
+    |> Base.encode64()
+  end
+
+  defp warn_if_protocol_missing(response) do
+    case Regex.run(~r/Sec-WebSocket-Protocol:\s*([^\r\n]+)/i, response) do
+      [_, value] ->
+        if String.downcase(String.trim(value)) != "mqtt" do
+          Logger.warning(
+            "[MqttX.Client.WebSocket] Server echoed Sec-WebSocket-Protocol=#{inspect(value)} (expected mqtt)"
+          )
+        end
+
+      nil ->
+        Logger.debug("[MqttX.Client.WebSocket] Server did not echo Sec-WebSocket-Protocol header")
     end
   end
 end

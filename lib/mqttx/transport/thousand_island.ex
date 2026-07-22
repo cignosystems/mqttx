@@ -58,17 +58,32 @@ defmodule MqttX.Transport.ThousandIsland do
       rate_limiter: rate_limiter
     }
 
-    thousand_island_opts = [
-      port: port,
-      handler_module: handler_module,
-      handler_options: handler_opts_full,
-      transport_module: transport_module,
-      transport_options: [{:ip, ip} | transport_options],
-      num_acceptors: num_acceptors
-    ]
+    thousand_island_opts =
+      [
+        port: port,
+        handler_module: handler_module,
+        handler_options: handler_opts_full,
+        transport_module: transport_module,
+        transport_options: [{:ip, ip} | transport_options],
+        num_acceptors: num_acceptors
+      ] ++ read_timeout_opts(transport_opts)
 
     Logger.info("[MqttX.Transport.ThousandIsland] Starting on port #{port}")
     ThousandIsland.start_link(thousand_island_opts)
+  end
+
+  # Pass ThousandIsland's `read_timeout` through when the caller sets it. An MQTT
+  # server governs connection liveness with its own keepalive timer (1.5x the
+  # negotiated keep-alive); ThousandIsland's default socket read timeout (60s) is
+  # independent of that and will close an idle-but-healthy connection whose
+  # keep-alive is >= ~40s, racing the client's PINGREQ. Setting
+  # `read_timeout: :infinity` lets the keepalive timer be authoritative. Omitted
+  # when unset so ThousandIsland's default still applies (backward compatible).
+  defp read_timeout_opts(transport_opts) do
+    case Keyword.get(transport_opts, :read_timeout) do
+      nil -> []
+      read_timeout -> [read_timeout: read_timeout]
+    end
   end
 
   defp create_retained_table(port) do

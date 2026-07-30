@@ -7,7 +7,7 @@ defmodule MqttX.Payload do
   ## Built-in Codecs
 
   - `MqttX.Payload.Raw` - Pass-through, no encoding
-  - `MqttX.Payload.JSON` - JSON encoding via Jason
+  - `MqttX.Payload.JSON` - JSON encoding via the OTP 27+ built-in `JSON` module
   - `MqttX.Payload.Protobuf` - Protocol Buffers via Protox
 
   ## Custom Codec Example

@@ -68,7 +68,7 @@ defmodule MqttX.Packet.Properties do
         {:ok, %{}, rest}
 
       {:ok, len, rest} when byte_size(rest) >= len ->
-        <<props_bin::binary-size(len), remaining::binary>> = rest
+        <<props_bin::binary-size(^len), remaining::binary>> = rest
 
         case decode_properties(props_bin, %{}) do
           {:ok, props} -> {:ok, finalize_props(props), remaining}
@@ -114,7 +114,8 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_payload_format_indicator, bool_byte(val)>>]
   end
 
-  defp encode_property({:message_expiry_interval, val}) when is_integer(val) do
+  defp encode_property({:message_expiry_interval, val})
+       when is_integer(val) and val >= 0 and val <= 0xFFFFFFFF do
     [<<@prop_message_expiry_interval, val::32-big>>]
   end
 
@@ -132,15 +133,21 @@ defmodule MqttX.Packet.Properties do
 
   defp encode_property({:subscription_identifier, vals}) when is_list(vals) do
     Enum.map(vals, fn val ->
+      unless is_integer(val) and val >= 1 and val <= 268_435_455 do
+        throw({:mqttx_invalid_property, :subscription_identifier})
+      end
+
       [<<@prop_subscription_identifier>>, Varint.encode(val)]
     end)
   end
 
-  defp encode_property({:subscription_identifier, val}) when is_integer(val) do
+  defp encode_property({:subscription_identifier, val})
+       when is_integer(val) and val >= 1 and val <= 268_435_455 do
     [<<@prop_subscription_identifier>>, Varint.encode(val)]
   end
 
-  defp encode_property({:session_expiry_interval, val}) when is_integer(val) do
+  defp encode_property({:session_expiry_interval, val})
+       when is_integer(val) and val >= 0 and val <= 0xFFFFFFFF do
     [<<@prop_session_expiry_interval, val::32-big>>]
   end
 
@@ -148,7 +155,8 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_assigned_client_identifier>>, encode_utf8(val)]
   end
 
-  defp encode_property({:server_keep_alive, val}) when is_integer(val) do
+  defp encode_property({:server_keep_alive, val})
+       when is_integer(val) and val >= 0 and val <= 0xFFFF do
     [<<@prop_server_keep_alive, val::16-big>>]
   end
 
@@ -164,7 +172,8 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_request_problem_information, bool_byte(val)>>]
   end
 
-  defp encode_property({:will_delay_interval, val}) when is_integer(val) do
+  defp encode_property({:will_delay_interval, val})
+       when is_integer(val) and val >= 0 and val <= 0xFFFFFFFF do
     [<<@prop_will_delay_interval, val::32-big>>]
   end
 
@@ -184,15 +193,17 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_reason_string>>, encode_utf8(val)]
   end
 
-  defp encode_property({:receive_maximum, val}) when is_integer(val) do
+  defp encode_property({:receive_maximum, val})
+       when is_integer(val) and val >= 0 and val <= 0xFFFF do
     [<<@prop_receive_maximum, val::16-big>>]
   end
 
-  defp encode_property({:topic_alias_maximum, val}) when is_integer(val) do
+  defp encode_property({:topic_alias_maximum, val})
+       when is_integer(val) and val >= 0 and val <= 0xFFFF do
     [<<@prop_topic_alias_maximum, val::16-big>>]
   end
 
-  defp encode_property({:topic_alias, val}) when is_integer(val) do
+  defp encode_property({:topic_alias, val}) when is_integer(val) and val >= 0 and val <= 0xFFFF do
     [<<@prop_topic_alias, val::16-big>>]
   end
 
@@ -216,7 +227,8 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_user_property>>, encode_utf8(key), encode_utf8(val)]
   end
 
-  defp encode_property({:maximum_packet_size, val}) when is_integer(val) do
+  defp encode_property({:maximum_packet_size, val})
+       when is_integer(val) and val >= 0 and val <= 0xFFFFFFFF do
     [<<@prop_maximum_packet_size, val::32-big>>]
   end
 
@@ -232,8 +244,12 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_shared_subscription_available, bool_byte(val)>>]
   end
 
-  defp encode_property(_other) do
-    []
+  # An unknown key or a value that failed its type/range guard must surface
+  # as an error — silently dropping it means e.g. a typo'd property or an
+  # out-of-range interval simply vanishes from the wire while the caller
+  # believes it was sent. The throw is caught at the Codec.encode boundary.
+  defp encode_property({name, _val}) do
+    throw({:mqttx_invalid_property, name})
   end
 
   # Decode properties from binary
@@ -295,6 +311,10 @@ defmodule MqttX.Packet.Properties do
   end
 
   defp decode_properties(<<@prop_subscription_identifier, rest::binary>>, props) do
+    # NOTE: Varint.decode/1 can return a BARE :incomplete (not a tuple), so this
+    # `with` needs an explicit else — without one it leaks that atom to callers
+    # and crashes them with CaseClauseError. The property slice is already
+    # complete by construction, so a truncated varint here is malformed.
     with {:ok, val, rest2} <- Varint.decode(rest) do
       if val == 0 do
         # §3.8.2.1.2: Subscription Identifier value 0 is Protocol Error
@@ -305,6 +325,9 @@ defmodule MqttX.Packet.Properties do
         existing = Map.get(props, :subscription_identifier, [])
         decode_properties(rest2, Map.put(props, :subscription_identifier, [val | existing]))
       end
+    else
+      {:error, _} = err -> err
+      _incomplete_or_other -> {:error, :malformed_packet}
     end
   end
 
@@ -519,8 +542,19 @@ defmodule MqttX.Packet.Properties do
   defp bool_byte(1), do: 1
   defp bool_byte(0), do: 0
 
+  # §1.5.4/§1.5.6: the 2-byte length prefix caps strings and binaries at
+  # 65,535 bytes; larger values would silently wrap modulo 65536 and corrupt
+  # the framing. The throw is caught at the Codec.encode boundary.
+  defp encode_utf8(str) when byte_size(str) > 0xFFFF do
+    throw(:mqttx_string_too_long)
+  end
+
   defp encode_utf8(str) when is_binary(str) do
     <<byte_size(str)::16-big, str::binary>>
+  end
+
+  defp encode_binary(bin) when byte_size(bin) > 0xFFFF do
+    throw(:mqttx_string_too_long)
   end
 
   defp encode_binary(bin) when is_binary(bin) do

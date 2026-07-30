@@ -3,12 +3,22 @@ defmodule MqttX.ClientTest do
 
   alias MqttX.Client
 
+  # A port that is guaranteed to refuse connections right now — these tests
+  # assert "not connected" behavior, which must not depend on whether a real
+  # broker happens to be listening on localhost:1883.
+  defp closed_port do
+    {:ok, socket} = :gen_tcp.listen(0, [])
+    {:ok, port} = :inet.port(socket)
+    :gen_tcp.close(socket)
+    port
+  end
+
   describe "connect/1" do
     test "accepts all valid options" do
       # This will fail to connect but validates option parsing
       opts = [
         host: "localhost",
-        port: 1883,
+        port: closed_port(),
         client_id: "test-client",
         username: "user",
         password: "pass",
@@ -26,13 +36,15 @@ defmodule MqttX.ClientTest do
     end
 
     test "uses default port 1883" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       assert is_pid(pid)
       GenServer.stop(pid, :normal, 1000)
     end
 
     test "accepts transport :tcp option" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test", transport: :tcp)
+      {:ok, pid} =
+        Client.connect(host: "localhost", port: closed_port(), client_id: "test", transport: :tcp)
+
       assert is_pid(pid)
       GenServer.stop(pid, :normal, 1000)
     end
@@ -66,7 +78,12 @@ defmodule MqttX.ClientTest do
 
     test "accepts retry_interval option" do
       {:ok, pid} =
-        Client.connect(host: "localhost", client_id: "test", retry_interval: 10_000)
+        Client.connect(
+          host: "localhost",
+          port: closed_port(),
+          client_id: "test",
+          retry_interval: 10_000
+        )
 
       assert is_pid(pid)
       GenServer.stop(pid, :normal, 1000)
@@ -76,6 +93,7 @@ defmodule MqttX.ClientTest do
       {:ok, pid} =
         Client.connect(
           host: "localhost",
+          port: closed_port(),
           client_id: "test",
           clean_session: false,
           session_store: MqttX.Session.ETSStore
@@ -88,7 +106,7 @@ defmodule MqttX.ClientTest do
 
   describe "connected?/1" do
     test "returns false when not connected" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
 
       # Give it a moment to attempt connection (will fail with no broker)
       Process.sleep(100)
@@ -102,7 +120,7 @@ defmodule MqttX.ClientTest do
 
   describe "publish/4" do
     test "returns error when not connected" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
 
       # Wait for connection attempt
       Process.sleep(100)
@@ -114,7 +132,7 @@ defmodule MqttX.ClientTest do
     end
 
     test "accepts qos option" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       # All QoS levels should be accepted (even if not connected)
@@ -126,7 +144,7 @@ defmodule MqttX.ClientTest do
     end
 
     test "accepts retain option" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       assert {:error, :not_connected} = Client.publish(pid, "test", "msg", retain: true)
@@ -138,7 +156,7 @@ defmodule MqttX.ClientTest do
 
   describe "subscribe/3" do
     test "returns error when not connected" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       result = Client.subscribe(pid, "test/topic")
@@ -148,7 +166,7 @@ defmodule MqttX.ClientTest do
     end
 
     test "accepts single topic as binary" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       assert {:error, :not_connected} = Client.subscribe(pid, "test/topic")
@@ -157,7 +175,7 @@ defmodule MqttX.ClientTest do
     end
 
     test "accepts multiple topics as list" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       assert {:error, :not_connected} = Client.subscribe(pid, ["topic/a", "topic/b"])
@@ -166,7 +184,7 @@ defmodule MqttX.ClientTest do
     end
 
     test "accepts qos option" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       assert {:error, :not_connected} = Client.subscribe(pid, "test", qos: 1)
@@ -177,7 +195,7 @@ defmodule MqttX.ClientTest do
 
   describe "unsubscribe/2" do
     test "returns error when not connected" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       result = Client.unsubscribe(pid, "test/topic")
@@ -187,7 +205,7 @@ defmodule MqttX.ClientTest do
     end
 
     test "accepts single topic" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       assert {:error, :not_connected} = Client.unsubscribe(pid, "test/topic")
@@ -196,7 +214,7 @@ defmodule MqttX.ClientTest do
     end
 
     test "accepts multiple topics" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       Process.sleep(100)
 
       assert {:error, :not_connected} = Client.unsubscribe(pid, ["topic/a", "topic/b"])
@@ -207,7 +225,7 @@ defmodule MqttX.ClientTest do
 
   describe "disconnect/1" do
     test "stops the client process gracefully" do
-      {:ok, pid} = Client.connect(host: "localhost", client_id: "test")
+      {:ok, pid} = Client.connect(host: "localhost", port: closed_port(), client_id: "test")
       assert Process.alive?(pid)
 
       # Use GenServer.stop for clean shutdown

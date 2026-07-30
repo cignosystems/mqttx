@@ -36,14 +36,17 @@ defmodule MqttX.Client.Backoff do
   - `:initial` - Initial delay in milliseconds (default: 1000)
   - `:max` - Maximum delay in milliseconds (default: 30000)
   - `:multiplier` - Multiplier for each retry (default: 2.0)
-  - `:jitter` - Random jitter factor 0-1 (default: 0.1)
+  - `:jitter` - Random jitter factor, clamped to 0-0.9 (default: 0.1)
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     initial = Keyword.get(opts, :initial, 1000)
     max = Keyword.get(opts, :max, 30_000)
     multiplier = Keyword.get(opts, :multiplier, 2.0)
-    jitter = Keyword.get(opts, :jitter, 0.1)
+
+    # Clamp to [0, 0.9]: jitter >= 1 can produce a zero or negative delay,
+    # and Process.send_after raises on negative values.
+    jitter = opts |> Keyword.get(:jitter, 0.1) |> min(0.9) |> max(0.0)
 
     %__MODULE__{
       initial: initial,

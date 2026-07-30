@@ -19,6 +19,11 @@ defmodule MqttX.Client.WebSocket do
 
   @initial_frag {<<>>, nil}
 
+  # Ceiling on a single WebSocket frame's declared payload length. The 64-bit
+  # length field otherwise lets a hostile peer declare an arbitrary size and
+  # make us buffer toward it indefinitely.
+  @max_frame_size 16_777_216
+
   @doc """
   Initial fragmentation state — pass into `decode_frames/2` on first call.
   """
@@ -77,46 +82,52 @@ defmodule MqttX.Client.WebSocket do
   @doc """
   Decode WebSocket frames from a binary buffer, threading fragmentation state.
 
-  Returns `{:ok, payloads, rest, new_frag_state}` for normal data frames or
-  `{:close, payloads}` if a Close frame was seen. Callers that don't need to
-  distinguish fragmented messages can use `decode_frames/1` (initial state).
+  Returns `{:ok, payloads, pings, rest, new_frag_state}` for normal data
+  frames — `pings` are the payloads of any Ping frames seen, which RFC 6455
+  §5.5.2 requires answering with a matching Pong — `{:close, payloads}` if a
+  Close frame was seen, or `{:error, :frame_too_large}` if a frame declares a
+  payload above the internal ceiling. Callers that don't need to distinguish
+  fragmented messages can use `decode_frames/1` (initial state).
   """
   def decode_frames(buffer), do: decode_frames(buffer, @initial_frag)
 
   def decode_frames(buffer, frag) do
-    decode_frames(buffer, [], frag)
+    decode_frames(buffer, [], [], frag)
   end
 
-  defp decode_frames(buffer, acc, {frag_buf, frag_type} = frag) do
+  defp decode_frames(buffer, acc, pings, {frag_buf, frag_type} = frag) do
     case decode_one_frame(buffer) do
-      {:ok, :ping, _payload, rest} ->
-        decode_frames(rest, acc, frag)
+      {:ok, :ping, payload, rest} ->
+        decode_frames(rest, acc, [payload | pings], frag)
 
       {:ok, :pong, _payload, rest} ->
-        decode_frames(rest, acc, frag)
+        decode_frames(rest, acc, pings, frag)
 
       {:ok, :close, _payload, _rest} ->
         {:close, Enum.reverse(acc)}
 
       # First fragment (FIN=0, opcode=binary|text)
       {:ok, {:fragment_start, type}, payload, rest} ->
-        decode_frames(rest, acc, {payload, type})
+        decode_frames(rest, acc, pings, {payload, type})
 
       # Middle fragment (FIN=0, opcode=continuation 0x00)
       {:ok, :fragment_middle, payload, rest} ->
-        decode_frames(rest, acc, {frag_buf <> payload, frag_type})
+        decode_frames(rest, acc, pings, {frag_buf <> payload, frag_type})
 
       # Final fragment (FIN=1, opcode=continuation 0x00)
       {:ok, :fragment_end, payload, rest} ->
         complete = frag_buf <> payload
-        decode_frames(rest, [complete | acc], @initial_frag)
+        decode_frames(rest, [complete | acc], pings, @initial_frag)
 
       # Standalone complete data frame (FIN=1, opcode=binary|text)
       {:ok, type, payload, rest} when type in [:binary, :text] ->
-        decode_frames(rest, [payload | acc], frag)
+        decode_frames(rest, [payload | acc], pings, frag)
+
+      :too_large ->
+        {:error, :frame_too_large}
 
       :incomplete ->
-        {:ok, Enum.reverse(acc), buffer, frag}
+        {:ok, Enum.reverse(acc), Enum.reverse(pings), buffer, frag}
     end
   end
 
@@ -126,7 +137,7 @@ defmodule MqttX.Client.WebSocket do
 
     case decode_length(len_tag, mask_bit, rest) do
       {:ok, len, mask_key, payload_rest} when byte_size(payload_rest) >= len ->
-        <<payload::binary-size(len), remaining::binary>> = payload_rest
+        <<payload::binary-size(^len), remaining::binary>> = payload_rest
 
         payload =
           if mask_key do
@@ -140,6 +151,9 @@ defmodule MqttX.Client.WebSocket do
 
       {:ok, _len, _mask_key, _payload_rest} ->
         :incomplete
+
+      :too_large ->
+        :too_large
 
       :incomplete ->
         :incomplete
@@ -174,6 +188,13 @@ defmodule MqttX.Client.WebSocket do
 
   defp decode_length(126, 1, <<len::16, mask::4-binary, rest::binary>>) do
     {:ok, len, mask, rest}
+  end
+
+  # A 64-bit length field lets a hostile peer declare up to 2^63 bytes; cap it
+  # so `ws_buffer` cannot be grown without bound while waiting for a frame
+  # that will never complete.
+  defp decode_length(127, _mask_bit, <<len::64, _rest::binary>>) when len > @max_frame_size do
+    :too_large
   end
 
   defp decode_length(127, 0, <<len::64, rest::binary>>) do

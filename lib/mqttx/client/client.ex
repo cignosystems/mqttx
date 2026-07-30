@@ -7,10 +7,14 @@ defmodule MqttX.Client do
   ## Example
 
       # Connect
+      # `await_connect: true` blocks until the session is live, so the calls
+      # below work inline. Without it, connect/1 returns immediately and these
+      # would get {:error, :not_connected} — see "Connection is asynchronous".
       {:ok, client} = MqttX.Client.connect(
         host: "localhost",
         port: 1883,
-        client_id: "my_app"
+        client_id: "my_app",
+        await_connect: true
       )
 
       # Subscribe (returns {:ok, granted_qos_list})
@@ -42,6 +46,14 @@ defmodule MqttX.Client do
           IO.puts("Disconnected: " <> inspect(reason))
           state
         end
+
+        def handle_mqtt_event(:publish_error, {_topic, _packet_id, reason_code}, state) do
+          IO.puts("Broker rejected publish: " <> inspect(reason_code))
+          state
+        end
+
+        # Catch-all so future event types don't raise
+        def handle_mqtt_event(_event, _data, state), do: state
       end
 
       {:ok, client} = MqttX.Client.connect(
@@ -116,23 +128,99 @@ defmodule MqttX.Client do
   ## Options
 
   - `:host` - Broker hostname (required)
-  - `:port` - Broker port (default: 1883)
+  - `:port` - Broker port (default: 1883 TCP / 8883 SSL / 8083 WS / 8084 WSS)
   - `:client_id` - Client identifier (required)
   - `:username` - Optional username
   - `:password` - Optional password
   - `:clean_session` - Clean session flag (default: true)
   - `:keepalive` - Keepalive interval in seconds (default: 60)
+  - `:protocol_version` - `3`, `4` (3.1.1) or `5` (default: 5)
   - `:handler` - Module to receive callbacks
   - `:handler_state` - Initial state for handler
   - `:name` - Optional name for the client process
 
+  ### Transport
+
+  - `:transport` - `:tcp`, `:ssl`, `:ws` or `:wss` (default: `:tcp`)
+  - `:ssl_opts` - SSL options for `:ssl`/`:wss`, merged **over** a secure
+    baseline (`verify: :verify_peer` against the OS trust store, SNI, HTTPS
+    hostname checking, TLS 1.2/1.3). Pass `[verify: :verify_none]` to opt out
+    deliberately; it is logged as a warning.
+  - `:ws_path` - WebSocket path for `:ws`/`:wss` (default: `"/mqtt"`)
+  - `:proxy` - Tunnel through an HTTP `CONNECT` proxy, e.g.
+    `[host: "proxy.corp", port: 3128, auth: {"user", "pass"}]`. Works for all
+    transports; `:port` defaults to 3128 and `:auth` (Basic) is optional. TLS
+    is negotiated with the broker through the tunnel.
+
+  ### Reliability and limits
+
+  - `:retry_interval` - QoS 1/2 retry interval in ms (default: 5000)
+  - `:max_inflight` - Max pending QoS 1/2 messages (default: 100)
+  - `:max_packet_size` - Reject inbound packets declaring more than this
+    (default: 1 MiB; `:infinity` disables)
+  - `:session_store` - Session store module or `{module, opts}`
+  - `:connect_properties` - MQTT 5.0 CONNECT properties, e.g.
+    `%{session_expiry_interval: 3600, receive_maximum: 20}`
+
+  ### Last Will & Testament
+
+  - `:will_topic`, `:will_payload`, `:will_qos`, `:will_retain`,
+    `:will_properties`
+
   ## Returns
 
-  `{:ok, pid}` on success, `{:error, reason}` on failure.
+  `{:ok, pid}` on success, `{:error, reason}` on failure — including
+  `{:error, {:missing_option, :host | :client_id}}` when a required option is
+  absent.
+
+  ## Connection is asynchronous
+
+  `connect/1` returns as soon as the client process starts — **the session is
+  not yet live**. The CONNECT/CONNACK handshake happens in the background so
+  that a client can be started before the broker is reachable (a device
+  booting before its network, a broker still starting up) and keep retrying
+  with backoff.
+
+  This means `subscribe/3` and `publish/4` called immediately after
+  `connect/1` will return `{:error, :not_connected}`. Wait for readiness in
+  one of these ways:
+
+      # 1. Act on the :connected event (recommended for long-lived clients)
+      def handle_mqtt_event(:connected, _info, state) do
+        MqttX.Client.subscribe(self(), "sensors/#", qos: 1)
+        state
+      end
+
+      # 2. Block until the first attempt resolves (handy in scripts and tests)
+      {:ok, client} = MqttX.Client.connect(host: "broker", client_id: "c",
+                                           await_connect: true)
+      # session is live here, or {:error, reason} was returned
+
+  With `await_connect: true`, a failed first attempt returns
+  `{:error, reason}` (for example `:econnrefused`, a TLS failure, or
+  `{:connack_error, code, info}`) and the client is stopped rather than left
+  retrying.
   """
-  @spec connect(keyword()) :: {:ok, pid()} | {:error, term()}
+  @spec connect(keyword()) :: GenServer.on_start() | {:error, term()}
   def connect(opts) do
-    Connection.start_link(opts)
+    {await?, start_opts} = Keyword.pop(opts, :await_connect, false)
+
+    with {:ok, pid} <- Connection.start_link(start_opts) do
+      if await? do
+        case Connection.await_connect(pid) do
+          :ok ->
+            {:ok, pid}
+
+          {:error, reason} ->
+            # Don't leave an orphan retrying in the background when the caller
+            # was told the connection failed.
+            _ = GenServer.stop(pid, :normal, 1_000)
+            {:error, reason}
+        end
+      else
+        {:ok, pid}
+      end
+    end
   end
 
   @doc """
@@ -142,6 +230,13 @@ defmodule MqttX.Client do
 
   - `:qos` - QoS level 0, 1, or 2 (default: 0)
   - `:retain` - Retain flag (default: false)
+  - `:properties` - PUBLISH properties map (MQTT 5.0), e.g.
+    `%{message_expiry_interval: 60, response_topic: "replies/1",
+    correlation_data: "req-42", user_properties: [{"k", "v"}]}`
+
+  `:ok` means the packet was written to the socket; for QoS 1/2 the
+  broker's acknowledgment is tracked in the background (rejections surface
+  via `handle_mqtt_event(:publish_error, {topic, packet_id, reason_code}, state)`).
   """
   @spec publish(pid(), binary(), binary(), keyword()) :: :ok | {:error, term()}
   def publish(client, topic, payload, opts \\ []) do
@@ -171,6 +266,10 @@ defmodule MqttX.Client do
 
   @doc """
   Disconnect from the broker.
+
+  Asynchronous: the returned `:ok` acknowledges the request, not that the
+  DISCONNECT packet has been sent — the client process sends it and stops
+  shortly after.
 
   ## Options (MQTT 5.0)
 

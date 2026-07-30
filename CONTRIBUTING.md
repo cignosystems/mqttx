@@ -7,9 +7,9 @@ Notes for humans and AI assistants modifying this library itself. If you are
 
 - `lib/mqttx/packet/` — wire codec (`codec.ex`, `properties.ex`, `varint.ex`, `types.ex`)
 - `lib/mqttx/topic.ex` — topic validation, normalization, wildcard matching, shared subs
-- `lib/mqttx/transport/handler.ex` — per-connection broker state machine (~1000 LoC, big file)
+- `lib/mqttx/transport/handler.ex` — per-connection broker state machine (~1900 LoC, big file)
 - `lib/mqttx/server/` — broker pieces: `server.ex`, `router.ex`, `rate_limiter.ex`, `will_delay.ex`
-- `lib/mqttx/client/connection.ex` — client GenServer (~1400 LoC)
+- `lib/mqttx/client/connection.ex` — client GenServer (~2200 LoC)
 - `lib/mqttx/client/websocket.ex` — RFC 6455 client framing
 - `lib/mqttx/session/` — `Store` behaviour + ETS implementation; `ETSOwner` keeps the
   default `:mqttx_sessions` table alive under the application supervisor
@@ -48,10 +48,6 @@ ordered roughly by ratio of impact to effort.
   contains a `+`/`#`. Replace with a topic trie keyed by literal/`+`/`#` (with
   separate `$`-prefix root). Same data structure could back the subscription
   trie in `router.ex`.
-- **Receive Maximum on the *client* (in-flight cap).** `connection.ex` exposes
-  `:max_inflight` but doesn't honor the server's `receive_maximum` from CONNACK
-  for outbound QoS>0. Threshold publishes when `state.inflight_tx_count >=
-  server.receive_maximum`.
 
 ### Larger (each ~day-plus)
 
@@ -62,12 +58,6 @@ ordered roughly by ratio of impact to effort.
   publish-tuples and retained-on-subscribe paths fan out through
   `MqttX.Server.Router.match/3` and the per-subscription opts are applied per
   outbound PUBLISH.
-- **Subscription matching trie in the router.** `MqttX.Topic.matches?/2` is
-  linear; `Router.match/3` walks every subscription. For brokers serving >10K
-  subscribers this is the dominant cost per publish. Replace with a per-level
-  trie keyed by literal segment / `:single_level` / `:multi_level`, with a
-  separate root for `$`-prefix topics. The current `Topic.matches?` semantics
-  (already $-aware after the v0.10 fix) become the trie's per-edge semantics.
 - **Persistent session store + expiry sweep.** `MqttX.Session.Store` covers
   CRUD on `subscriptions`, `pending_messages`, `packet_id`. Add (additively,
   no signature change to the behaviour) fields for QoS 2 inbound packet IDs,
@@ -78,12 +68,6 @@ ordered roughly by ratio of impact to effort.
   incoming bytes via `buf <> data` — O(n²) on fragmented large packets. Same
   pattern in `connection.ex:handle_info({:tcp, …})`. Switch to iolist
   accumulation with `IO.iodata_to_binary/1` only at decode time.
-- **Max packet size enforced before decode.** Currently `process_buffer/2`
-  decodes the whole packet then checks `byte_size(buffer) - byte_size(rest) >
-  server_max_packet_size`. An attacker sending a 100MB packet still gets it
-  fully buffered before rejection. Inspect the variable byte integer in the
-  fixed header first; if `remaining_length` is out of policy, send DISCONNECT
-  0x95 and close before any payload allocation.
 
 ### API-changing (worth a v0.11 deliberate bump)
 
@@ -96,14 +80,12 @@ ordered roughly by ratio of impact to effort.
 
 ### Smaller polish (low risk, do whenever)
 
-- `MqttX.Topic.is_wildcard?/1` is a `is_*` predicate but isn't a guard.
-  Rename to `wildcard_part?/1` to match Credo conventions.
 - Several reason-code literals (`0x82`, `0x94`, `0x95`, `0x93`, `0x92`, `0x8C`,
   `0x84`, `0x18`) appear inline across `handler.ex`. Pull to a shared
   module attribute file (`MqttX.Packet.ReasonCodes`).
 - Packet-type and property-id constants are duplicated in `types.ex`,
   `codec.ex`, and `properties.ex`. Pick one source of truth.
-- `connection.ex` is a 1400-line monolithic GenServer. Split connect/handshake,
+- `connection.ex` is a ~2200-line monolithic GenServer. Split connect/handshake,
   retry logic, topic-alias logic into helper modules.
 - `MqttX.Topic.flatten/1` switched from binary concat to iodata, but other
   paths (`handler.ex:normalize_topic_key/1` etc.) still do `Enum.join("/")` per

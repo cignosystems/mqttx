@@ -22,112 +22,26 @@ Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package.
 > idiomatic patterns, and a list of mistakes commonly made when integrating
 > MqttX. Also rendered on [hexdocs](https://hexdocs.pm/mqttx/agents.html).
 
-## MQTT for Cellular IoT
-
-For IoT devices on cellular networks (LTE-M, NB-IoT), every byte matters. Data transmission costs money, drains batteries, and increases latency. MQTT combined with Protobuf dramatically outperforms WebSocket with JSON:
-
-### Protocol Overhead Comparison
-
-| Metric | WebSocket + JSON | MQTT + Protobuf | Savings |
-|--------|------------------|-----------------|---------|
-| Connection handshake | ~300-500 bytes | ~30-50 bytes | **90%** |
-| Per-message overhead | 6-14 bytes | 2-4 bytes | **70%** |
-| Keep-alive (ping) | ~6 bytes | 2 bytes | **67%** |
-
-### Real-World Payload Example
-
-Sending a sensor reading `{temperature: 25.5, humidity: 60, battery: 85}`:
-
-| Format | Size | Notes |
-|--------|------|-------|
-| JSON | 52 bytes | `{"temperature":25.5,"humidity":60,"battery":85}` |
-| Protobuf | 9 bytes | Binary: `0x08 0xCC 0x01 0x10 0x3C 0x18 0x55` |
-| **Reduction** | **83%** | 5.8x smaller |
-
-### Monthly Data Usage (1 device, 1 msg/min)
-
-| Protocol | Payload | Monthly Data |
-|----------|---------|--------------|
-| WebSocket + JSON | 52 bytes | ~2.2 MB |
-| MQTT + Protobuf | 9 bytes | ~0.4 MB |
-| **Savings** | | **1.8 MB/device** |
-
-For fleets of thousands of devices, this translates to significant cost savings on cellular data plans and extended battery life from reduced radio-on time.
-
-### MQTT vs WebSocket (Same JSON Payload)
-
-Even when using JSON for both protocols, MQTT still provides significant overhead savings:
-
-| Metric | WebSocket + JSON | MQTT + JSON | Savings |
-|--------|------------------|-------------|---------|
-| Connection handshake | ~300-500 bytes | ~30-50 bytes | **90%** |
-| Per-message overhead | 6-14 bytes | 2-4 bytes | **70%** |
-| Keep-alive (ping) | ~6 bytes | 2 bytes | **67%** |
-| 52-byte JSON message | 58-66 bytes total | 54-56 bytes total | **15-18%** |
-
-**Key insight**: MQTT's binary protocol has lower framing overhead than WebSocket's text-based frames. For high-frequency IoT messages, this adds up significantly.
-
-## Why MqttX?
-
-Existing Elixir/Erlang MQTT libraries have limitations:
-
-- **mqtt_packet_map**: Erlang-only codec, no server/client, slower encoding
-- **Tortoise/Tortoise311**: Client-only, complex supervision, dated architecture
-- **emqtt**: Erlang-focused, heavy dependencies
-
-MqttX provides a **unified, pure Elixir solution** with:
-
-- **2.9-4.2x faster encoding** than mqtt_packet_map for common packets
-- Modern GenServer-based client with exponential backoff reconnection
-- Transport-agnostic server that works with ThousandIsland or Ranch
-- Clean, composable API designed for IoT and real-time applications
-- Zero external dependencies for the core codec
-
-The codec has been tested for interoperability with:
-
-- **Zephyr RTOS** MQTT client (Nordic nRF9160, nRF52)
-- **Eclipse Paho** clients (C, Python, JavaScript)
-- **Mosquitto** broker
-- Standard MQTT test suites
-
-### Connecting Nordic Thingy91 / nRF9160 (Zephyr MQTT)
-
-Key Zephyr MQTT settings for MqttX compatibility:
-
-```
-CONFIG_MQTT_KEEPALIVE=30        # Must be < cloud proxy idle timeout (e.g. Fly.io 60s)
-CONFIG_MQTT_LIB_TLS=y           # TLS required for production
-CONFIG_MQTT_CLEAN_SESSION=1     # Or use MQTT 5.0 session_expiry
-```
-
-Important notes:
-
-- Zephyr's MQTT library supports MQTT 3.1.1 and 5.0
-- For MQTT 5.0: `server_keep_alive` in CONNACK overrides the client's `CONFIG_MQTT_KEEPALIVE` — set it server-side for fleet control
-- For cellular (LTE-M/NB-IoT): use keepalive ≤ 30s to survive cloud proxy idle timeouts (Fly.io, AWS IoT, Azure)
-- Protobuf payloads recommended for cellular bandwidth savings
-
-### Cloud Deployment with TLS Proxy
-
-When deploying behind a TLS-terminating proxy (Fly.io, AWS NLB, Azure Front Door), ensure:
-
-- Client keepalive < proxy idle timeout (usually 60s)
-- Use `server_keep_alive` transport opt to enforce this server-side for all clients
-- Fly.io: `internal_port` 8883, TLS terminated by Fly proxy
+> **Name note:** MqttX (this Elixir library) is not affiliated with
+> [MQTTX](https://mqttx.app), EMQX's desktop MQTT client tool. The hex package
+> name `mqttx` is stable — you can depend on it.
 
 ## Installation
+
+Requires **Elixir 1.18+ / OTP 27+** (the JSON payload codec uses the native
+`JSON` module; CI covers Elixir 1.18-1.20 on OTP 27-29).
 
 Add `mqttx` to your dependencies:
 
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.10.0"},
+    {:mqttx, "~> 0.11.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: WebSocket transport
     {:bandit, "~> 1.6"},
-    {:websock_adapter, "~> 0.5"},
+    {:websock_adapter, "~> 0.5 or ~> 0.6"},
     # Optional: Payload codecs
     {:protox, "~> 2.0"}
   ]
@@ -182,12 +96,7 @@ Start the server:
 ```elixir
 {:ok, _pid} = MqttX.Server.start_link(
   MyApp.MqttHandler,
-  [transport_opts: %{
-    server_keep_alive: 30,           # override client keepalive (v5)
-    topic_alias_maximum: 100,        # max topic aliases
-    receive_maximum: 65535,          # max inflight QoS>0
-    max_packet_size: 256_000         # reject oversized packets
-  }],
+  [],
   transport: MqttX.Transport.ThousandIsland,
   port: 1883
 )
@@ -196,11 +105,14 @@ Start the server:
 ### MQTT Client
 
 ```elixir
-# Connect with TCP (default)
+# Connect with TCP (default). connect/1 is asynchronous — `await_connect: true`
+# blocks until the session is live so the calls below work inline; long-lived
+# clients should instead act on the handler's :connected event.
 {:ok, client} = MqttX.Client.connect(
   host: "localhost",
   port: 1883,
   client_id: "my_client",
+  await_connect: true,
   username: "user",        # optional
   password: "secret"       # optional
 )
@@ -217,18 +129,36 @@ Start the server:
 
 ### TLS/SSL Connection
 
+Certificates are **verified by default** since v0.11.0 — `verify_peer` against
+the OS trust store, with SNI and HTTPS-style hostname checking:
+
 ```elixir
-# Connect with TLS
 {:ok, client} = MqttX.Client.connect(
   host: "broker.example.com",
   port: 8883,                    # default SSL port
   client_id: "secure_client",
+  transport: :ssl
+)
+```
+
+Options in `:ssl_opts` are merged *over* that baseline — supply a private CA
+with `ssl_opts: [cacertfile: "/etc/ssl/private-ca.pem"]`, or, for a
+development broker with a self-signed certificate, opt out explicitly with
+`ssl_opts: [verify: :verify_none]` (logs a warning on every connect).
+
+### Behind an HTTP proxy
+
+Where direct outbound to 1883/8883 is blocked, tunnel through an HTTP
+`CONNECT` proxy — works for every transport, and TLS is still negotiated with
+the broker through the tunnel:
+
+```elixir
+{:ok, client} = MqttX.Client.connect(
+  host: "broker.example.com",
+  port: 8883,
+  client_id: "behind_proxy",
   transport: :ssl,
-  ssl_opts: [
-    verify: :verify_peer,
-    cacerts: :public_key.cacerts_get(),
-    server_name_indication: ~c"broker.example.com"
-  ]
+  proxy: [host: "proxy.corp", port: 3128, auth: {"user", "pass"}]
 )
 ```
 
@@ -261,38 +191,77 @@ packet = %{
 {:ok, {decoded, rest}} = MqttX.Packet.Codec.decode(4, binary)
 ```
 
+## Why MQTT, and why MqttX?
+
+MQTT is the right protocol for constrained and cellular deployments, and
+this library exists because the alternatives in the ecosystem each leave a
+gap. The reasoning — protocol-overhead comparisons against HTTP and
+WebSocket, real payload measurements, monthly cellular data budgets, and an
+honest comparison with the other Elixir/Erlang MQTT libraries — lives in
+[Why MQTT for IoT](guides/why-mqtt-for-iot.md).
+
 ## Common Patterns
 
 ### Receiving messages on the client
 
 Provide a handler module that implements `handle_mqtt_event/3`. The client
-calls it on connect, disconnect, and for every incoming PUBLISH:
+calls it on connect, disconnect, for every incoming PUBLISH, and when the
+broker rejects one of your QoS 1/2 publishes:
 
 ```elixir
 defmodule MyApp.MqttClientHandler do
-  def handle_mqtt_event(:connected, _info, state), do: state
-  def handle_mqtt_event(:disconnected, _reason, state), do: state
-
   def handle_mqtt_event(:message, {topic, payload, _packet}, state) do
     IO.puts("Got #{payload} on #{Enum.join(topic, "/")}")
     state
   end
+
+  # Catch-all so other events (:connected, :disconnected, :publish_error)
+  # don't raise
+  def handle_mqtt_event(_event, _data, state), do: state
 end
 
 {:ok, client} = MqttX.Client.connect(
   host: "broker.example.com",
   client_id: "subscriber",
   handler: MyApp.MqttClientHandler,
-  handler_state: %{}
+  handler_state: %{},
+  await_connect: true
 )
 
 {:ok, _granted} = MqttX.Client.subscribe(client, "sensors/#", qos: 1)
 ```
 
-`topic` arrives as a list of segments (`["sensors", "room1", "temp"]`) — use
-`Enum.join(topic, "/")` to get the original string. The `:message` event's
-third element is the full decoded packet — useful for inspecting QoS, the
-retain flag, or MQTT 5.0 user properties.
+`topic` arrives as a list of segments (`["sensors", "room1", "temp"]`), not the
+original string. The full event list, the payload/packet shapes, and the rules
+for calling back into the client from a handler are in the
+**[Client Guide](guides/client.md#receiving-messages)**.
+
+### Module-based client (`use MqttX`)
+
+For a client that owns its callbacks, connection, and supervision in one
+module:
+
+```elixir
+defmodule MyApp.Sensors do
+  use MqttX
+
+  @impl true
+  def handle_message(topic, payload, _packet, state) do
+    # Safe to publish from inside a callback — callbacks run in this module's
+    # own process, not inside the connection
+    publish("ack/" <> Enum.join(topic, "/"), payload, qos: 1)
+    {:ok, state}
+  end
+end
+
+# In your supervision tree:
+children = [{MyApp.Sensors, host: "broker.example.com", client_id: "sensors-1"}]
+```
+
+Every callback has a default, so implement only what you need. The full
+callback list and the injected helpers are documented in
+**`MqttX.SimpleClient`** and the
+**[Client Guide](guides/client.md#module-based-clients-use-mqttx)**.
 
 ### Publishing from a server callback (broadcast / fan-out)
 
@@ -345,11 +314,18 @@ In MQTT 5.0 the client tells the broker how long to keep its session via
 )
 ```
 
-The broker queues QoS 1/2 messages while the client is offline (up to 1 hour
-in this example) and replays them on reconnect.
+A spec-compliant broker queues QoS 1/2 messages while the client is offline
+(up to 1 hour in this example) and replays them on reconnect. Note that
+MqttX's *own* broker does not implement offline queueing — see `MqttX.Server`
+if you are running MqttX as the broker.
 
 ## Common Pitfalls
 
+- **`connect/1` does not wait for the broker.** It returns as soon as the
+  client process starts, so a `subscribe`/`publish` issued immediately after
+  gets `{:error, :not_connected}`. Subscribe once the session is live, or pass
+  `await_connect: true`. The async default lets a client start before its
+  broker is reachable and retry with backoff.
 - **`clean_session: false` does nothing without `:session_store`.** The flag
   tells the broker to keep state — but for the *client* to resume QoS 1/2
   in-flight on reconnect, you must also pass a `:session_store` module.
@@ -387,7 +363,10 @@ MqttX.Server.start_link(
   MyHandler,
   [],
   transport: MqttX.Transport.Ranch,
-  port: 1883
+  port: 1883,
+  # :ranch_tcp (default) or :ranch_ssl — note this option was named
+  # `:transport` before v0.11.0, which collided with the adapter selector above
+  ranch_transport: :ranch_tcp
 )
 ```
 
@@ -518,7 +497,7 @@ Use `handle_connect/4` to log protocol version or make version-specific decision
 
 ## Performance
 
-Architected to scale from tens of thousands to **hundreds of thousands of concurrent devices** on a single BEAM node, depending on hardware and workload. Each connection is a lightweight Erlang process (~20KB total with connection state and socket), and the hot paths are optimized for high message throughput:
+Architected to scale from tens of thousands to **roughly a million concurrent devices** on a single BEAM node, depending on hardware and workload. Each connection is a lightweight Erlang process (~20KB of BEAM state plus ~4-8KB of kernel socket buffers), and the hot paths are optimized for high message throughput:
 
 - **Trie-based topic router**: O(L+K) matching where L = topic depth, K = matching subscriptions — independent of total subscription count
 - **iodata encoding**: Socket sends use iodata directly, avoiding binary copies on every packet
@@ -528,14 +507,29 @@ Architected to scale from tens of thousands to **hundreds of thousands of concur
 - **Direct inflight counter**: O(1) flow control check instead of scanning pending_acks
 - **ETS-optimized retained delivery**: O(1) lookup for exact topic subscriptions
 
-| Metric | Conservative | Optimistic |
-|--------|-------------|------------|
-| Concurrent connections | 50,000 | 200,000 |
-| Messages/second (QoS 0) | 100,000 | 500,000+ |
-| Messages/second (QoS 1) | 50,000 | 200,000 |
-| Memory per connection | ~20 KB | ~20 KB |
+Capacity depends on hardware, so these figures are anchored to instance sizes
+rather than given as a single ceiling. Devices are the practical targets from
+the [capacity planning](guides/performance.md#capacity-planning) method, which
+reserves headroom for the runtime, ETS, and reconnect storms:
 
-**Codec benchmarks vs mqtt_packet_map** (Apple M4 Pro):
+| Instance | Idle-ish devices (~1 msg/min) | Chatty devices (1 msg/sec) | Binding constraint |
+|----------|------------------------------|----------------------------|--------------------|
+| 1 vCPU / 2 GB | ~50,000 | ~15,000 | RAM / CPU |
+| 4 vCPU / 16 GB | ~400,000 | ~60,000 | RAM, fds, kernel memory |
+| 16 vCPU / 128 GB | ~1,000,000 | ~160,000 | ETS contention, accept rate |
+
+Beyond roughly 500K connections per node the limit stops being RAM and becomes
+kernel socket memory, file descriptors, and contention on shared ETS tables —
+none of which improve with more cores — so horizontal scaling usually beats a
+larger instance. Message-rate figures assume small QoS 0 payloads, plaintext
+TCP, and a handler doing negligible work.
+
+> **These are estimates from architectural analysis and the codec benchmarks
+> below — not end-to-end load tests.** See the
+> [Performance & Scaling guide](guides/performance.md) for the sizing formula,
+> per-vCPU throughput, and the caveats behind each number.
+
+**Codec benchmarks vs mqtt_packet_map** — measured, on an Apple M4 Pro:
 
 | Operation | MqttX | mqtt_packet_map | Result |
 |-----------|-------|-----------------|--------|
@@ -543,7 +537,19 @@ Architected to scale from tens of thousands to **hundreds of thousands of concur
 | SUBSCRIBE encode | 3.42M ips | 0.82M ips | **4.2x faster** |
 | PUBLISH decode | 2.36M ips | 2.25M ips | ~same |
 
-See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS tuning, and deployment recommendations.
+The performance guide also covers [VM tuning](guides/performance.md#vm-tuning) (`+P`/`+Q`
+limits, which you *must* raise past 65K connections), OS tuning, and
+multi-node deployment.
+
+## Guides
+
+[Getting Started](guides/getting-started.md) ·
+[Why MQTT for IoT](guides/why-mqtt-for-iot.md) ·
+[Client](guides/client.md) ·
+[Server / Broker](guides/server.md) ·
+[Packet Codec](guides/codec.md) ·
+[Telemetry](guides/telemetry.md) ·
+[Performance & Scaling](guides/performance.md)
 
 ## API Reference
 
@@ -555,8 +561,8 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 | `connect_supervised(opts)` | Connect under `MqttX.Client.Supervisor` with crash recovery |
 | `list()` | List all registered client connections |
 | `whereis(client_id)` | Look up a connection by client_id |
-| `publish(client, topic, payload, opts \\ [])` | Publish a message. Options: `:qos` (0-2), `:retain` (boolean) |
-| `subscribe(client, topics, opts \\ [])` | Subscribe to topics. Options: `:qos` (0-2) |
+| `publish(client, topic, payload, opts \\ [])` | Publish a message. Options: `:qos` (0-2), `:retain` (boolean), `:properties` (MQTT 5.0) |
+| `subscribe(client, topics, opts \\ [])` | Subscribe to topics. Options: `:qos` (0-2), `:no_local`, `:retain_as_published`, `:retain_handling`, `:properties` (MQTT 5.0) |
 | `unsubscribe(client, topics)` | Unsubscribe from topics |
 | `disconnect(client)` | Disconnect from the broker |
 | `connected?(client)` | Check if client is connected |
@@ -565,17 +571,23 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `:host` | Broker hostname (required) | - |
-| `:port` | Broker port | 1883 (TCP), 8883 (SSL) |
-| `:client_id` | Client identifier (required) | - |
+| `:host` | Broker hostname | *required* |
+| `:port` | Broker port | `1883` / `8883` / `8083` / `8084` |
+| `:client_id` | Client identifier | *required* |
 | `:username` | Authentication username | `nil` |
 | `:password` | Authentication password | `nil` |
 | `:clean_session` | Start fresh session | `true` |
-| `:keepalive` | Keep-alive interval (seconds) | 60 |
-| `:transport` | `:tcp` or `:ssl` | `:tcp` |
-| `:ssl_opts` | SSL options for `:ssl` transport | `[]` |
-| `:retry_interval` | QoS retry interval (ms) | 5000 |
-| `:max_inflight` | Max pending QoS 1/2 messages | 100 |
+| `:keepalive` | Keep-alive interval (seconds) | `60` |
+| `:await_connect` | Block until the first CONNACK resolves (see [Common Pitfalls](#common-pitfalls)) | `false` |
+| `:protocol_version` | MQTT protocol level: `3`, `4` (3.1.1) or `5` | `5` |
+| `:transport` | `:tcp`, `:ssl`, `:ws`, or `:wss` | `:tcp` |
+| `:ssl_opts` | SSL options, merged **over** the secure baseline (see [TLS/SSL](guides/client.md#tls-ssl)) | `[]` |
+| `:ws_path` | WebSocket path for `:ws` or `:wss` | `"/mqtt"` |
+| `:proxy` | HTTP CONNECT proxy, e.g. `[host: "proxy.corp", port: 3128, auth: {"u", "p"}]` | `nil` |
+| `:retry_interval` | QoS retry interval (ms) | `5000` |
+| `:max_inflight` | Max pending QoS 1/2 messages | `100` |
+| `:max_packet_size` | Reject inbound packets declaring more than this (`:infinity` disables) | `1 MiB` |
+| `:will_topic` / `:will_payload` / `:will_qos` / `:will_retain` / `:will_properties` | Last Will & Testament | `nil` / `""` / `0` / `false` / `%{}` |
 | `:connect_properties` | MQTT 5.0 CONNECT properties (e.g. `%{session_expiry_interval: 3600}`) | `%{}` |
 | `:session_store` | Session store module | `nil` |
 | `:handler` | Callback module for messages | `nil` |
@@ -585,7 +597,7 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 
 | Function | Description |
 |----------|-------------|
-| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:name`, `:rate_limit` |
+| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:rate_limit`, `:ip`. Protocol options go in `handler_opts` under `:transport_opts` |
 
 **Callbacks:**
 
@@ -598,7 +610,8 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 | `handle_subscribe(topics, state)` | Handle SUBSCRIBE. Return `{:ok, granted_qos_list, state}` |
 | `handle_unsubscribe(topics, state)` | Handle UNSUBSCRIBE. Return `{:ok, state}` |
 | `handle_disconnect(reason, state)` | Handle client disconnection. Return `:ok` |
-| `handle_info(message, state)` | Handle custom messages. Return `{:ok, state}`, `{:publish, topic, payload, state}`, or `{:stop, reason, state}` |
+| `handle_session_expired(client_id, state)` | *(optional)* MQTT 5.0 session expiry elapsed after disconnect. Return `:ok` |
+| `handle_info(message, state)` | Handle custom messages. Return `{:ok, state}`, `{:publish, topic, payload, state}`, `{:publish, topic, payload, opts, state}`, `{:disconnect, reason_code, state}`, `{:disconnect, reason_code, properties, state}`, or `{:stop, reason, state}` |
 
 ### MqttX.Packet.Codec
 
@@ -638,9 +651,9 @@ See the [Performance & Scaling guide](guides/performance.md) for VM tuning, OS t
 | **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
 | **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
 | **Session Persistence (Server)** | Planned | Server-side session persistence (currently client-only) |
-| **MQTT 5.0 Enhanced Auth** | Planned | SCRAM-SHA, external auth providers |
-| **Telemetry Docs** | Planned | Document telemetry events for observability integration |
-| **Property-based Tests** | Planned | StreamData for fuzzing the packet codec |
+| **MQTT 5.0 Enhanced Auth** | Partial | AUTH exchange and re-authentication implemented; no built-in SCRAM/external providers |
+| **Telemetry Docs** | Done | See the [Telemetry guide](guides/telemetry.md) |
+| **Property-based Tests** | Done | StreamData round-trips + decode/encode fuzzing of the codec |
 | **End-to-end Load Tests** | Planned | Benchee-based throughput validation under realistic workloads |
 
 ## License

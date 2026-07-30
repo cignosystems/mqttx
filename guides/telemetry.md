@@ -12,10 +12,13 @@ MqttX emits [`:telemetry`](https://hex.pm/packages/telemetry) events at key poin
 | `[:mqttx, :client, :disconnect]` | `system_time` | `client_id`, `reason` |
 | `[:mqttx, :client, :publish, :start]` | `system_time` | `client_id`, `topic`, `qos`, `payload_size` |
 | `[:mqttx, :client, :publish, :stop]` | `duration` | `client_id`, `topic`, `qos` |
+| `[:mqttx, :client, :publish, :exception]` | `duration` | `client_id`, `topic`, `qos`, `reason_code` |
 | `[:mqttx, :client, :subscribe]` | `system_time` | `client_id`, `topics` |
-| `[:mqttx, :client, :message]` | `system_time`, `payload_size` | `client_id`, `topic`, `qos` |
+| `[:mqttx, :client, :message]` | `system_time`, `payload_size` | `client_id`, `topic`¹, `qos` |
 
-The `connect` and `publish` events use the start/stop/exception span pattern. `duration` is in native time units — use `System.convert_time_unit/3` to convert.
+The `connect` and `publish` events use the start/stop/exception span pattern. `duration` is in native time units — use `System.convert_time_unit/3` to convert. `[:mqttx, :client, :publish, :exception]` fires when the broker *rejects* a QoS 1/2 publish (reason code >= 0x80), not when the send itself fails.
+
+¹ **Topic shape:** inbound events carry the **decoded** topic — a list of segments like `["sensors", "room1", "temp"]` — while outbound publish events carry the binary topic you passed to `publish/4`. Join with `Enum.join(topic, "/")` before using it in a log line or as a metric tag.
 
 ## Server Events
 
@@ -25,7 +28,7 @@ The `connect` and `publish` events use the start/stop/exception span pattern. `d
 | `[:mqttx, :server, :client_connect, :stop]` | `duration` | `client_id`, `protocol_version` |
 | `[:mqttx, :server, :client_connect, :exception]` | `duration` | `client_id`, `reason_code` |
 | `[:mqttx, :server, :client_disconnect]` | `system_time` | `client_id`, `reason` |
-| `[:mqttx, :server, :publish]` | `system_time`, `payload_size` | `client_id`, `topic`, `qos` |
+| `[:mqttx, :server, :publish]` | `system_time`, `payload_size` | `client_id`, `topic`¹, `qos` |
 | `[:mqttx, :server, :subscribe]` | `system_time` | `client_id`, `topics` |
 
 ## Attaching Handlers
@@ -78,7 +81,7 @@ defmodule MyApp.MqttxTelemetry do
   end
 
   def handle_event([:mqttx, :server, :publish], %{payload_size: size}, meta, _config) do
-    Logger.debug("[MQTT] #{meta.client_id} published #{size}B to #{meta.topic}")
+    Logger.debug("[MQTT] #{meta.client_id} published #{size}B to #{Enum.join(meta.topic, "/")}")
   end
 
   def handle_event(_event, _measurements, _meta, _config), do: :ok
@@ -132,3 +135,7 @@ end
 ```
 
 See `MqttX.Telemetry` module docs for the complete API reference.
+
+---
+
+← Back to the [documentation index](../README.md#guides)

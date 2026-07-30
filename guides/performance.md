@@ -1,10 +1,10 @@
 # Performance & Scaling
 
-MqttX is architected to scale from tens of thousands to hundreds of thousands of concurrent device connections on a single BEAM node, depending on hardware and workload. This guide explains the architectural decisions and optimizations that make this possible.
+MqttX is architected to scale from tens of thousands to roughly a million concurrent device connections on a single BEAM node, depending on hardware and workload — see [Capacity Planning](#capacity-planning) for what each instance size actually supports and where the ceiling comes from. This guide explains the architectural decisions and optimizations that make this possible.
 
 ## Architecture Overview
 
-Each MQTT connection is a lightweight Erlang process (~2KB initial heap, ~20KB total with connection state and socket overhead). The BEAM VM's preemptive scheduler distributes these processes across all available CPU cores. At 100k connections, total memory overhead is roughly 2GB — well within reach of a modest server.
+Each MQTT connection is a lightweight Erlang process (~2KB initial heap, ~20KB total with connection state and socket overhead). The BEAM VM's preemptive scheduler distributes these processes across all available CPU cores. At 100k connections, connection state alone is roughly 2GB; size the machine above that — see [Capacity Planning](#capacity-planning) for the headroom a real deployment needs.
 
 The key bottlenecks at scale are not the number of connections, but the **hot paths** that execute on every message:
 
@@ -21,7 +21,7 @@ The key bottlenecks at scale are not the number of connections, but the **hot pa
 
 The router uses a **trie (prefix tree)** keyed by topic segments. Given a subscription to `sensors/+/temperature`, the trie looks like:
 
-```
+```text
 root
 └── "sensors"
     └── :single_level  (+)
@@ -70,12 +70,12 @@ The `<<>>` match is a constant-time check. When the buffer is empty (the majorit
 
 ## Callback Dispatch
 
-Elixir's `function_exported?/3` performs a module lookup on each call. For optional callbacks like `handle_info/2`, `handle_puback/3`, and `handle_mqtt_event/3`, this check runs on every incoming packet. MqttX computes these once at connection init:
+Elixir's `function_exported?/3` performs a module lookup on each call. For optional callbacks like `handle_info/2`, `handle_puback/2`, and `handle_mqtt_event/3`, this check runs on every incoming packet. MqttX computes these once at connection init:
 
 ```elixir
 # Computed once in handle_connection/init:
 handler_has_handle_info: function_exported?(handler, :handle_info, 2),
-handler_has_handle_puback: function_exported?(handler, :handle_puback, 3)
+handler_has_handle_puback: function_exported?(handler, :handle_puback, 2)
 
 # Then used as a simple boolean check per packet:
 if state.handler_has_handle_puback do
@@ -85,7 +85,7 @@ end
 
 ## Flow Control
 
-MQTT 5.0's `receive_maximum` limits how many unacknowledged QoS 2 messages can be in flight simultaneously. Both client and server enforce this with a direct counter:
+MQTT 5.0's `receive_maximum` limits how many unacknowledged QoS 1/2 messages can be in flight simultaneously. Both client and server enforce this with a direct counter:
 
 ```elixir
 # Server-side: check before accepting incoming QoS 2 PUBLISH
@@ -107,45 +107,97 @@ For a server with 10,000 retained messages and a client subscribing to 5 exact t
 
 ## Capacity Planning
 
-The primary bottleneck depends on your device activity pattern. For most IoT deployments, **RAM is the limiting factor, not CPU**.
+> **Read this first.** The numbers below are derived from architectural
+> analysis and the codec benchmarks above — **not** from end-to-end load
+> tests. This project does not yet ship a load harness, so treat them as a
+> starting point for your own measurements, not as guarantees. Real capacity
+> depends on message sizes, subscription fan-out, retained-store size, TLS vs
+> plaintext, and above all the work your handler callbacks do.
 
 ### Per-device resource usage
 
-Each connected device consumes approximately **~20KB of RAM** (process heap + connection state + socket). This breaks down as:
+Budget roughly **20–25 KB of system RAM per connected device**, split between
+the BEAM and the kernel:
 
-- Process heap: ~2KB (BEAM base allocation)
-- State map (client_id, protocol flags, will message, timers): ~1KB
-- Socket + TCP buffers: ~2–5KB
-- Handler state (application-defined): ~0.5–5KB
-- Session data, pending acks, optional features: ~1–5KB
+| Component | Size | Where it lives |
+|-----------|------|----------------|
+| Process heap (BEAM base allocation) | ~2 KB | BEAM RSS |
+| Connection state (client_id, flags, will, timers) | ~1 KB | BEAM RSS |
+| Handler state (application-defined) | ~0.5–5 KB | BEAM RSS |
+| Session data, pending acks, optional features | ~1–5 KB | BEAM RSS |
+| Socket struct and BEAM-side buffers | ~2–5 KB | BEAM RSS |
+| **Kernel socket buffers** (`rmem`/`wmem` minimums) | **~4–8 KB** | **Kernel, not BEAM RSS** |
 
-CPU usage depends entirely on message frequency.
+The kernel share is the one most often forgotten: it does not appear in the
+BEAM's memory reporting, but it comes out of the same machine's RAM. At 500K
+connections it alone is 2–4 GB.
 
-> **Note:** These are theoretical estimates based on architectural analysis and codec benchmarks. The project does not yet include end-to-end load tests validating these numbers under production conditions. Actual performance will vary with hardware, OS tuning, message sizes, subscription patterns, and application logic in your handler callbacks.
+### Sizing method
 
-### Device counts by workload
+Do not allocate 100% of RAM to connection state. A workable rule:
 
-| Device activity | Per vCPU | Bottleneck |
-|-----------------|----------|------------|
+```text
+devices ≈ (total_RAM × 0.60) / 22 KB
+```
+
+The 40% reserve covers the BEAM runtime itself, ETS tables (the retained-message
+store — up to `:max_retained_messages`, 100K topics by default — plus the
+subscription trie), the binary heap for in-flight payloads, OS page cache, and
+headroom for reconnect storms, which transiently allocate far above steady
+state. Machines sized to their steady-state ceiling fall over during exactly
+the event you most need them to survive: a mass reconnect after a network blip.
+
+### Instance sizing — idle-ish IoT (~1 msg/min)
+
+| Instance | RAM-derived ceiling | Practical target | Binding constraint |
+|----------|--------------------|--------------------|--------------------|
+| 1 vCPU / 2 GB | ~55,000 | ~50,000 | RAM |
+| 2 vCPU / 4 GB | ~110,000 | ~100,000 | RAM |
+| 2 vCPU / 8 GB | ~225,000 | ~200,000 | RAM, `+Q` port limit |
+| 4 vCPU / 16 GB | ~450,000 | ~400,000 | RAM, fds, kernel memory |
+| 8 vCPU / 32 GB | ~900,000 | ~600,000 | fds, kernel memory, ETS contention |
+| 16 vCPU / 128 GB | ~3,600,000 | ~1,000,000 | ETS contention, accept rate, failure domain |
+
+The right-hand columns diverge on purpose. Below ~500K connections RAM is the
+limit and the arithmetic holds. Above it the bottleneck moves somewhere else
+entirely, and buying more RAM stops helping:
+
+- **Kernel socket memory** grows with connections, not cores: 1M sockets is
+  4–8 GB of kernel buffers on top of BEAM RSS.
+- **Shared ETS tables** — the retained store and the subscription router are
+  single tables every connection process reads. Read concurrency is enabled,
+  but write-heavy retained or subscribe/unsubscribe churn contends regardless
+  of how many cores you add.
+- **Accept and handshake rate**, not steady state, is what fails first on a
+  large node. A mass reconnect of 1M devices means 1M CONNECTs (and TLS
+  handshakes, which are CPU-expensive) arriving in seconds.
+- **Failure domain.** One node holding 1M devices is one restart away from a
+  1M-device reconnect storm against itself.
+
+For these reasons, past roughly 500K connections per node, **horizontal
+scaling is usually the better engineering answer than a larger instance** —
+several 8-vCPU nodes behind a load balancer beat one 16-vCPU node, and give
+you somewhere to fail over to. See [Beyond a single node](#beyond-a-single-node).
+
+Every row above ~65,000 connections requires raising the BEAM port limit
+(`+Q`) and file-descriptor limits; rows above 262,144 also require `+P`. See
+[VM Tuning](#vm-tuning) and [OS Tuning](#os-tuning) — these are not optional.
+
+### Message-rate ceilings
+
+When devices are chatty, CPU binds before RAM. Per-vCPU throughput, assuming
+small (≈50-byte) QoS 0 payloads and a handler that does negligible work:
+
+| Device activity | Devices per vCPU | Bottleneck |
+|-----------------|------------------|------------|
 | Sleepy sensors (1 msg/min) | ~50K–100K | RAM |
 | Normal IoT (1 msg/30s) | ~30K–80K | RAM |
 | Chatty devices (1 msg/sec) | ~10K–15K | CPU |
 | Real-time streaming (10 msg/sec) | ~1K–2K | CPU |
 
-These per-vCPU numbers are not meant to be multiplied linearly — scaling is sub-linear due to ETS contention, scheduler rebalancing, per-process GC pauses, and OS-level limits (file descriptors, kernel socket buffer memory).
-
-### Instance sizing
-
-For typical IoT workloads (temperature sensors, ping/pong, periodic telemetry at ~1 msg/min):
-
-| Instance | RAM | Devices | CPU usage |
-|----------|-----|---------|-----------|
-| 1 vCPU / 2GB | 2GB | ~80,000 | <5% |
-| 2 vCPU / 4GB | 4GB | ~180,000 | <10% |
-| 2 vCPU / 8GB | 8GB | ~350,000 | <10% |
-| 4 vCPU / 16GB | 16GB | ~700,000 | <15% |
-
-For active workloads (1 msg/sec per device), CPU becomes the constraint:
+Scaling across cores is **sub-linear** — assume roughly 80–85% efficiency per
+doubling beyond 4 vCPUs, due to scheduler rebalancing, per-process GC pauses,
+and ETS contention:
 
 | Instance | Devices @ 1 msg/sec | Devices @ 10 msg/sec |
 |----------|---------------------|----------------------|
@@ -153,15 +205,32 @@ For active workloads (1 msg/sec per device), CPU becomes the constraint:
 | 2 vCPU | ~30,000 | ~3,000 |
 | 4 vCPU | ~60,000 | ~6,000 |
 | 8 vCPU | ~100,000 | ~10,000 |
+| 16 vCPU | ~160,000 | ~16,000 |
+
+These assume plaintext TCP. TLS adds per-handshake CPU cost (significant
+during reconnect storms) and a smaller per-message cost; budget conservatively
+if devices reconnect frequently on flaky cellular links.
 
 ### System-level constraints
 
-At high connection counts, OS and kernel limits often become the bottleneck before BEAM limits:
+At high connection counts, OS and kernel limits usually bind before BEAM ones:
 
-- **File descriptors**: Each connection consumes one fd. Set `ulimit -n` accordingly (see [OS Tuning](#os-tuning)).
-- **Ephemeral ports**: A single IP address supports ~64K outbound ports. For more connections, bind multiple IPs.
-- **Kernel socket buffer memory**: Each TCP socket reserves kernel buffer space (~4–8KB default). At 500K connections this alone can consume several GB of kernel memory.
-- **BEAM process/port limits**: Default limits are 262,144 processes and 65,536 ports. Increase with `+P` and `+Q` flags (see [VM Tuning](#vm-tuning)).
+- **File descriptors**: one per connection. Raise `ulimit -n` above your target
+  (see [OS Tuning](#os-tuning)).
+- **BEAM port limit**: every socket is a port, and the default is only 65,536 —
+  the first hard wall you hit. Raise with `+Q`. The default process limit
+  (262,144) binds later; raise with `+P`.
+- **Kernel socket buffer memory**: ~4–8 KB per socket by default, outside BEAM
+  RSS. At 500K connections that is 2–4 GB; at 1M, 4–8 GB. Tune `net.ipv4.tcp_rmem`
+  and `tcp_wmem` downward for many-idle-connection workloads.
+- **Client-side port exhaustion**: a *client* host can open ~64K outbound
+  connections per destination IP:port pair. This does **not** cap a broker —
+  a listening server is limited to ~64K connections *per distinct client IP*,
+  since each connection is identified by the full 4-tuple. It matters when
+  load-testing from a small number of source hosts, where you will hit the
+  limit on the generator long before the broker.
+- **Accept backlog**: raise `net.core.somaxconn` so reconnect bursts are not
+  dropped at the listen queue.
 
 ### Beyond a single node
 
@@ -171,17 +240,9 @@ Past ~500K connections, consider clustering multiple BEAM nodes behind a load ba
 
 ### Single Node
 
-A single BEAM node with MqttX can handle:
-
-| Metric | Conservative | Optimistic |
-|--------|-------------|------------|
-| Concurrent connections | 50,000 | 200,000 |
-| Messages/second (QoS 0) | 100,000 | 500,000+ |
-| Messages/second (QoS 1) | 50,000 | 200,000 |
-| Memory per connection | ~20 KB | ~20 KB |
-| Total memory (100k conns) | ~2 GB | ~2 GB |
-
-These are theoretical estimates based on codec throughput benchmarks and architectural analysis — not measured under end-to-end load. Actual numbers depend on hardware, OS tuning, message sizes, subscription patterns, and handler callback complexity. QoS 2 has higher overhead due to the 4-step handshake.
+See [Capacity Planning](#capacity-planning) above for per-instance figures and
+the sizing method behind them. Note that QoS 2 carries higher overhead than the
+numbers there imply, because of its four-step handshake.
 
 ### VM Tuning
 
@@ -200,7 +261,7 @@ elixir --erl "+Q 200000" -S mix run
 
 Or in `rel/vm.args`:
 
-```
+```text
 +S 8:8
 +P 1000000
 +Q 200000
@@ -248,7 +309,7 @@ Both ThousandIsland and Ranch are battle-tested for high connection counts:
 | Transport | Strengths | Notes |
 |-----------|-----------|-------|
 | ThousandIsland | Pure Elixir, simpler supervision | Recommended for new projects |
-| Ranch | Mature C-based acceptor, proven at scale | Used by Cowboy, RabbitMQ |
+| Ranch | Mature Erlang acceptor pool, proven at scale | Used by Cowboy, RabbitMQ |
 
 ### Monitoring
 
@@ -259,3 +320,7 @@ Use the telemetry events (see [Telemetry guide](telemetry.md)) to track:
 - **Publish latency**: `[:mqttx, :client, :publish, :stop]` duration histogram
 - **Payload sizes**: `[:mqttx, :server, :publish]` payload_size distribution
 - **Connection errors**: `[:mqttx, :client, :connect, :exception]` counter by reason
+
+---
+
+← Back to the [documentation index](../README.md#guides)

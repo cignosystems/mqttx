@@ -32,13 +32,8 @@ CONNECT, CONNACK, PUBLISH, PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE, SUBACK, U
 
 The codec is optimized with zero-copy binary references, unrolled varint decoding, and iodata output to avoid concatenation.
 
-**Benchmarks vs mqtt_packet_map** (Apple M4 Pro):
-
-| Operation | MqttX | mqtt_packet_map | Speedup |
-|-----------|-------|-----------------|---------|
-| PUBLISH encode | 5.05M ips | 1.72M ips | **2.9x** |
-| SUBSCRIBE encode | 3.42M ips | 0.82M ips | **4.2x** |
-| PUBLISH decode | 2.36M ips | 2.25M ips | ~1x |
+Measured figures, and what they mean for capacity, are in the
+[Performance guide](performance.md#packet-encoding).
 
 ## Payload Codecs
 
@@ -86,3 +81,7 @@ defmodule MyApp.MsgPackCodec do
   def decode(binary), do: {:ok, Msgpax.unpack!(binary)}
 end
 ```
+
+---
+
+← Back to the [documentation index](../README.md#guides)

@@ -51,12 +51,15 @@ end
 | Callback | Return |
 |----------|--------|
 | `init(opts)` | `state` |
+| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as the 3-arity form plus `%{protocol_version:, keep_alive:}`; takes precedence when defined |
 | `handle_connect(client_id, credentials, state)` | `{:ok, state}` or `{:error, reason_code, state}` |
 | `handle_publish(topic, payload, opts, state)` | `{:ok, state}`, `{:disconnect, reason_code, state}` |
 | `handle_subscribe(topics, state)` | `{:ok, granted_qos_list, state}`, `{:disconnect, reason_code, state}` |
 | `handle_unsubscribe(topics, state)` | `{:ok, state}`, `{:disconnect, reason_code, state}` |
 | `handle_disconnect(reason, state)` | `:ok` |
 | `handle_info(message, state)` | `{:ok, state}`, `{:publish, ...}`, `{:disconnect, reason_code, state}`, or `{:stop, reason, state}` |
+| `handle_puback(packet_id, state)` | `{:ok, state}` *(optional)* — a QoS 1 PUBLISH you sent was acknowledged |
+| `handle_auth(method, data, state)` | `{:ok, state}`, `{:continue, data, state}`, or `{:error, reason_code, state}` *(optional, MQTT 5.0 enhanced auth)* |
 | `handle_session_expired(client_id, state)` | `:ok` (optional) |
 
 Use `handle_info/2` with `{:publish, topic, payload, state}` to push messages to connected clients from external events (e.g., PubSub).
@@ -87,14 +90,17 @@ Any callback that returns `{:disconnect, reason_code, state}` or `{:disconnect, 
   MyApp.MqttHandler,
   [],
   transport: MqttX.Transport.Ranch,
-  port: 1883
+  port: 1883,
+  # :ranch_tcp (default) or :ranch_ssl. Named `:transport` before v0.11.0,
+  # which collided with the adapter selector above.
+  ranch_transport: :ranch_tcp
 )
 ```
 
 ### WebSocket
 
 ```elixir
-# mix.exs: {:bandit, "~> 1.6"}, {:websock_adapter, "~> 0.5"}
+# mix.exs: {:bandit, "~> 1.6"}, {:websock_adapter, "~> 0.5 or ~> 0.6"}
 
 {:ok, _pid} = MqttX.Server.start_link(
   MyApp.MqttHandler,
@@ -121,7 +127,7 @@ matches = Router.match(router, "sensors/room1/temp")
 # => [{client_ref, %{qos: 1}}]
 ```
 
-### Shared Subscriptions (MQTT 5.0)
+### Shared Subscriptions
 
 Distribute messages across a group of subscribers with round-robin load balancing:
 
@@ -171,9 +177,25 @@ The server automatically stores retained messages in ETS and delivers them to ne
 
 The server enforces MQTT keepalive as defined in the spec: if no packet is received from a client within 1.5x the `keep_alive` interval (set in the CONNECT packet), the server disconnects the client and publishes any will message.
 
-The keepalive timer resets on every received packet (not just PINGREQ). Clients that set `keep_alive: 0` are exempt from timeout enforcement.
+The keepalive timer resets on every received packet (not just PINGREQ). Clients that set `keep_alive: 0` are exempt from keepalive enforcement — but not from the idle ceiling below.
 
 When a keepalive timeout fires, your `handle_disconnect/2` callback receives `:keepalive_timeout` as the reason.
+
+### Idle ceiling
+
+Because MQTT keepalive does not apply when a client connects with
+`keep_alive: 0`, the server additionally closes any socket idle for longer
+than `:max_idle_timeout` (default 15 minutes), regardless of the negotiated
+Keep Alive. The timer resets on any inbound data, so it never interferes with
+a client that is honoring its keepalive. `handle_disconnect/2` receives
+`:idle_timeout`.
+
+```elixir
+transport_opts: %{max_idle_timeout: 900_000}   # :infinity disables
+```
+
+A separate `:connect_timeout` (default 10 s) closes sockets that never
+complete CONNECT.
 
 ## Will Messages
 
@@ -188,9 +210,24 @@ MQTT 5.0 clients can set `will_delay_interval` in the will properties to delay p
 
 This allows a grace period for clients to reconnect before their "last will" is broadcast.
 
+## Session State
+
+The server operates in clean-session mode **for every protocol version**:
+`session_present` is always `false` in CONNACK, and session state
+(subscriptions, queued messages, in-flight QoS 1/2) is not persisted across
+reconnections. A client that connects with `clean_session: false` therefore
+gains nothing against *this* broker, though it works as expected against EMQX,
+Mosquitto, and other brokers. If your application needs session resumption,
+implement it at the handler level using `handle_connect/3` and a session store.
+
 ## Session Expiry (MQTT 5.0)
 
-MQTT 5.0 clients can set `session_expiry_interval` in the CONNECT properties. After the client disconnects, the server waits the specified interval then calls your `handle_session_expired/2` callback:
+MQTT 5.0 clients can set `session_expiry_interval` in the CONNECT properties. After the client disconnects, the server waits the specified interval then calls your `handle_session_expired/2` callback.
+
+The timer is supervised and **cancelled if the same client reconnects within
+the window**, so expiry never fires for a session that resumed in time. A
+client may also revise the interval in its DISCONNECT packet (§3.14.2.2.2) —
+commonly `session_expiry_interval: 0` meaning "drop my session now".
 
 ```elixir
 @impl true
@@ -247,7 +284,7 @@ Clients can use topic aliases to reduce bandwidth by replacing repeated topic st
 
 ### Flow Control (Receive Maximum)
 
-The server enforces `receive_maximum` for incoming QoS 2 messages:
+The server enforces `receive_maximum` for incoming QoS 1 and QoS 2 messages:
 
 - Advertises `receive_maximum` in CONNACK (default: 65535, configurable via `transport_opts`)
 - Tracks in-flight QoS 2 messages (between PUBREC and PUBCOMP)
@@ -255,17 +292,25 @@ The server enforces `receive_maximum` for incoming QoS 2 messages:
 
 ### Maximum Packet Size
 
-Configure a maximum incoming packet size to protect against oversized messages:
+Incoming packets are capped at **1 MiB by default** (since v0.11.0) and the
+limit is enforced on the *declared* remaining length before the body is
+buffered, so an unauthenticated peer cannot force a large allocation. Override
+or disable it with `:infinity`:
 
 ```elixir
-MqttX.Server.start_link(MyApp.MqttHandler, [],
+# NOTE: protocol options live in `transport_opts` inside the *handler options*
+# (2nd argument), not the transport options (3rd argument).
+MqttX.Server.start_link(
+  MyApp.MqttHandler,
+  [transport_opts: %{max_packet_size: 1_048_576}],
   transport: MqttX.Transport.ThousandIsland,
-  port: 1883,
-  transport_opts: %{max_packet_size: 1_048_576}  # 1MB limit
+  port: 1883
 )
 ```
 
 - Server sends DISCONNECT with reason code `0x95` (Packet too large) for oversized incoming packets
+- Retained storage is likewise bounded by `:max_retained_messages`
+  (default 100_000 distinct topics)
 - Outgoing publishes exceeding the client's advertised `maximum_packet_size` are silently dropped
 - Server advertises its `maximum_packet_size` in CONNACK when configured
 
@@ -279,9 +324,10 @@ The server automatically retries stale QoS 2 handshake messages:
 - Drops entries after max retries (default: 3)
 - Handles DUP incoming PUBLISH by re-sending PUBREC without re-storing
 
-### Shared Subscriptions
+### Shared Subscription Availability
 
-Distribute messages across a group of subscribers with `$share/group/topic` patterns. The server advertises `shared_subscription_available: 1` in CONNACK. See the [Topic Routing](#shared-subscriptions-mqtt-50) section above for usage.
+The server advertises `shared_subscription_available: 1` in CONNACK. See
+[Shared Subscriptions](#shared-subscriptions) under Topic Routing for usage.
 
 ### CONNACK Properties
 
@@ -291,21 +337,17 @@ For MQTT 5.0 connections, the server automatically includes these properties in 
 |----------|-------|-------------|
 | `shared_subscription_available` | `1` | Shared subscriptions supported |
 | `topic_alias_maximum` | `100` | Max topic aliases the server accepts |
-| `receive_maximum` | `65535` | Max in-flight QoS 2 messages |
+| `receive_maximum` | `65535` | Max in-flight QoS 1/2 messages |
 | `maximum_packet_size` | *(if configured)* | Max incoming packet size in bytes |
 | `retain_available` | `1` | Retained messages supported |
 | `wildcard_subscription_available` | `1` | Wildcard subscriptions supported |
 | `subscription_identifier_available` | `0` | Subscription identifiers not supported |
 
-### MQTT 5.0 Publish Properties
+### Publish Properties
 
 The `opts` map passed to `handle_publish/4` includes a `:properties` key containing any MQTT 5.0 publish properties sent by the client (e.g., `user_properties`, `content_type`, `correlation_data`, `response_topic`, `payload_format_indicator`, `message_expiry_interval`). These properties are also forwarded when the server sends outgoing PUBLISH messages via `handle_info/2`.
 
-### Session Handling
-
-The server operates in clean-session mode: `session_present` is always `false` in CONNACK. Session state (subscriptions, queued messages) is not persisted across reconnections. If your application requires session resumption, implement it at the handler level using `handle_connect/3` and a session store.
-
-### Subscription Options (MQTT 5.0)
+### Subscription Options
 
 The server supports MQTT 5.0 subscription options:
 
@@ -314,3 +356,7 @@ The server supports MQTT 5.0 subscription options:
   - `0` — Send retained messages (default)
   - `1` — Send retained messages if the subscription does not already exist
   - `2` — Do not send retained messages on subscribe
+
+---
+
+← Back to the [documentation index](../README.md#guides)

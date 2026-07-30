@@ -109,9 +109,10 @@ defmodule MqttX.InteropEmqxTest do
           password: "wrong_pass"
         )
 
-      Process.sleep(3000)
-      refute MqttX.Client.connected?(client)
-      GenServer.stop(client, :normal, 1000)
+      # A non-retryable CONNACK rejection (bad credentials) stops the client
+      # entirely instead of leaving it reconnect-looping against the broker.
+      ref = Process.monitor(client)
+      assert_receive {:DOWN, ^ref, :process, ^client, :normal}, 10_000
     end
 
     test "graceful disconnect" do
@@ -1619,6 +1620,77 @@ defmodule MqttX.InteropEmqxTest do
       GenServer.stop(publisher, :normal, 1000)
       Agent.stop(pub_agent)
       Agent.stop(sub_agent)
+    end
+  end
+
+  describe "0.11.0 behavior against live broker" do
+    test "subscriptions are automatically replayed after a connection drop (clean_session: true)" do
+      sub_agent = start_supervised!(Supervisor.child_spec({Agent, fn -> [] end}, id: :sub_agent))
+      pub_agent = start_supervised!(Supervisor.child_spec({Agent, fn -> [] end}, id: :pub_agent))
+      usu_agent = start_supervised!(Supervisor.child_spec({Agent, fn -> [] end}, id: :usu_agent))
+      topic = "mqttx/test/resub/#{uid()}"
+      client_id = "mqttx-resub-#{uid()}"
+
+      {:ok, subscriber} = connect_emqx(client_id, agent: sub_agent)
+      Process.sleep(2000)
+      {:ok, _} = MqttX.Client.subscribe(subscriber, topic, qos: 1)
+
+      # Force a broker-side drop via session takeover: a second CONNECT with
+      # the same client_id makes EMQX disconnect the subscriber. With
+      # clean_session: true the broker forgets the subscription, so only the
+      # client-side replay can restore delivery.
+      {:ok, usurper} = connect_emqx(client_id, agent: usu_agent)
+      Process.sleep(1000)
+      # Leave before the subscriber's reconnect (backoff ~1s) so the two
+      # don't take the session over from each other in a loop
+      MqttX.Client.disconnect(usurper)
+
+      # Wait for the subscriber to reconnect and replay its subscription
+      Process.sleep(6000)
+      assert MqttX.Client.connected?(subscriber)
+
+      {:ok, publisher} = connect_emqx("mqttx-resub-pub-#{uid()}", agent: pub_agent)
+      Process.sleep(2000)
+      :ok = MqttX.Client.publish(publisher, topic, "after reconnect", qos: 1)
+
+      # 4 events: connected, disconnected (takeover), connected, message
+      events = wait_for_events(sub_agent, 4, 5000)
+      # The drop was real...
+      assert Enum.any?(events, &match?({:disconnected, _}, &1))
+      # ...and delivery works again without any manual resubscribe
+      assert Enum.any?(events, &match?({:message, ^topic, "after reconnect", _}, &1))
+
+      GenServer.stop(subscriber, :normal, 1000)
+      GenServer.stop(publisher, :normal, 1000)
+    end
+
+    test "default TLS verification refuses an untrusted certificate" do
+      # This broker's certificate is self-signed (and currently expired), so
+      # the secure-by-default client MUST refuse it unless the caller
+      # explicitly opts out with verify: :verify_none — which is exactly what
+      # the rest of this suite does.
+      agent = start_supervised!(Supervisor.child_spec({Agent, fn -> [] end}, id: :tls_agent))
+
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: @host,
+          port: @port,
+          client_id: "mqttx-tls-verify-#{uid()}",
+          username: @username,
+          password: @password,
+          transport: :ssl,
+          # no verify_none: secure defaults apply
+          ssl_opts: [],
+          handler: Handler,
+          handler_state: %{agent: agent}
+        )
+
+      Process.sleep(4000)
+      refute MqttX.Client.connected?(client)
+      events = Agent.get(agent, & &1)
+      refute Enum.any?(events, &match?({:connected, _}, &1))
+
+      GenServer.stop(client, :normal, 1000)
     end
   end
 end

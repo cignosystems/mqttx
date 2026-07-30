@@ -817,8 +817,10 @@ defmodule MqttX.IntegrationTest do
           protocol_version: 5
         )
 
-      Process.sleep(500)
-      refute MqttX.Client.connected?(client)
+      # A non-retryable CONNACK rejection (0x86) now stops the client
+      # entirely instead of leaving it reconnect-looping.
+      ref = Process.monitor(client)
+      assert_receive {:DOWN, ^ref, :process, ^client, :normal}, 5_000
 
       assert_received {:telemetry, [:mqttx, :server, :client_connect, :exception], %{duration: _},
                        _}
@@ -1324,7 +1326,10 @@ defmodule MqttX.IntegrationTest do
             retain: false,
             properties: %{will_delay_interval: 2}
           },
-          properties: %{}
+          # §3.1.2.5: the will fires at the EARLIER of delay expiry or
+          # session end — without a session expiry the session ends at
+          # disconnect and the delay would (correctly) not apply.
+          properties: %{session_expiry_interval: 30}
         })
 
       :ok = :gen_tcp.send(socket, connect_packet)

@@ -51,7 +51,7 @@ defmodule MqttX.Server.Router do
               {:normal, Topic.normalized_topic()} | {:shared, binary(), Topic.normalized_topic()}
             ]
           },
-          shared_groups: %{binary() => shared_group()},
+          shared_groups: %{{binary(), Topic.normalized_topic()} => shared_group()},
           count: non_neg_integer()
         }
 
@@ -121,10 +121,13 @@ defmodule MqttX.Server.Router do
     extra_opts = Keyword.drop(opts, [:qos])
     member_opts = Map.put(Map.new(extra_opts), :qos, qos)
 
+    # §4.8.2: a share is identified by the (ShareName, TopicFilter) PAIR —
+    # one group name legitimately spans several filters. Keying by group name
+    # alone silently discarded the second filter's subscription.
     shared_groups =
       Map.update(
         router.shared_groups,
-        group,
+        {group, normalized},
         # Create new group
         %{filter: normalized, members: [{client, member_opts}], index: 0},
         fn existing_group ->
@@ -188,9 +191,9 @@ defmodule MqttX.Server.Router do
   defp unsubscribe_shared(router, group, topic_filter, client) do
     normalized = normalize_filter(topic_filter)
 
-    # Remove from shared group
+    # Remove from shared group (keyed by {group, filter} per §4.8.2)
     shared_groups =
-      case Map.get(router.shared_groups, group) do
+      case Map.get(router.shared_groups, {group, normalized}) do
         nil ->
           router.shared_groups
 
@@ -198,9 +201,12 @@ defmodule MqttX.Server.Router do
           new_members = Enum.reject(group_data.members, fn {c, _} -> c == client end)
 
           if new_members == [] do
-            Map.delete(router.shared_groups, group)
+            Map.delete(router.shared_groups, {group, normalized})
           else
-            Map.put(router.shared_groups, group, %{group_data | members: new_members})
+            Map.put(router.shared_groups, {group, normalized}, %{
+              group_data
+              | members: new_members
+            })
           end
       end
 
@@ -235,9 +241,9 @@ defmodule MqttX.Server.Router do
           delta = if did_remove, do: 1, else: 0
           {new_trie, removed + delta, sg_acc}
 
-        {:shared, group, _filter}, {trie_acc, removed, sg_acc} ->
+        {:shared, group, filter}, {trie_acc, removed, sg_acc} ->
           new_sg =
-            case Map.get(sg_acc, group) do
+            case Map.get(sg_acc, {group, filter}) do
               nil ->
                 sg_acc
 
@@ -245,9 +251,9 @@ defmodule MqttX.Server.Router do
                 new_members = Enum.reject(group_data.members, fn {c, _} -> c == client end)
 
                 if new_members == [] do
-                  Map.delete(sg_acc, group)
+                  Map.delete(sg_acc, {group, filter})
                 else
-                  Map.put(sg_acc, group, %{group_data | members: new_members})
+                  Map.put(sg_acc, {group, filter}, %{group_data | members: new_members})
                 end
             end
 
@@ -270,7 +276,10 @@ defmodule MqttX.Server.Router do
 
   Returns a list of `{client, opts}` tuples for each matching subscription.
 
-  For shared subscriptions, only one client per group is selected (round-robin).
+  For shared subscriptions, only one client per group is selected — but this
+  read-only function does NOT advance the round-robin index. Message
+  delivery must go through `match_and_advance/3`, or every delivery lands on
+  the same group member.
 
   The optional `publisher` parameter enables no_local filtering: subscriptions
   with `no_local: true` are excluded when the publisher matches the subscriber.
@@ -279,10 +288,15 @@ defmodule MqttX.Server.Router do
   def match(router, topic, publisher \\ nil) do
     normalized = normalize_topic(topic)
 
-    # Get regular subscription matches via trie traversal
+    # Get regular subscription matches via trie traversal. A client with
+    # several overlapping subscriptions gets ONE delivery at the maximum
+    # matching QoS (§3.3.4), not an arbitrary one.
     regular_matches =
       trie_match(router.trie, normalized)
-      |> Enum.uniq_by(fn {client, _opts} -> client end)
+      |> Enum.group_by(fn {client, _opts} -> client end)
+      |> Enum.map(fn {_client, entries} ->
+        Enum.max_by(entries, fn {_c, opts} -> Map.get(opts, :qos, 0) end)
+      end)
       |> filter_no_local(publisher)
 
     # Get shared subscription matches (one per group, round-robin)
@@ -316,23 +330,28 @@ defmodule MqttX.Server.Router do
   def match_and_advance(router, topic, publisher \\ nil) do
     normalized = normalize_topic(topic)
 
-    # Get regular subscription matches via trie traversal
+    # Get regular subscription matches via trie traversal. A client with
+    # several overlapping subscriptions gets ONE delivery at the maximum
+    # matching QoS (§3.3.4), not an arbitrary one.
     regular_matches =
       trie_match(router.trie, normalized)
-      |> Enum.uniq_by(fn {client, _opts} -> client end)
+      |> Enum.group_by(fn {client, _opts} -> client end)
+      |> Enum.map(fn {_client, entries} ->
+        Enum.max_by(entries, fn {_c, opts} -> Map.get(opts, :qos, 0) end)
+      end)
       |> filter_no_local(publisher)
 
     # Get shared subscription matches and advance indices
     {shared_matches, updated_shared_groups} =
       router.shared_groups
       |> Enum.filter(fn {_group, data} -> Topic.matches?(data.filter, normalized) end)
-      |> Enum.map_reduce(router.shared_groups, fn {group, data}, acc ->
+      |> Enum.map_reduce(router.shared_groups, fn {key, data}, acc ->
         index = rem(data.index, length(data.members))
         {client, opts} = Enum.at(data.members, index)
 
         # Advance the index
         updated_data = %{data | index: data.index + 1}
-        updated_acc = Map.put(acc, group, updated_data)
+        updated_acc = Map.put(acc, key, updated_data)
 
         {{client, opts}, updated_acc}
       end)
@@ -364,8 +383,8 @@ defmodule MqttX.Server.Router do
         %{filter: filter, client: client, qos: qos, opts: Map.delete(opts, :qos)}
 
       {:shared, group, filter} ->
-        # Look up from shared_groups
-        case Map.get(router.shared_groups, group) do
+        # Look up from shared_groups (keyed by {group, filter})
+        case Map.get(router.shared_groups, {group, filter}) do
           %{members: members} ->
             {_, member_opts} = Enum.find(members, {client, %{}}, fn {c, _} -> c == client end)
             qos = Map.get(member_opts, :qos, 0)

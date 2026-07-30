@@ -2,8 +2,10 @@ defmodule MqttX.Session.ETSStore do
   @moduledoc """
   ETS-based in-memory session store.
 
-  This is the default session store implementation. Sessions are stored in
-  an ETS table and persist for the lifetime of the BEAM VM.
+  The built-in `MqttX.Session.Store` implementation. Sessions live in an ETS
+  table owned by a supervised process, so they survive a connection crash and
+  persist for the lifetime of the BEAM VM. Session persistence is off unless
+  you pass `:session_store` explicitly to `MqttX.Client.connect/1`.
 
   ## Options
 
@@ -43,23 +45,12 @@ defmodule MqttX.Session.ETSStore do
   def init(opts) do
     table = Keyword.get(opts, :table, @default_table)
 
-    # The default :mqttx_sessions table is pre-created by MqttX.Session.ETSOwner
-    # under the application supervisor so it outlives transient callers. For
-    # custom tables (passed via opts) we fall back to creating-on-demand; the
-    # caller is responsible for ensuring its lifetime if longer-lived storage
-    # is needed.
-    case :ets.whereis(table) do
-      :undefined ->
-        :ets.new(table, [
-          :named_table,
-          :public,
-          :set,
-          {:read_concurrency, true},
-          {:write_concurrency, true}
-        ])
-
-      _ref ->
-        :ok
+    # All tables (default and custom) are created via ETSOwner so they are
+    # owned by a supervised, long-lived process. Creating them here would
+    # make the *connection process* the owner — the table would die exactly
+    # on the crash the session store exists to survive.
+    if :ets.whereis(table) == :undefined do
+      MqttX.Session.ETSOwner.ensure_table(table)
     end
 
     {:ok, %{table: table}}

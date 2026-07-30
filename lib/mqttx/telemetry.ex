@@ -49,6 +49,13 @@ defmodule MqttX.Telemetry do
   - Measurements: `%{duration: integer()}`
   - Metadata: `%{client_id: binary(), topic: binary(), qos: 0..2}`
 
+  ### `[:mqttx, :client, :publish, :exception]`
+  Emitted when the broker rejects a QoS 1/2 publish (PUBACK/PUBREC carrying a
+  reason code >= 0x80).
+
+  - Measurements: `%{duration: integer()}`
+  - Metadata: `%{client_id: binary(), topic: binary(), qos: 0..2, reason_code: 0..255}`
+
   ### `[:mqttx, :client, :subscribe]`
   Emitted when a client subscribes to topics.
 
@@ -59,7 +66,16 @@ defmodule MqttX.Telemetry do
   Emitted when a client receives a message.
 
   - Measurements: `%{system_time: integer(), payload_size: integer()}`
-  - Metadata: `%{client_id: binary(), topic: binary(), qos: 0..2}`
+  - Metadata: `%{client_id: binary(), topic: [binary() | atom()], qos: 0..2}`
+
+  > #### Topic shape {: .info}
+  >
+  > Inbound events (`[:mqttx, :client, :message]` and
+  > `[:mqttx, :server, :publish]`) carry the **decoded** topic — a list of
+  > segments such as `["sensors", "room1", "temp"]` — because that is what the
+  > codec produces. Outbound publish events carry the binary topic you passed
+  > to `publish/4`. Join with `Enum.join(topic, "/")` before using it as a
+  > metric tag or in a log line.
 
   ## Server Events
 
@@ -91,7 +107,8 @@ defmodule MqttX.Telemetry do
   Emitted when the server receives a PUBLISH packet.
 
   - Measurements: `%{system_time: integer(), payload_size: integer()}`
-  - Metadata: `%{client_id: binary(), topic: binary(), qos: 0..2}`
+  - Metadata: `%{client_id: binary(), topic: [binary() | atom()], qos: 0..2}`
+    (decoded segment list — see the topic-shape note above)
 
   ### `[:mqttx, :server, :subscribe]`
   Emitted when a client subscribes.
@@ -170,6 +187,13 @@ defmodule MqttX.Telemetry do
   @doc false
   def client_publish_stop(duration, metadata) do
     emit([:mqttx, :client, :publish, :stop], %{duration: duration}, metadata)
+  end
+
+  @doc false
+  # Broker rejected a QoS 1/2 publish (PUBACK/PUBREC reason >= 0x80).
+  # Metadata includes :reason_code.
+  def client_publish_error(duration, metadata) do
+    emit([:mqttx, :client, :publish, :exception], %{duration: duration}, metadata)
   end
 
   @doc false

@@ -57,8 +57,22 @@ defmodule MqttX.Server do
 
   Optional callbacks:
 
+  - `handle_connect/4` - Like `handle_connect/3` but also receives connection
+    info (protocol version, keepalive); preferred when defined
   - `handle_unsubscribe/2` - Handle UNSUBSCRIBE requests
-  - `handle_puback/2` - Handle PUBACK for QoS 1 messages
+  - `handle_puback/2` - Handle PUBACK/PUBCOMP for QoS 1/2 messages
+  - `handle_info/2` - Handle arbitrary messages sent to the connection process
+  - `handle_auth/3` - Enhanced authentication exchange (MQTT 5.0 AUTH)
+  - `handle_session_expired/2` - Session expiry notification (MQTT 5.0)
+
+  ## Session state limitation
+
+  Session state (subscriptions, in-flight QoS 1/2 messages) currently lives
+  in the connection process and dies with it: the broker does not queue
+  messages for disconnected persistent sessions, and reconnecting clients
+  always receive `session_present: false`. Model durable state in your
+  handler (e.g. via `Phoenix.PubSub` or your database) if you need
+  persistence across connections.
   """
 
   @type client_id :: binary()
@@ -284,7 +298,6 @@ defmodule MqttX.Server do
 
   - `:transport` - Transport module (default: `MqttX.Transport.ThousandIsland`)
   - `:port` - Port to listen on (default: 1883)
-  - `:name` - Optional name for the server process
 
   All other options are passed to the transport adapter.
   """

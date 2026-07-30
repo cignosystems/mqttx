@@ -158,8 +158,13 @@ defmodule MqttX.Server.RouterTest do
       router = Router.subscribe(router, "$share/workers/jobs/#", :client1, qos: 1)
 
       assert map_size(router.shared_groups) == 1
-      assert router.shared_groups["workers"].filter == ["jobs", :multi_level]
-      assert length(router.shared_groups["workers"].members) == 1
+
+      assert router.shared_groups[{"workers", ["jobs", :multi_level]}].filter == [
+               "jobs",
+               :multi_level
+             ]
+
+      assert length(router.shared_groups[{"workers", ["jobs", :multi_level]}].members) == 1
     end
 
     test "multiple clients in same shared group" do
@@ -168,7 +173,7 @@ defmodule MqttX.Server.RouterTest do
       router = Router.subscribe(router, "$share/workers/jobs/#", :client2, qos: 1)
 
       assert map_size(router.shared_groups) == 1
-      assert length(router.shared_groups["workers"].members) == 2
+      assert length(router.shared_groups[{"workers", ["jobs", :multi_level]}].members) == 2
     end
 
     test "same client can only join group once" do
@@ -176,7 +181,25 @@ defmodule MqttX.Server.RouterTest do
       router = Router.subscribe(router, "$share/workers/jobs/#", :client1, qos: 1)
       router = Router.subscribe(router, "$share/workers/jobs/#", :client1, qos: 1)
 
-      assert length(router.shared_groups["workers"].members) == 1
+      assert length(router.shared_groups[{"workers", ["jobs", :multi_level]}].members) == 1
+    end
+
+    test "one group name spans multiple filters (§4.8.2 share = {group, filter} pair)" do
+      router = Router.new()
+      router = Router.subscribe(router, "$share/workers/jobs/#", :client1, qos: 1)
+      router = Router.subscribe(router, "$share/workers/alerts/#", :client2, qos: 1)
+
+      # Both shares exist independently
+      assert map_size(router.shared_groups) == 2
+
+      # Each filter routes to its own subscriber
+      assert [{:client1, _}] = Router.match(router, "jobs/task1")
+      assert [{:client2, _}] = Router.match(router, "alerts/cpu")
+
+      # Unsubscribing one filter leaves the other share intact
+      router = Router.unsubscribe(router, "$share/workers/alerts/#", :client2)
+      assert [{:client1, _}] = Router.match(router, "jobs/task1")
+      assert Router.match(router, "alerts/cpu") == []
     end
 
     test "match shared subscription returns one client per group" do
@@ -230,7 +253,7 @@ defmodule MqttX.Server.RouterTest do
       router = Router.subscribe(router, "$share/workers/jobs/#", :client2, qos: 1)
       router = Router.unsubscribe(router, "$share/workers/jobs/#", :client1)
 
-      assert length(router.shared_groups["workers"].members) == 1
+      assert length(router.shared_groups[{"workers", ["jobs", :multi_level]}].members) == 1
     end
 
     test "shared group removed when last member leaves" do
@@ -247,7 +270,7 @@ defmodule MqttX.Server.RouterTest do
       router = Router.subscribe(router, "$share/workers/jobs/#", :client2, qos: 1)
       router = Router.unsubscribe_all(router, :client1)
 
-      assert length(router.shared_groups["workers"].members) == 1
+      assert length(router.shared_groups[{"workers", ["jobs", :multi_level]}].members) == 1
     end
   end
 

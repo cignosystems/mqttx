@@ -8,28 +8,30 @@ defmodule MqttX.Server.WillDelay do
   # requires that if a client reconnects with the same client_id within its
   # advertised will_delay_interval, the pending Will MUST NOT be sent.
   #
-  # Keyed by client_id. New schedules replace any existing pending will for
-  # that client_id; explicit cancel/1 (called on a fresh CONNECT) drops the
-  # entry without firing.
+  # Keyed by {retained_table, client_id} — the same scope session takeover
+  # uses, so two listeners in one VM cannot cancel each other's timers. New
+  # schedules replace any existing pending will for that key; explicit
+  # cancel/1 (called on a fresh CONNECT) drops the entry without firing.
 
   use GenServer
 
   @type ctx :: %{
           required(:retained_table) => :ets.tid(),
           required(:handler) => module(),
-          required(:handler_state) => term()
+          required(:handler_state) => term(),
+          optional(:max_retained_messages) => non_neg_integer() | nil
         }
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec schedule(binary(), map(), non_neg_integer(), ctx()) :: :ok
+  @spec schedule(term(), map(), non_neg_integer(), ctx()) :: :ok
   def schedule(client_id, will, delay_ms, ctx) do
     GenServer.cast(__MODULE__, {:schedule, client_id, will, delay_ms, ctx})
   end
 
-  @spec cancel(binary()) :: :ok
+  @spec cancel(term()) :: :ok
   def cancel(client_id) do
     GenServer.cast(__MODULE__, {:cancel, client_id})
   end
@@ -87,24 +89,38 @@ defmodule MqttX.Server.WillDelay do
     }
 
     if will.retain do
-      store_retained(will.topic, will.payload, will.qos, will_props, ctx.retained_table)
+      store_retained(
+        will.topic,
+        will.payload,
+        will.qos,
+        will_props,
+        ctx.retained_table,
+        Map.get(ctx, :max_retained_messages)
+      )
     end
 
     ctx.handler.handle_publish(will.topic, will.payload, opts, ctx.handler_state)
   end
 
-  defp store_retained(topic, <<>>, _qos, _props, table) do
+  defp store_retained(topic, <<>>, _qos, _props, table, _max) do
     :ets.delete(table, topic_key(topic))
     :ok
   end
 
-  defp store_retained(topic, payload, qos, props, table) do
+  defp store_retained(topic, payload, qos, props, table, max) do
     key = topic_key(topic)
-    normalized_list = MqttX.Topic.normalize(key)
-    timestamp = System.system_time(:second)
-    expiry_interval = Map.get(props || %{}, :message_expiry_interval)
-    :ets.insert(table, {key, normalized_list, payload, qos, timestamp, expiry_interval})
-    :ok
+
+    # Honor the listener's retained-store cap — a delayed Will must not be a
+    # way around it (existing topics can always be overwritten).
+    if max && not :ets.member(table, key) && :ets.info(table, :size) >= max do
+      :ok
+    else
+      normalized_list = MqttX.Topic.normalize(key)
+      timestamp = System.system_time(:second)
+      expiry_interval = Map.get(props || %{}, :message_expiry_interval)
+      :ets.insert(table, {key, normalized_list, payload, qos, timestamp, expiry_interval})
+      :ok
+    end
   end
 
   defp topic_key(topic) when is_list(topic), do: Enum.join(topic, "/")

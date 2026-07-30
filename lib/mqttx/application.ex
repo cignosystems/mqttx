@@ -12,6 +12,10 @@ defmodule MqttX.Application do
       MqttX.Session.ETSOwner,
       # Owns Will Delay Interval timers across connection lifecycles.
       MqttX.Server.WillDelay,
+      # Owns Session Expiry Interval timers across connection lifecycles.
+      MqttX.Server.SessionExpiry,
+      # client_id → connection pid, for §3.1.4-3 session takeover
+      {Registry, keys: :duplicate, name: MqttX.Server.ConnectionRegistry},
       # DynamicSupervisor for managed client connections
       MqttX.Client.Supervisor
     ]

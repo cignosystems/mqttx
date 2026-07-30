@@ -19,7 +19,7 @@ defmodule MqttX.Server.RateLimiter do
 
       case MqttX.Server.RateLimiter.allow_connection?(limiter) do
         :ok -> # accept connection
-        {:error, :rate_limited} -> # reject with 0x9F
+        {:error, :rate_limited} -> # close the connection
       end
 
       case MqttX.Server.RateLimiter.allow_message?(limiter, client_id) do

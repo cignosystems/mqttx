@@ -63,9 +63,21 @@ defmodule MqttX.Topic do
   end
 
   def validate(topic) when is_list(topic) do
-    topic
-    |> normalize()
-    |> validate_normalized()
+    # Same §1.5.4 byte cap as the binary form: segment bytes + separators
+    byte_total =
+      Enum.reduce(topic, max(length(topic) - 1, 0), fn
+        seg, acc when is_binary(seg) -> acc + byte_size(seg)
+        # wildcard atoms (:single_level/:multi_level) encode as 1 byte
+        _atom, acc -> acc + 1
+      end)
+
+    if byte_total > @max_topic_bytes do
+      {:error, :invalid_topic}
+    else
+      topic
+      |> normalize()
+      |> validate_normalized()
+    end
   end
 
   @doc """

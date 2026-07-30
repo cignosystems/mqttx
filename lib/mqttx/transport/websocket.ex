@@ -17,6 +17,15 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
     - `:port` - Port to listen on (default: 8083)
     - `:ip` - IP address to bind to (default: `{0, 0, 0, 0}`)
     - `:path` - WebSocket path (default: `/mqtt`)
+    - `:max_frame_size` - Largest WebSocket frame accepted, in bytes
+      (`:infinity` disables). When unset, websock_adapter's own default
+      applies — note that changed in websock_adapter 0.6.0 from `:infinity`
+      to 10 MB, so set this explicitly if you need behaviour independent of
+      which adapter version resolves.
+
+    All protocol-level options (`:max_packet_size`, `:max_idle_timeout`,
+    `:rate_limit`, …) behave as documented in
+    `MqttX.Transport.ThousandIsland`.
     """
 
     @behaviour MqttX.Transport
@@ -43,7 +52,8 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
         handler_opts: handler_opts,
         retained_table: retained_table,
         rate_limiter: rate_limiter,
-        path: Keyword.get(transport_opts, :path, "/mqtt")
+        path: Keyword.get(transport_opts, :path, "/mqtt"),
+        max_frame_size: Keyword.get(transport_opts, :max_frame_size)
       }
 
       bandit_opts = [
@@ -93,6 +103,16 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
     @impl Plug
     def init(opts), do: opts
 
+    # websock_adapter's own default changed in 0.6.0 (:infinity -> 10 MB), so
+    # only pass :max_frame_size when the caller set it explicitly — that keeps
+    # behaviour identical on 0.5.x and 0.6.x for anyone who configures it, and
+    # otherwise defers to whichever adapter version is installed.
+    defp upgrade_opts(%{max_frame_size: size})
+         when (is_integer(size) and size > 0) or size == :infinity,
+         do: [max_frame_size: size]
+
+    defp upgrade_opts(_opts), do: []
+
     @impl Plug
     def call(conn, opts) do
       paths = [opts.path, "/"]
@@ -116,7 +136,7 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
               retained_table: opts.retained_table,
               rate_limiter: opts.rate_limiter
             },
-            []
+            upgrade_opts(opts)
           )
         else
           conn
@@ -151,7 +171,9 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
           {:ok, proto}
 
         {:error, :rate_limited} ->
-          {:stop, :normal, {1008, "Rate limited"}}
+          # 4-tuple form so the close code actually reaches the client and
+          # terminate/2 receives a map state
+          {:stop, :normal, {1008, "Rate limited"}, %{}}
       end
     end
 
@@ -163,12 +185,13 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
           if frames == [], do: {:ok, s}, else: {:push, frames, s}
 
         {:close, _reason, s} ->
-          frames = flush_ws_sends()
-          if frames == [], do: {:stop, :normal, s}, else: {:stop, :normal, {1000, ""}, s}
+          # 5-tuple stop: deliver any queued MQTT frames (rejection CONNACKs,
+          # DISCONNECT packets) before the close frame — otherwise the client
+          # sees a bare close and can't tell auth failure from a network blip.
+          stop_with_frames(s, {1000, ""})
 
         {:error, _reason, s} ->
-          frames = flush_ws_sends()
-          if frames == [], do: {:stop, :normal, s}, else: {:stop, :normal, {1011, ""}, s}
+          stop_with_frames(s, {1011, ""})
       end
     end
 
@@ -188,8 +211,7 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
           if frames == [], do: {:ok, s}, else: {:push, frames, s}
 
         {:stop, _reason, s} ->
-          frames = flush_ws_sends()
-          if frames == [], do: {:stop, :normal, s}, else: {:stop, :normal, {1000, ""}, s}
+          stop_with_frames(s, {1000, ""})
       end
     end
 
@@ -197,6 +219,15 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
     def terminate(_reason, state) do
       Proto.handle_close(state)
       :ok
+    end
+
+    # WebSock supports {:stop, reason, close_detail, messages, state}: the
+    # queued frames are sent before the close frame.
+    defp stop_with_frames(state, close_detail) do
+      case flush_ws_sends() do
+        [] -> {:stop, :normal, state}
+        frames -> {:stop, :normal, close_detail, frames, state}
+      end
     end
 
     defp flush_ws_sends(acc \\ []) do

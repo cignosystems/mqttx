@@ -18,10 +18,31 @@ defmodule MqttX.Session.ETSOwner do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @doc false
+  # Create (if missing) a session table OWNED BY THIS PROCESS, so its
+  # lifetime is tied to the application rather than to whichever connection
+  # process happened to ask first. Serializing creation through the
+  # GenServer also removes the check-then-create race between two
+  # connections initializing the same table concurrently.
+  @spec ensure_table(atom()) :: :ok
+  def ensure_table(table) when is_atom(table) do
+    GenServer.call(__MODULE__, {:ensure_table, table})
+  end
+
+  @impl true
+  def handle_call({:ensure_table, table}, _from, state) do
+    create_if_missing(table)
+    {:reply, :ok, state}
+  end
+
   @impl true
   def init(opts) do
     table = Keyword.get(opts, :table, @table)
+    create_if_missing(table)
+    {:ok, %{table: table}}
+  end
 
+  defp create_if_missing(table) do
     case :ets.whereis(table) do
       :undefined ->
         :ets.new(table, [
@@ -35,7 +56,5 @@ defmodule MqttX.Session.ETSOwner do
       _ ->
         :ok
     end
-
-    {:ok, %{table: table}}
   end
 end

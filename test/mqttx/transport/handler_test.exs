@@ -1323,10 +1323,12 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, data} = Codec.encode(5, auth2)
       {:ok, state} = Proto.handle_data(data, state)
 
-      assert_received {:sent, connack_data}
-      {:ok, {connack, <<>>}} = Codec.decode(5, IO.iodata_to_binary(connack_data))
-      assert connack.type == :connack
-      assert connack.reason_code == 0
+      # Re-authentication success is signaled with AUTH 0x00 (§4.12.1) —
+      # a second CONNACK on a live connection would be a protocol violation.
+      assert_received {:sent, auth_ok_data}
+      {:ok, {auth_ok, <<>>}} = Codec.decode(5, IO.iodata_to_binary(auth_ok_data))
+      assert auth_ok.type == :auth
+      assert auth_ok.reason_code == 0x00
       assert state.connected == true
     end
 
@@ -1398,13 +1400,14 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, data} = Codec.encode(5, auth2)
       {:close, :auth_failed, _state} = Proto.handle_data(data, state)
 
-      assert_received {:sent, connack_data}
-      {:ok, {connack, <<>>}} = Codec.decode(5, IO.iodata_to_binary(connack_data))
-      assert connack.type == :connack
-      assert connack.reason_code == 0x87
+      # Failed re-authentication ends with DISCONNECT, not a second CONNACK
+      assert_received {:sent, disconnect_data}
+      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
+      assert disconnect.type == :disconnect
+      assert disconnect.reason_code == 0x87
     end
 
-    test "default handle_auth (TestHandler) → CONNACK 0x8C, connection closed", ctx do
+    test "default handle_auth (TestHandler) → DISCONNECT 0x8C, connection closed", ctx do
       {:ok, state} =
         Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
@@ -1428,13 +1431,14 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, data} = Codec.encode(5, auth)
       result = Proto.handle_data(data, state)
 
-      # Default handle_auth returns {:error, 0x8C, state} which means auth not supported
+      # Default handle_auth returns {:error, 0x8C, state} — on a live
+      # connection the rejection is a DISCONNECT, not a second CONNACK
       assert {:close, _, _} = result
 
-      assert_received {:sent, connack_data}
-      {:ok, {connack, <<>>}} = Codec.decode(5, IO.iodata_to_binary(connack_data))
-      assert connack.type == :connack
-      assert connack.reason_code == 0x8C
+      assert_received {:sent, disconnect_data}
+      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
+      assert disconnect.type == :disconnect
+      assert disconnect.reason_code == 0x8C
     end
   end
 
@@ -1637,25 +1641,37 @@ defmodule MqttX.Transport.HandlerTest do
     state
   end
 
-  defp connect_client_v5(ctx, client_id) do
+  defp connect_client_v5(ctx, client_id, properties \\ %{}) do
     {:ok, state} =
       Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
-    connect = %{
-      type: :connect,
-      protocol_version: 5,
-      client_id: client_id,
-      username: nil,
-      password: nil,
-      will: nil,
-      clean_session: true,
-      keep_alive: 0,
-      properties: %{}
-    }
-
-    {:ok, data} = Codec.encode(5, connect)
-    {:ok, state} = Proto.handle_data(data, state)
+    {:ok, state} = Proto.handle_data(connect_packet_v5(client_id, properties), state)
     state
+  end
+
+  defp connect_publisher_v5(ctx, client_id, properties \\ %{}) do
+    {:ok, state} =
+      Proto.init(PublishOnInfoHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+
+    {:ok, state} = Proto.handle_data(connect_packet_v5(client_id, properties), state)
+    state
+  end
+
+  defp connect_packet_v5(client_id, properties \\ %{}) do
+    {:ok, data} =
+      Codec.encode(5, %{
+        type: :connect,
+        protocol_version: 5,
+        client_id: client_id,
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: properties
+      })
+
+    data
   end
 
   defp drain_mailbox do
@@ -1696,6 +1712,324 @@ defmodule MqttX.Transport.HandlerTest do
       {:sent, data} -> data
     after
       100 -> raise "No sent data in mailbox"
+    end
+  end
+
+  describe "max packet size (declared-length enforcement)" do
+    test "rejects a packet declaring more than the default 1 MiB before buffering it", ctx do
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+
+      assert state.server_max_packet_size == 1_048_576
+
+      # 5-byte prefix declaring a ~256 MB body — must be rejected immediately,
+      # without waiting for (or accumulating) the body
+      oversized_header = <<3::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
+
+      assert {:close, :packet_too_large, closed} = Proto.handle_data(oversized_header, state)
+      assert closed.buffer == <<>>
+    end
+
+    test "honors a custom max_packet_size from transport_opts", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{max_packet_size: 64}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+
+      big = <<3::4, 0::4, 200, 1>>
+      assert {:close, :packet_too_large, _} = Proto.handle_data(big, state)
+
+      # a packet under the limit still flows normally
+      {:ok, connect} =
+        Codec.encode(4, %{
+          type: :connect,
+          protocol_version: 4,
+          client_id: "small-client",
+          username: nil,
+          password: nil,
+          will: nil,
+          clean_session: true,
+          keep_alive: 0,
+          properties: %{}
+        })
+
+      {:ok, fresh} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+      assert {:ok, connected} = Proto.handle_data(connect, fresh)
+      assert connected.connected
+    end
+
+    test "max_packet_size: :infinity disables the cap", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{max_packet_size: :infinity}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+
+      assert state.server_max_packet_size == nil
+
+      # declared-oversize prefix is buffered as incomplete instead of rejected
+      oversized_header = <<3::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
+      assert {:ok, buffering} = Proto.handle_data(oversized_header, state)
+      assert buffering.buffer == oversized_header
+    end
+  end
+
+  describe "session takeover (§3.1.4-3)" do
+    test "colliding CONNECT disconnects the incumbent with 0x8E", ctx do
+      incumbent = connect_client_v5(ctx, "collide-me")
+      assert incumbent.connected
+      drain_mailbox()
+
+      # A second connection claiming the same client_id, on the same listener
+      # (same retained_table), must evict the first.
+      parent = self()
+
+      usurper =
+        spawn_link(fn ->
+          send_fn = fn data -> send(parent, {:usurper_sent, data}) end
+          {:ok, s} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, send_fn)
+          {:ok, s} = Proto.handle_data(connect_packet_v5("collide-me"), s)
+          send(parent, {:usurper_connected, s.connected})
+
+          receive do
+            :stop -> :ok
+          after
+            5_000 -> :ok
+          end
+        end)
+
+      assert_receive {:usurper_connected, true}, 2_000
+
+      # The incumbent's connection process receives the takeover notice
+      assert_receive {:server_disconnect, 0x8E, _props}, 2_000
+
+      # ...and acting on it sends DISCONNECT 0x8E and stops
+      assert {:stop, :normal, _} = Proto.handle_info({:server_disconnect, 0x8E, %{}}, incumbent)
+      assert_received {:sent, disconnect_data}
+      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
+      assert disconnect.type == :disconnect
+      assert disconnect.reason_code == 0x8E
+
+      send(usurper, :stop)
+    end
+
+    test "takeover is scoped per listener — a different retained table does not evict", ctx do
+      _incumbent = connect_client_v5(ctx, "scoped-id")
+      other_table = :ets.new(:other_listener_retained, [:public, :set])
+      parent = self()
+
+      spawn_link(fn ->
+        send_fn = fn data -> send(parent, {:other_sent, data}) end
+        {:ok, s} = Proto.init(TestHandler, [agent: ctx.agent], other_table, nil, send_fn)
+        {:ok, _s} = Proto.handle_data(connect_packet_v5("scoped-id"), s)
+        send(parent, :other_connected)
+      end)
+
+      assert_receive :other_connected, 2_000
+      refute_receive {:server_disconnect, 0x8E, _}, 300
+    end
+
+    test "an UNAUTHORIZED CONNECT does not evict the incumbent or touch its timers", ctx do
+      incumbent = connect_client_v5(ctx, "protected-id")
+      assert incumbent.connected
+
+      parent = self()
+
+      spawn_link(fn ->
+        send_fn = fn data -> send(parent, {:rejected_sent, data}) end
+        # RejectHandler always answers {:error, 0x86, state}
+        {:ok, s} = Proto.init(RejectHandler, [], ctx.retained_table, nil, send_fn)
+        {:close, :auth_failed, _} = Proto.handle_data(connect_packet_v5("protected-id"), s)
+        send(parent, :rejected_done)
+      end)
+
+      assert_receive :rejected_done, 2_000
+      # The incumbent must NOT be evicted by a connection that failed auth
+      refute_receive {:server_disconnect, _, _}, 300
+    end
+  end
+
+  describe "idle ceiling (keepalive-independent)" do
+    test "defaults to 15 minutes and is armed on init", ctx do
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+
+      assert state.max_idle_timeout == 900_000
+      assert is_reference(state.idle_timer)
+    end
+
+    test "fires for a keep_alive: 0 client, which has no keepalive timer", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{max_idle_timeout: 50}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+
+      # keep_alive: 0 means NO keepalive timer — the idle ceiling is the only
+      # liveness bound for this connection.
+      {:ok, state} = Proto.handle_data(connect_packet_v5("idle-zero-keepalive"), state)
+      assert state.keepalive_timer == nil
+      assert state.max_idle_timeout == 50
+
+      assert_receive :mqtt_idle_timeout, 1_000
+      assert {:stop, :normal, _} = Proto.handle_info(:mqtt_idle_timeout, state)
+    end
+
+    test "inbound data resets the ceiling", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{max_idle_timeout: 60_000}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+      first_timer = state.idle_timer
+
+      {:ok, state} = Proto.handle_data(connect_packet_v5("idle-reset"), state)
+      refute state.idle_timer == first_timer
+    end
+
+    test "max_idle_timeout: :infinity disables it", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{max_idle_timeout: :infinity}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+      assert state.max_idle_timeout == nil
+      assert state.idle_timer == nil
+    end
+  end
+
+  describe "DISCONNECT session-expiry revision (§3.14.2.2.2)" do
+    test "a client that connected with SEI > 0 may revise it on DISCONNECT", ctx do
+      state = connect_client_v5(ctx, "sei-revise", %{session_expiry_interval: 3600})
+      assert state.session_expiry_interval == 3600
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :disconnect,
+          reason_code: 0x00,
+          properties: %{session_expiry_interval: 0}
+        })
+
+      assert {:close, :disconnect, closed} = Proto.handle_data(data, state)
+      assert closed.session_expiry_interval == 0
+    end
+
+    test "revising SEI from 0 to non-zero is a protocol error (0x82)", ctx do
+      state = connect_client_v5(ctx, "sei-illegal", %{session_expiry_interval: 0})
+      drain_mailbox()
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :disconnect,
+          reason_code: 0x00,
+          properties: %{session_expiry_interval: 60}
+        })
+
+      assert {:close, :protocol_error, _} = Proto.handle_data(data, state)
+      assert_received {:sent, sent}
+      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(sent))
+      assert disconnect.reason_code == 0x82
+    end
+  end
+
+  describe "retain_handling: 1" do
+    test "sends retained on a NEW subscription", ctx do
+      state = connect_client_v5(ctx, "rh1-new")
+      drain_mailbox()
+
+      :ets.insert(
+        ctx.retained_table,
+        {"rh1/topic", ["rh1", "topic"], "retained-1", 0, System.system_time(:second), nil}
+      )
+
+      sub = %{
+        type: :subscribe,
+        packet_id: 1,
+        topics: [%{topic: "rh1/topic", qos: 0, retain_handling: 1}],
+        properties: %{}
+      }
+
+      {:ok, data} = Codec.encode(5, sub)
+      {:ok, _state} = Proto.handle_data(data, state)
+
+      assert_received {:sent, _suback}
+      assert_received {:sent, publish_data}
+      {:ok, {publish, <<>>}} = Codec.decode(5, IO.iodata_to_binary(publish_data))
+      assert publish.type == :publish
+      assert publish.payload == "retained-1"
+    end
+
+    test "suppresses retained when the subscription already exists", ctx do
+      state = connect_client_v5(ctx, "rh1-existing")
+      drain_mailbox()
+
+      :ets.insert(
+        ctx.retained_table,
+        {"rh1e/topic", ["rh1e", "topic"], "retained-1", 0, System.system_time(:second), nil}
+      )
+
+      sub = %{
+        type: :subscribe,
+        packet_id: 1,
+        topics: [%{topic: "rh1e/topic", qos: 0, retain_handling: 1}],
+        properties: %{}
+      }
+
+      {:ok, data} = Codec.encode(5, sub)
+      {:ok, state} = Proto.handle_data(data, state)
+      drain_mailbox()
+
+      # Re-subscribing to the SAME filter must not replay the retained message
+      {:ok, data2} = Codec.encode(5, %{sub | packet_id: 2})
+      {:ok, _state} = Proto.handle_data(data2, state)
+
+      assert_received {:sent, suback_data}
+      {:ok, {suback, <<>>}} = Codec.decode(5, IO.iodata_to_binary(suback_data))
+      assert suback.type == :suback
+      refute_received {:sent, _}
+    end
+  end
+
+  describe "outbound Receive Maximum (§3.3.4)" do
+    test "queues QoS 1 publishes beyond the client's advertised window", ctx do
+      state = connect_publisher_v5(ctx, "recv-max", %{receive_maximum: 2})
+      assert state.client_receive_maximum == 2
+      drain_mailbox()
+
+      state =
+        Enum.reduce(1..5, state, fn n, acc ->
+          {:noreply, acc} =
+            Proto.handle_info({:send_publish, "q/#{n}", "p#{n}", %{qos: 1}}, acc)
+
+          acc
+        end)
+
+      # Only 2 in flight; the rest wait in the queue
+      assert map_size(state.pending_qos1_tx) == 2
+      assert :queue.len(state.outbound_queue) == 3
+    end
+
+    test "a PUBACK drains one queued publish", ctx do
+      state = connect_publisher_v5(ctx, "recv-max-drain", %{receive_maximum: 1})
+      drain_mailbox()
+
+      state =
+        Enum.reduce(1..3, state, fn n, acc ->
+          {:noreply, acc} = Proto.handle_info({:send_publish, "d/#{n}", "p#{n}", %{qos: 1}}, acc)
+          acc
+        end)
+
+      assert map_size(state.pending_qos1_tx) == 1
+      assert :queue.len(state.outbound_queue) == 2
+
+      [in_flight_id] = Map.keys(state.pending_qos1_tx)
+      {:ok, puback} = Codec.encode(5, %{type: :puback, packet_id: in_flight_id, reason_code: 0})
+      {:ok, state} = Proto.handle_data(puback, state)
+
+      # Window freed → exactly one queued message promoted
+      assert map_size(state.pending_qos1_tx) == 1
+      assert :queue.len(state.outbound_queue) == 1
+    end
+  end
+
+  describe "pre-CONNECT handshake timeout" do
+    test "closes a socket that never sends CONNECT", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{connect_timeout: 50}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+
+      assert_receive :mqtt_connect_timeout, 1_000
+      assert {:stop, :normal, _} = Proto.handle_info(:mqtt_connect_timeout, state)
+    end
+
+    test "is a no-op once CONNECT completed", ctx do
+      state = connect_client_v5(ctx, "handshake-done")
+      assert {:noreply, _} = Proto.handle_info(:mqtt_connect_timeout, state)
     end
   end
 end

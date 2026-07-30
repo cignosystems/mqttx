@@ -15,9 +15,35 @@ defmodule MqttX.Transport.ThousandIsland do
 
   - `:port` - Port to listen on (default: 1883)
   - `:ip` - IP address to bind to (default: `{0, 0, 0, 0}`)
-  - `:transport_module` - ThousandIsland transport (`:tcp` or `:ssl`)
-  - `:transport_options` - SSL/TLS options when using `:ssl`
+  - `:transport_module` - ThousandIsland transport module
+    (`ThousandIsland.Transports.TCP` or `...SSL`)
+  - `:transport_options` - SSL/TLS options when using the SSL transport,
+    merged over a secure baseline (TLS 1.2/1.3, `secure_renegotiate`)
   - `:num_acceptors` - Number of acceptor processes (default: 100)
+  - `:read_timeout` - ThousandIsland socket read timeout (default:
+    `:infinity`). MQTT liveness is enforced by the protocol keepalive and
+    `:max_idle_timeout` below; TI's own 60 s default would disconnect
+    spec-compliant clients whose Keep Alive exceeds it.
+
+  Everything below is passed through `transport_opts` to the protocol handler
+  and applies to all adapters:
+
+  - `:max_packet_size` - Reject packets whose declared size exceeds this,
+    before the body is buffered (default: 1 MiB, `:infinity` disables)
+  - `:max_idle_timeout` - Close a socket idle for this long regardless of the
+    negotiated Keep Alive, which does not apply when a client connects with
+    `keep_alive: 0` (default: 900_000 ms, `:infinity` disables)
+  - `:connect_timeout` - Close a socket that has not completed CONNECT within
+    this window (default: 10_000 ms, `:infinity` disables)
+  - `:max_retained_messages` - Cap on distinct retained topics
+    (default: 100_000, `:infinity` disables)
+  - `:rate_limit` - Options for `MqttX.Server.RateLimiter` (default: none)
+  - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 65535)
+  - `:topic_alias_maximum` - Topic aliases the server accepts (default: 100)
+  - `:server_keep_alive` - Override the client's Keep Alive (MQTT 5.0 only)
+  - `:supported_versions` - Accepted protocol levels (default: `[3, 4, 5]`)
+  - `:qos2_retry_interval` / `:qos2_max_retries` - Outbound QoS 1/2
+    retransmission tuning (defaults: 5000 ms, 3)
   """
 
   @behaviour MqttX.Transport
@@ -37,6 +63,21 @@ defmodule MqttX.Transport.ThousandIsland do
       Keyword.get(transport_opts, :transport_module, ThousandIsland.Transports.TCP)
 
     transport_options = Keyword.get(transport_opts, :transport_options, [])
+
+    # Secure TLS baseline — user options are merged over it (C1).
+    transport_options =
+      if transport_module == ThousandIsland.Transports.SSL do
+        Keyword.merge(
+          [
+            versions: [:"tlsv1.3", :"tlsv1.2"],
+            secure_renegotiate: true,
+            honor_cipher_order: true
+          ],
+          transport_options
+        )
+      else
+        transport_options
+      end
 
     # Create ETS table for retained messages
     retained_table = create_retained_table(port)
@@ -64,7 +105,11 @@ defmodule MqttX.Transport.ThousandIsland do
       handler_options: handler_opts_full,
       transport_module: transport_module,
       transport_options: [{:ip, ip} | transport_options],
-      num_acceptors: num_acceptors
+      num_acceptors: num_acceptors,
+      # ThousandIsland's default 60s read_timeout would kill compliant MQTT
+      # clients whose keepalive exceeds ~40s. Liveness is enforced by the
+      # protocol itself (keepalive timer + pre-CONNECT handshake deadline).
+      read_timeout: Keyword.get(transport_opts, :read_timeout, :infinity)
     ]
 
     Logger.info("[MqttX.Transport.ThousandIsland] Starting on port #{port}")

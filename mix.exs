@@ -1,7 +1,7 @@
 defmodule MqttX.MixProject do
   use Mix.Project
 
-  @version "0.10.0"
+  @version "0.11.0"
   @source_url "https://github.com/cignosystems/mqttx"
 
   def project do
@@ -13,6 +13,22 @@ defmodule MqttX.MixProject do
       deps: deps(),
       package: package(),
       docs: docs(),
+      # Honest floor at today's measured level (71.4%); raise as the thin
+      # spots (WillDelay, Payload.Protobuf, SimpleClient) gain tests.
+      test_coverage: [summary: [threshold: 70]],
+      # Include the optional transport deps in the PLT so dialyzer actually
+      # checks the adapter call sites
+      dialyzer: [
+        plt_add_apps: [
+          :thousand_island,
+          :ranch,
+          :bandit,
+          :websock_adapter,
+          :mix,
+          :ex_unit
+        ],
+        flags: [:error_handling]
+      ],
       name: "MqttX",
       description: "Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package"
     ]
@@ -20,7 +36,8 @@ defmodule MqttX.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :crypto],
+      # :ssl/:public_key must be listed or TLS transports fail inside releases
+      extra_applications: [:logger, :crypto, :ssl, :public_key],
       mod: {MqttX.Application, []}
     ]
   end
@@ -34,14 +51,15 @@ defmodule MqttX.MixProject do
       {:thousand_island, "~> 1.4", optional: true},
       {:ranch, "~> 2.2", optional: true},
       {:bandit, "~> 1.6", optional: true},
-      {:websock_adapter, "~> 0.5", optional: true},
+      {:websock_adapter, "~> 0.5 or ~> 0.6", optional: true},
 
       # Payload codecs (optional)
       {:protox, "~> 2.0", optional: true},
 
       # Dev/test
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
-      {:dialyxir, "~> 1.4", only: :dev, runtime: false}
+      {:dialyxir, "~> 1.4", only: :dev, runtime: false},
+      {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end
 
@@ -70,6 +88,7 @@ defmodule MqttX.MixProject do
         "AGENTS.md",
         "CHANGELOG.md",
         "guides/getting-started.md",
+        "guides/why-mqtt-for-iot.md",
         "guides/client.md",
         "guides/server.md",
         "guides/codec.md",
@@ -79,6 +98,7 @@ defmodule MqttX.MixProject do
       groups_for_extras: [
         Guides: [
           "guides/getting-started.md",
+          "guides/why-mqtt-for-iot.md",
           "guides/client.md",
           "guides/server.md",
           "guides/codec.md",

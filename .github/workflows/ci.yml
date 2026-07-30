@@ -15,12 +15,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Oldest supported pair (mix.exs floor) and newest, plus the
+          # released Elixir versions in between on their native OTP.
           - elixir: '1.18'
             otp: '27'
-          - elixir: '1.18'
-            otp: '28'
           - elixir: '1.19'
             otp: '28'
+          - elixir: '1.20'
+            otp: '28'
+          - elixir: '1.20'
+            otp: '29'
     steps:
       - uses: actions/checkout@v5
 
@@ -58,22 +62,22 @@ jobs:
       - name: Setup Elixir
         uses: erlef/setup-beam@v1
         with:
-          elixir-version: '1.19'
-          otp-version: '28'
+          elixir-version: '1.20'
+          otp-version: '29'
 
       - name: Cache deps
         uses: actions/cache@v5
         with:
           path: deps
-          key: deps-${{ runner.os }}-28-1.19-${{ hashFiles('**/mix.lock') }}
-          restore-keys: deps-${{ runner.os }}-28-1.19-
+          key: deps-${{ runner.os }}-29-1.20-${{ hashFiles('**/mix.lock') }}
+          restore-keys: deps-${{ runner.os }}-29-1.20-
 
       - name: Cache PLT
         uses: actions/cache@v5
         with:
           path: _build/dev/*.plt
-          key: plt-${{ runner.os }}-28-1.19-${{ hashFiles('**/mix.lock') }}
-          restore-keys: plt-${{ runner.os }}-28-1.19-
+          key: plt-${{ runner.os }}-29-1.20-${{ hashFiles('**/mix.lock') }}
+          restore-keys: plt-${{ runner.os }}-29-1.20-
 
       - name: Install dependencies
         run: mix deps.get
@@ -92,15 +96,15 @@ jobs:
       - name: Setup Elixir
         uses: erlef/setup-beam@v1
         with:
-          elixir-version: '1.19'
-          otp-version: '28'
+          elixir-version: '1.20'
+          otp-version: '29'
 
       - name: Cache deps
         uses: actions/cache@v5
         with:
           path: deps
-          key: deps-${{ runner.os }}-28-1.19-${{ hashFiles('**/mix.lock') }}
-          restore-keys: deps-${{ runner.os }}-28-1.19-
+          key: deps-${{ runner.os }}-29-1.20-${{ hashFiles('**/mix.lock') }}
+          restore-keys: deps-${{ runner.os }}-29-1.20-
 
       - name: Install dependencies
         run: mix deps.get

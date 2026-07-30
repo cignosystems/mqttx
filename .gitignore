@@ -22,3 +22,11 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 mqttx-*.tar
 
+
+# macOS Finder metadata
+.DS_Store
+
+# Local AI-session working files (audit reports, reply drafts, plans)
+/.claude/
+/mqttx-review*.md
+/github-issue-replies.md

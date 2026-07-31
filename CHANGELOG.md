@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.1] - 2026-07-31
+
+### Fixed
+
+- **README links render correctly on hex.pm's package page.** The page shows
+  the README from the package tarball and rewrites relative links to the raw
+  file server (`repo.hex.pm/preview/...`), which serves guide pages as plain
+  text. All relative documentation links in the README are now absolute
+  hexdocs.pm URLs, which work on hexdocs, GitHub, and hex.pm alike; a
+  documentation test resolves each one back to its source file and verifies
+  the page and heading anchor exist.
+
 ## [0.11.0] - 2026-07-31
 
 A security and correctness release. Every Critical and High finding from a

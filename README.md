@@ -18,9 +18,9 @@ Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package.
 - 🔌 Pluggable transports (ThousandIsland, Ranch)
 - 📦 Optional payload codecs (JSON, Protobuf)
 
-> **AI coding assistants:** see [`AGENTS.md`](AGENTS.md) for the mental model,
-> idiomatic patterns, and a list of mistakes commonly made when integrating
-> MqttX. Also rendered on [hexdocs](https://hexdocs.pm/mqttx/agents.html).
+> **AI coding assistants:** see [`AGENTS.md`](https://hexdocs.pm/mqttx/agents.html)
+> for the mental model, idiomatic patterns, and a list of mistakes commonly
+> made when integrating MqttX.
 
 > **Name note:** MqttX (this Elixir library) is not affiliated with
 > [MQTTX](https://mqttx.app), EMQX's desktop MQTT client tool. The hex package
@@ -198,7 +198,7 @@ this library exists because the alternatives in the ecosystem each leave a
 gap. The reasoning — protocol-overhead comparisons against HTTP and
 WebSocket, real payload measurements, monthly cellular data budgets, and an
 honest comparison with the other Elixir/Erlang MQTT libraries — lives in
-[Why MQTT for IoT](guides/why-mqtt-for-iot.md).
+[Why MQTT for IoT](https://hexdocs.pm/mqttx/why-mqtt-for-iot.html).
 
 ## Common Patterns
 
@@ -234,7 +234,7 @@ end
 `topic` arrives as a list of segments (`["sensors", "room1", "temp"]`), not the
 original string. The full event list, the payload/packet shapes, and the rules
 for calling back into the client from a handler are in the
-**[Client Guide](guides/client.md#receiving-messages)**.
+**[Client Guide](https://hexdocs.pm/mqttx/client.html#receiving-messages)**.
 
 ### Module-based client (`use MqttX`)
 
@@ -261,7 +261,7 @@ children = [{MyApp.Sensors, host: "broker.example.com", client_id: "sensors-1"}]
 Every callback has a default, so implement only what you need. The full
 callback list and the injected helpers are documented in
 **`MqttX.SimpleClient`** and the
-**[Client Guide](guides/client.md#module-based-clients-use-mqttx)**.
+**[Client Guide](https://hexdocs.pm/mqttx/client.html#module-based-clients-use-mqttx)**.
 
 ### Publishing from a server callback (broadcast / fan-out)
 
@@ -306,7 +306,7 @@ In MQTT 5.0 the client tells the broker how long to keep its session via
 ```elixir
 {:ok, client} = MqttX.Client.connect(
   host: "broker.example.com",
-  client_id: "device-imei-350457794457489",
+  client_id: "device-imei-490154203237518",
   protocol_version: 5,
   clean_session: false,
   connect_properties: %{session_expiry_interval: 3600},
@@ -509,7 +509,7 @@ Architected to scale from tens of thousands to **roughly a million concurrent de
 
 Capacity depends on hardware, so these figures are anchored to instance sizes
 rather than given as a single ceiling. Devices are the practical targets from
-the [capacity planning](guides/performance.md#capacity-planning) method, which
+the [capacity planning](https://hexdocs.pm/mqttx/performance.html#capacity-planning) method, which
 reserves headroom for the runtime, ETS, and reconnect storms:
 
 | Instance | Idle-ish devices (~1 msg/min) | Chatty devices (1 msg/sec) | Binding constraint |
@@ -526,7 +526,7 @@ TCP, and a handler doing negligible work.
 
 > **These are estimates from architectural analysis and the codec benchmarks
 > below — not end-to-end load tests.** See the
-> [Performance & Scaling guide](guides/performance.md) for the sizing formula,
+> [Performance & Scaling guide](https://hexdocs.pm/mqttx/performance.html) for the sizing formula,
 > per-vCPU throughput, and the caveats behind each number.
 
 **Codec benchmarks vs mqtt_packet_map** — measured, on an Apple M4 Pro:
@@ -537,19 +537,19 @@ TCP, and a handler doing negligible work.
 | SUBSCRIBE encode | 3.42M ips | 0.82M ips | **4.2x faster** |
 | PUBLISH decode | 2.36M ips | 2.25M ips | ~same |
 
-The performance guide also covers [VM tuning](guides/performance.md#vm-tuning) (`+P`/`+Q`
+The performance guide also covers [VM tuning](https://hexdocs.pm/mqttx/performance.html#vm-tuning) (`+P`/`+Q`
 limits, which you *must* raise past 65K connections), OS tuning, and
 multi-node deployment.
 
 ## Guides
 
-[Getting Started](guides/getting-started.md) ·
-[Why MQTT for IoT](guides/why-mqtt-for-iot.md) ·
-[Client](guides/client.md) ·
-[Server / Broker](guides/server.md) ·
-[Packet Codec](guides/codec.md) ·
-[Telemetry](guides/telemetry.md) ·
-[Performance & Scaling](guides/performance.md)
+[Getting Started](https://hexdocs.pm/mqttx/getting-started.html) ·
+[Why MQTT for IoT](https://hexdocs.pm/mqttx/why-mqtt-for-iot.html) ·
+[Client](https://hexdocs.pm/mqttx/client.html) ·
+[Server / Broker](https://hexdocs.pm/mqttx/server.html) ·
+[Packet Codec](https://hexdocs.pm/mqttx/codec.html) ·
+[Telemetry](https://hexdocs.pm/mqttx/telemetry.html) ·
+[Performance & Scaling](https://hexdocs.pm/mqttx/performance.html)
 
 ## API Reference
 
@@ -581,7 +581,7 @@ multi-node deployment.
 | `:await_connect` | Block until the first CONNACK resolves (see [Common Pitfalls](#common-pitfalls)) | `false` |
 | `:protocol_version` | MQTT protocol level: `3`, `4` (3.1.1) or `5` | `5` |
 | `:transport` | `:tcp`, `:ssl`, `:ws`, or `:wss` | `:tcp` |
-| `:ssl_opts` | SSL options, merged **over** the secure baseline (see [TLS/SSL](guides/client.md#tls-ssl)) | `[]` |
+| `:ssl_opts` | SSL options, merged **over** the secure baseline (see [TLS/SSL](https://hexdocs.pm/mqttx/client.html#tls-ssl)) | `[]` |
 | `:ws_path` | WebSocket path for `:ws` or `:wss` | `"/mqtt"` |
 | `:proxy` | HTTP CONNECT proxy, e.g. `[host: "proxy.corp", port: 3128, auth: {"u", "p"}]` | `nil` |
 | `:retry_interval` | QoS retry interval (ms) | `5000` |
@@ -652,7 +652,7 @@ multi-node deployment.
 | **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
 | **Session Persistence (Server)** | Planned | Server-side session persistence (currently client-only) |
 | **MQTT 5.0 Enhanced Auth** | Partial | AUTH exchange and re-authentication implemented; no built-in SCRAM/external providers |
-| **Telemetry Docs** | Done | See the [Telemetry guide](guides/telemetry.md) |
+| **Telemetry Docs** | Done | See the [Telemetry guide](https://hexdocs.pm/mqttx/telemetry.html) |
 | **Property-based Tests** | Done | StreamData round-trips + decode/encode fuzzing of the codec |
 | **End-to-end Load Tests** | Planned | Benchee-based throughput validation under realistic workloads |
 

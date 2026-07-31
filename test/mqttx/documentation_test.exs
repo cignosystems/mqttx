@@ -417,6 +417,30 @@ defmodule MqttX.DocumentationTest do
       assert broken == [], "Broken documentation links:\n" <> Enum.join(broken, "\n")
     end
 
+    test "absolute hexdocs links point at real pages and headings" do
+      # README links are absolute hexdocs URLs (relative .md links render as
+      # raw text on hex.pm's package preview), so they bypass the relative-link
+      # check above. Resolve each back to its source file and verify.
+      page_sources = %{
+        "agents" => "AGENTS.md",
+        "changelog" => "CHANGELOG.md",
+        "readme" => "README.md"
+      }
+
+      broken =
+        for f <- @docs ++ ["CHANGELOG.md"],
+            {text, link} <- links(f),
+            [_, page, fragment] <-
+              Regex.scan(~r|^https://hexdocs\.pm/mqttx/([\w.-]+)\.html(?:#([\w-]+))?$|, link)
+              |> Enum.take(1),
+            problem = hexdocs_link_problem(page, fragment, page_sources),
+            problem != nil do
+          "#{f}: [#{text}](#{link}) — #{problem}"
+        end
+
+      assert broken == [], "Broken hexdocs links:\n" <> Enum.join(broken, "\n")
+    end
+
     test "no two headings in a guide share an anchor" do
       # ExDoc gives colliding headings the same id, so one of the two links
       # becomes unreachable. (CHANGELOG is exempt: repeated "### Fixed"
@@ -632,5 +656,28 @@ defmodule MqttX.DocumentationTest do
       |> Enum.map(fn [event] -> String.replace(event, " ", "") end)
     end)
     |> MapSet.new()
+  end
+
+  defp hexdocs_link_problem(page, fragment, page_sources) do
+    source = Map.get(page_sources, page, "guides/#{page}.md")
+
+    cond do
+      String.starts_with?(page, "MqttX") ->
+        if Code.ensure_loaded?(Module.concat([page])),
+          do: nil,
+          else: "module #{page} does not exist"
+
+      not File.exists?(source) ->
+        "no extra source file #{source} for page #{page}.html"
+
+      fragment in [nil, ""] ->
+        nil
+
+      fragment in Enum.map(headings(source), &slugify/1) ->
+        nil
+
+      true ->
+        "no heading ##{fragment} in #{source}"
+    end
   end
 end

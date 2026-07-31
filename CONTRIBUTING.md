@@ -20,8 +20,19 @@ Notes for humans and AI assistants modifying this library itself. If you are
 ## Running tests
 
 - Local unit + integration: `mix test --exclude interop`
-- EMQX interop:
-  `EMQX_HOST=du0.emmtry.com EMQX_PORT=8883 EMQX_USERNAME=350457794457489 EMQX_PASSWORD=Emmtry2 mix test test/mqttx/interop_emqx_test.exs --include interop`
+- EMQX interop — runs against any reachable EMQX. The easiest is a local
+  Docker one (it ships a self-signed TLS listener on 8883 out of the box,
+  which is fine because the suite connects with `verify: :verify_none`):
+
+  ```sh
+  docker run -d --name emqx -p 1883:1883 -p 8883:8883 emqx/emqx
+  EMQX_HOST=localhost EMQX_PORT=8883 \
+    mix test test/mqttx/interop_emqx_test.exs --include interop
+  ```
+
+  Note: with default EMQX config anonymous access is allowed, so the
+  "rejects wrong credentials" test is only meaningful against a broker with
+  password auth enabled (set `EMQX_USERNAME`/`EMQX_PASSWORD` accordingly).
 
 ## Known test environment couplings
 

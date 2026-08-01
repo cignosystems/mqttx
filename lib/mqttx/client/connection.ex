@@ -1101,11 +1101,7 @@ defmodule MqttX.Client.Connection do
 
     if state.connack_timer, do: Process.cancel_timer(state.connack_timer)
 
-    # Extract MQTT 5.0 properties from CONNACK
     props = Map.get(connack, :properties, %{})
-    topic_alias_max = Map.get(props, :topic_alias_maximum)
-    receive_max = Map.get(props, :receive_maximum, 65535)
-    max_packet_size = Map.get(props, :maximum_packet_size)
     session_present = Map.get(connack, :session_present, false)
 
     # MQTT-3.2.2-2: server MUST NOT report session_present=true if we
@@ -1117,36 +1113,38 @@ defmodule MqttX.Client.Connection do
       )
     end
 
-    # Server may override keepalive (MQTT 5.0 §3.2.2.3.14)
-    keepalive =
-      case Map.get(props, :server_keep_alive) do
-        nil -> state.keepalive
-        val -> val
-      end
+    emit_connect_stop_telemetry(state)
 
-    # Server may assign a client identifier (MQTT 5.0 §3.2.2.3.7)
-    client_id =
-      case Map.get(props, :assigned_client_identifier) do
-        nil -> state.client_id
-        val -> val
-      end
+    # §4.4: on session resumption immediately resend unacknowledged QoS 1/2
+    # state in original order; on a fresh session, discard it. And if the
+    # broker did not resume our session, replay every tracked subscription
+    # or the client is silently deaf after reconnect.
+    state =
+      state
+      |> apply_connack_settings(props)
+      |> sync_inflight_after_connect(session_present)
+      |> notify_handler(:connected, %{properties: props, session_present: session_present})
+
+    state = if session_present, do: state, else: resubscribe_all(state)
+    state = reply_to_connect_waiters(state, :ok)
+
+    # Process any packets that arrived right behind the CONNACK
+    if state.buffer != <<>>, do: process_buffer(state), else: state
+  end
+
+  # Apply the settings the CONNACK negotiated: server overrides for keepalive
+  # (§3.2.2.3.14) and client id (§3.2.2.3.7), flow-control and packet-size
+  # limits, and fresh per-connection topic-alias tables (§3.3.2.3.4).
+  defp apply_connack_settings(state, props) do
+    keepalive = Map.get(props, :server_keep_alive) || state.keepalive
+    client_id = Map.get(props, :assigned_client_identifier) || state.client_id
 
     keepalive_timer =
       if keepalive > 0,
         do: Process.send_after(self(), :keepalive, keepalive * 1000),
         else: nil
 
-    retry_timer = Process.send_after(self(), :check_inflight, state.retry_interval)
-
-    # Server's topic_alias_maximum tells us how many outgoing aliases we can use
-    server_tam = Map.get(props, :topic_alias_maximum, 0)
-
-    if telem = state.connect_telemetry do
-      duration = System.monotonic_time() - telem.start_time
-      Telemetry.client_connect_stop(duration, telem.metadata)
-    end
-
-    state = %{
+    %{
       state
       | connected: true,
         connecting: false,
@@ -1155,38 +1153,27 @@ defmodule MqttX.Client.Connection do
         connect_telemetry: nil,
         backoff: Backoff.reset(state.backoff),
         keepalive_timer: keepalive_timer,
-        retry_timer: retry_timer,
+        retry_timer: Process.send_after(self(), :check_inflight, state.retry_interval),
         pingresp_timer: nil,
         keepalive: keepalive,
         client_id: client_id,
-        topic_alias_maximum: topic_alias_max,
-        receive_maximum: receive_max,
-        server_maximum_packet_size: max_packet_size,
-        server_topic_alias_maximum: server_tam,
+        topic_alias_maximum: Map.get(props, :topic_alias_maximum),
+        receive_maximum: Map.get(props, :receive_maximum, 65535),
+        server_maximum_packet_size: Map.get(props, :maximum_packet_size),
+        server_topic_alias_maximum: Map.get(props, :topic_alias_maximum, 0),
         topic_to_alias: %{},
         next_alias: 1,
-        # Inbound aliases are also per-connection (§3.3.2.3.4)
         alias_to_topic: %{}
     }
+  end
 
-    # §4.4: on session resumption immediately resend unacknowledged QoS 1/2
-    # state in original order; on a fresh session, discard it.
-    state = sync_inflight_after_connect(state, session_present)
+  defp emit_connect_stop_telemetry(state) do
+    if telem = state.connect_telemetry do
+      duration = System.monotonic_time() - telem.start_time
+      Telemetry.client_connect_stop(duration, telem.metadata)
+    end
 
-    state =
-      notify_handler(state, :connected, %{
-        properties: props,
-        session_present: session_present
-      })
-
-    # The broker did not resume our session — replay every tracked
-    # subscription or the client is silently deaf after reconnect.
-    state = if session_present, do: state, else: resubscribe_all(state)
-
-    state = reply_to_connect_waiters(state, :ok)
-
-    # Process any packets that arrived right behind the CONNACK
-    if state.buffer != <<>>, do: process_buffer(state), else: state
+    :ok
   end
 
   # A connection attempt failed (transport error, CONNACK rejection,

@@ -80,7 +80,7 @@ ordered roughly by ratio of impact to effort.
   pattern in `connection.ex:handle_info({:tcp, …})`. Switch to iolist
   accumulation with `IO.iodata_to_binary/1` only at decode time.
 
-### API-changing (worth a v0.11 deliberate bump)
+### API-changing (worth a deliberate minor bump)
 
 - **Payload codec PFI / content-type wiring.** `MqttX.Payload` callbacks are
   `encode/1`/`decode/1`. To auto-set `:payload_format_indicator` and
@@ -94,8 +94,9 @@ ordered roughly by ratio of impact to effort.
 - Several reason-code literals (`0x82`, `0x94`, `0x95`, `0x93`, `0x92`, `0x8C`,
   `0x84`, `0x18`) appear inline across `handler.ex`. Pull to a shared
   module attribute file (`MqttX.Packet.ReasonCodes`).
-- Packet-type and property-id constants are duplicated in `types.ex`,
-  `codec.ex`, and `properties.ex`. Pick one source of truth.
+- Packet-type and property-id constants are duplicated in `codec.ex` and
+  `properties.ex`. Pick one source of truth. (The third copy, `types.ex`,
+  was dead code and removed in 0.11.1.)
 - `connection.ex` is a ~2200-line monolithic GenServer. Split connect/handshake,
   retry logic, topic-alias logic into helper modules.
 - `MqttX.Topic.flatten/1` switched from binary concat to iodata, but other

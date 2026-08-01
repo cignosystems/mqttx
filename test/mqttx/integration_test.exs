@@ -141,7 +141,7 @@ defmodule MqttX.IntegrationTest do
 
     @impl true
     def init(opts) do
-      %{agent: Keyword.fetch!(opts, :agent)}
+      %{agent: Keyword.fetch!(opts, :agent), notify: Keyword.get(opts, :notify)}
     end
 
     @impl true
@@ -176,6 +176,10 @@ defmodule MqttX.IntegrationTest do
 
     @impl true
     def handle_session_expired(client_id, state) do
+      # Deliver directly to the test process so tests can assert_receive
+      # instead of sleeping past the expiry timer (a flake source).
+      if state[:notify], do: send(state.notify, {:session_expired, client_id})
+
       try do
         Agent.update(state.agent, fn events ->
           [{:session_expired, client_id} | events]
@@ -1374,7 +1378,7 @@ defmodule MqttX.IntegrationTest do
   describe "session expiry" do
     test "handle_session_expired called when session_expiry_interval expires" do
       {:ok, agent} = Agent.start_link(fn -> [] end)
-      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent)
+      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent, notify: self())
 
       {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
 
@@ -1395,20 +1399,13 @@ defmodule MqttX.IntegrationTest do
       :ok = :gen_tcp.send(socket, connect_packet)
       {:ok, _connack} = :gen_tcp.recv(socket, 0, 2000)
 
-      Process.sleep(100)
-
       # Disconnect ungracefully
       :gen_tcp.close(socket)
 
-      # Session should not have expired yet
-      Process.sleep(500)
-      events_early = Agent.get(agent, & &1)
-      refute Enum.any?(events_early, &match?({:session_expired, "session-expiry-test"}, &1))
-
-      # Wait for session expiry (1 second + margin)
-      Process.sleep(1500)
-      events_late = Agent.get(agent, & &1)
-      assert Enum.any?(events_late, &match?({:session_expired, "session-expiry-test"}, &1))
+      # Must not fire before the 1 s expiry timer...
+      refute_receive {:session_expired, "session-expiry-test"}, 700
+      # ...and must fire once it elapses
+      assert_receive {:session_expired, "session-expiry-test"}, 2_000
 
       ThousandIsland.stop(server_pid)
       Agent.stop(agent)
@@ -1416,7 +1413,7 @@ defmodule MqttX.IntegrationTest do
 
     test "handle_session_expired called immediately when session_expiry_interval is 0" do
       {:ok, agent} = Agent.start_link(fn -> [] end)
-      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent)
+      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent, notify: self())
 
       {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
 
@@ -1437,15 +1434,11 @@ defmodule MqttX.IntegrationTest do
       :ok = :gen_tcp.send(socket, connect_packet)
       {:ok, _connack} = :gen_tcp.recv(socket, 0, 2000)
 
-      Process.sleep(100)
-
       # Disconnect ungracefully
       :gen_tcp.close(socket)
 
       # Session should expire immediately
-      Process.sleep(500)
-      events = Agent.get(agent, & &1)
-      assert Enum.any?(events, &match?({:session_expired, "session-immediate-test"}, &1))
+      assert_receive {:session_expired, "session-immediate-test"}, 1_000
 
       ThousandIsland.stop(server_pid)
       Agent.stop(agent)
@@ -1453,7 +1446,7 @@ defmodule MqttX.IntegrationTest do
 
     test "handle_session_expired not called when session_expiry_interval is 0xFFFFFFFF (never expire)" do
       {:ok, agent} = Agent.start_link(fn -> [] end)
-      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent)
+      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent, notify: self())
 
       {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
 
@@ -1474,14 +1467,10 @@ defmodule MqttX.IntegrationTest do
       :ok = :gen_tcp.send(socket, connect_packet)
       {:ok, _connack} = :gen_tcp.recv(socket, 0, 2000)
 
-      Process.sleep(100)
-
       # Disconnect ungracefully
       :gen_tcp.close(socket)
 
-      Process.sleep(1000)
-      events = Agent.get(agent, & &1)
-      refute Enum.any?(events, &match?({:session_expired, _}, &1))
+      refute_receive {:session_expired, _}, 1_200
 
       ThousandIsland.stop(server_pid)
       Agent.stop(agent)
@@ -1489,7 +1478,7 @@ defmodule MqttX.IntegrationTest do
 
     test "session expiry on graceful disconnect" do
       {:ok, agent} = Agent.start_link(fn -> [] end)
-      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent)
+      {server_pid, port} = start_server(SessionExpiryHandler, agent: agent, notify: self())
 
       {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
 
@@ -1522,10 +1511,8 @@ defmodule MqttX.IntegrationTest do
 
       :ok = :gen_tcp.send(socket, disconnect_packet)
 
-      # Wait for session expiry
-      Process.sleep(2000)
-      events = Agent.get(agent, & &1)
-      assert Enum.any?(events, &match?({:session_expired, "session-graceful-test"}, &1))
+      # Expiry timer is 1 s from DISCONNECT
+      assert_receive {:session_expired, "session-graceful-test"}, 2_500
 
       :gen_tcp.close(socket)
       ThousandIsland.stop(server_pid)

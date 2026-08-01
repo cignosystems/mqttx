@@ -28,13 +28,18 @@ defmodule MqttX.Transport.RanchTest do
   end
 
   setup do
-    port = get_free_port()
+    # Bind port 0 and ask ranch for the real port — closing a probe socket
+    # and reusing its number raced other tests for the port.
+    refs_before = MapSet.new(Map.keys(:ranch.info()))
 
     {:ok, listener} =
       MqttX.Server.start_link(EchoHandler, [],
         transport: MqttX.Transport.Ranch,
-        port: port
+        port: 0
       )
+
+    [ref] = Map.keys(:ranch.info()) |> Enum.reject(&MapSet.member?(refs_before, &1))
+    port = :ranch.get_port(ref)
 
     on_exit(fn ->
       if Process.alive?(listener), do: Process.exit(listener, :shutdown)
@@ -95,12 +100,5 @@ defmodule MqttX.Transport.RanchTest do
       })
 
     data
-  end
-
-  defp get_free_port do
-    {:ok, socket} = :gen_tcp.listen(0, [])
-    {:ok, port} = :inet.port(socket)
-    :gen_tcp.close(socket)
-    port
   end
 end

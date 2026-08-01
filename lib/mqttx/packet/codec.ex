@@ -424,14 +424,7 @@ defmodule MqttX.Packet.Codec do
         err
     end
   catch
-    :mqttx_string_too_long -> {:error, :string_too_long}
-    :mqttx_invalid_utf8 -> {:error, :invalid_utf8}
-    :mqttx_missing_packet_id -> {:error, :missing_packet_id}
-    :mqttx_invalid_qos -> {:error, :invalid_qos}
-    :mqttx_invalid_topic -> {:error, :invalid_topic}
-    :mqttx_empty_topic_list -> {:error, :empty_topic_list}
-    :mqttx_value_out_of_range -> {:error, :value_out_of_range}
-    {:mqttx_invalid_property, name} -> {:error, {:invalid_property, name}}
+    thrown -> encode_throw_to_error(thrown)
   end
 
   @doc """
@@ -453,15 +446,23 @@ defmodule MqttX.Packet.Codec do
         err
     end
   catch
-    :mqttx_string_too_long -> {:error, :string_too_long}
-    :mqttx_invalid_utf8 -> {:error, :invalid_utf8}
-    :mqttx_missing_packet_id -> {:error, :missing_packet_id}
-    :mqttx_invalid_qos -> {:error, :invalid_qos}
-    :mqttx_invalid_topic -> {:error, :invalid_topic}
-    :mqttx_empty_topic_list -> {:error, :empty_topic_list}
-    :mqttx_value_out_of_range -> {:error, :value_out_of_range}
-    {:mqttx_invalid_property, name} -> {:error, {:invalid_property, name}}
+    thrown -> encode_throw_to_error(thrown)
   end
+
+  # Shared mapping for the throw-based validation in encode_packet/2 and its
+  # helpers. Anything not thrown by this module is re-thrown untouched.
+  defp encode_throw_to_error(:mqttx_string_too_long), do: {:error, :string_too_long}
+  defp encode_throw_to_error(:mqttx_invalid_utf8), do: {:error, :invalid_utf8}
+  defp encode_throw_to_error(:mqttx_missing_packet_id), do: {:error, :missing_packet_id}
+  defp encode_throw_to_error(:mqttx_invalid_qos), do: {:error, :invalid_qos}
+  defp encode_throw_to_error(:mqttx_invalid_topic), do: {:error, :invalid_topic}
+  defp encode_throw_to_error(:mqttx_empty_topic_list), do: {:error, :empty_topic_list}
+  defp encode_throw_to_error(:mqttx_value_out_of_range), do: {:error, :value_out_of_range}
+
+  defp encode_throw_to_error({:mqttx_invalid_property, name}),
+    do: {:error, {:invalid_property, name}}
+
+  defp encode_throw_to_error(other), do: throw(other)
 
   # CONNECT
   defp encode_packet(version, %{type: :connect} = msg) do

@@ -80,6 +80,8 @@ defmodule MqttX.Client.InflightResendTest do
 
   test "unacked QoS 1 PUBLISH is resent with dup=1 immediately after session resumption" do
     {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    # Close on failure too, not just on the happy path at the end of the test
+    on_exit(fn -> :gen_tcp.close(listen) end)
     {:ok, port} = :inet.port(listen)
     broker = start_broker(listen, self(), true)
 
@@ -106,6 +108,8 @@ defmodule MqttX.Client.InflightResendTest do
 
   test "in-flight state is discarded when the broker starts a fresh session" do
     {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    # Close on failure too, not just on the happy path at the end of the test
+    on_exit(fn -> :gen_tcp.close(listen) end)
     {:ok, port} = :inet.port(listen)
     broker = start_broker(listen, self(), false)
 

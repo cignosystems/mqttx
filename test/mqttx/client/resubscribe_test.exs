@@ -14,6 +14,8 @@ defmodule MqttX.Client.ResubscribeTest do
 
   test "subscriptions are replayed after a reconnect without session resumption" do
     {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    # Close on failure too, not just on the happy path at the end of the test
+    on_exit(fn -> :gen_tcp.close(listen) end)
     {:ok, port} = :inet.port(listen)
     parent = self()
 

@@ -499,7 +499,7 @@ defmodule MqttX.DocumentationTest do
       # documenting it should fail here.
       events =
         Regex.scan(
-          ~r/notify_handler\(\s*state,?\s*:(\w+)/,
+          ~r/notify_handler\(\s*(?:state\s*,\s*)?:(\w+)/,
           File.read!("lib/mqttx/client/connection.ex")
         )
         |> Enum.map(fn [_, event] -> ":" <> event end)

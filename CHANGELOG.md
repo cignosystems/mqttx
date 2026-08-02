@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`MqttX.Packet.ReasonCodes`** — named constants for the MQTT 5.0 reason
+  codes and MQTT 3.1.1 CONNACK return codes the library sends, plus an
+  `is_error_code/1` guard for the §2.4 "0x80 and above means failure" rule.
+  Useful in handler callbacks that return reason codes: `{:error,
+  MqttX.Packet.ReasonCodes.bad_authentication_method(), state}` says what
+  `0x8C` means. It defines only the codes the library itself uses rather than
+  mirroring the whole spec table, so expect to add to it.
+
+### Changed
+
+- **Internal restructuring, no behaviour change.** The HTTP CONNECT proxy
+  tunnel and the MQTT 5.0 topic-alias handling moved out of
+  `MqttX.Client.Connection` into `MqttX.Client.Proxy` and
+  `MqttX.Client.TopicAlias` (both internal), trimming that module by ~140
+  lines; `finalize_connection/2` split into `apply_connack_settings/2` and a
+  telemetry helper; the two identical `catch` blocks in `Codec.encode/2` and
+  `encode_iodata/2` now share one mapping function that re-raises anything it
+  does not recognise.
+- Topic joins across the broker and Will-delay paths now share
+  `MqttX.Topic.flatten/1` instead of private `Enum.join("/")` copies. That is
+  also a latent-bug fix: `flatten/1` renders wildcards correctly, so a filter
+  list containing `:single_level` yields `"+"` rather than `"single_level"`.
+
+### Fixed
+
+- Four test-hygiene issues that made the suite fragile rather than wrong:
+  the session-expiry tests are message-driven instead of sleeping past a 1 s
+  timer with fixed margins; two client tests close their listen sockets via
+  `on_exit` so a failed assertion no longer leaks them; and the Ranch test
+  binds port 0 and asks ranch for the real port instead of racing on a
+  closed probe socket.
+
 ### Security
 
 Findings from a multi-agent security review of the whole repository at

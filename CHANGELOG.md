@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Security
+
+Findings from a multi-agent security review of the whole repository at
+`a8f28fe`. Each fix carries a regression test that was confirmed to fail
+against the previous code.
+
+- **A Will message bypassed publish authorization.** An ordinary PUBLISH stores
+  its retained entry only after `handle_publish/4` accepts it, but both Will
+  paths — immediate (`MqttX.Transport.Handler`) and delayed
+  (`MqttX.Server.WillDelay`) — wrote to the retained store *first* and then
+  discarded the handler's answer. A peer that got past `handle_connect` could
+  therefore plant, or with an empty payload delete, a retained message on any
+  topic its ACL forbids; `deliver_retained_messages/2` later handed it to
+  subscribers without consulting the handler again. Both paths now publish
+  through the handler first and store only on `{:ok, _}`. A Will's topic and
+  payload never reach `handle_connect`, so `handle_publish/4` is the only
+  callback that can authorize them — brokers relying on it for per-topic
+  authorization were affected.
+- **A broker could choose which session record the client overwrote.** The
+  client adopted the CONNACK `assigned_client_identifier` unconditionally and
+  used the resulting `client_id` as the `session_store` key, so a malicious or
+  MITM'd broker could rename the connection to another client's id and clobber
+  that client's persisted session in the shared table — the victim would then
+  replay the attacker-influenced subscriptions and in-flight publishes against
+  its own broker. The store is now keyed by an immutable `session_key` captured
+  in `init/1`, and the assigned identifier is honoured only when the client
+  actually sent a zero-length one, per §3.2.2.3.7 (a broker that sends one
+  anyway is ignored with a warning). Affects `session_store` +
+  `clean_session: false` deployments sharing a session table.
+- **Log-record forgery via `client_id`.** The keepalive-timeout log line
+  interpolated the client-supplied identifier raw; the codec permits CR, LF and
+  ANSI escapes, so a client could forge additional log records or corrupt an
+  operator's console. It now uses `inspect/1`, as every other log site in that
+  module already did.
+
+Not a vulnerability in the library, but found by the same review and worth
+noting: local broker credentials were removed from the repository's Claude Code
+settings file.
+
 ## [0.11.1] - 2026-07-31
 
 ### Fixed

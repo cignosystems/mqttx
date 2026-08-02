@@ -59,6 +59,10 @@ defmodule MqttX.Client.Connection do
     :host,
     :port,
     :client_id,
+    # The client id as configured, captured once in init/1 and never reassigned.
+    # `client_id` can be replaced by the broker's Assigned Client Identifier, so
+    # it must not select which persisted session record we read or write.
+    :session_key,
     :username,
     :password,
     :socket,
@@ -311,6 +315,7 @@ defmodule MqttX.Client.Connection do
       host: Keyword.fetch!(opts, :host),
       port: Keyword.get(opts, :port, default_port),
       client_id: client_id,
+      session_key: client_id,
       username: Keyword.get(opts, :username),
       password: Keyword.get(opts, :password),
       clean_session: clean_session,
@@ -1064,7 +1069,7 @@ defmodule MqttX.Client.Connection do
   # limits, and fresh per-connection topic-alias tables (§3.3.2.3.4).
   defp apply_connack_settings(state, props) do
     keepalive = Map.get(props, :server_keep_alive) || state.keepalive
-    client_id = Map.get(props, :assigned_client_identifier) || state.client_id
+    client_id = assigned_client_id(props, state)
 
     keepalive_timer =
       if keepalive > 0,
@@ -1092,6 +1097,34 @@ defmodule MqttX.Client.Connection do
         next_alias: 1,
         alias_to_topic: %{}
     }
+  end
+
+  # §3.2.2.3.7: the server assigns a Client Identifier only when the client sent
+  # a zero-length one. Honouring it unconditionally let any broker rename this
+  # connection to another client's id, which used to select the session-store
+  # record we wrote — see `session_key`.
+  defp assigned_client_id(props, %{client_id: configured} = state)
+       when configured in [nil, ""] do
+    Map.get(props, :assigned_client_identifier) || state.client_id
+  end
+
+  defp assigned_client_id(props, state) do
+    case Map.get(props, :assigned_client_identifier) do
+      nil ->
+        state.client_id
+
+      assigned when assigned != state.client_id ->
+        Logger.warning(
+          "[MqttX.Client] Broker sent an Assigned Client Identifier " <>
+            "(#{inspect(assigned)}) although we supplied #{inspect(state.client_id)}; " <>
+            "ignoring it (MQTT 5.0 §3.2.2.3.7)"
+        )
+
+        state.client_id
+
+      _same ->
+        state.client_id
+    end
   end
 
   defp emit_connect_stop_telemetry(state) do
@@ -1942,10 +1975,12 @@ defmodule MqttX.Client.Connection do
         subscriptions: state.subscriptions
       }
 
-      case state.session_store.save(state.client_id, session, state.session_store_state) do
+      # session_key, not client_id: the store is keyed by what we configured, so
+      # a broker cannot direct this write at another client's record.
+      case state.session_store.save(state.session_key, session, state.session_store_state) do
         {:error, reason} ->
           Logger.warning(
-            "[MqttX.Client] Failed to persist session for #{inspect(state.client_id)}: #{inspect(reason)}"
+            "[MqttX.Client] Failed to persist session for #{inspect(state.session_key)}: #{inspect(reason)}"
           )
 
         _ ->

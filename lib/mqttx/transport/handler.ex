@@ -373,7 +373,9 @@ defmodule MqttX.Transport.Handler do
   end
 
   def handle_info(:keepalive_timeout, state) do
-    Logger.debug("[MqttX.Transport] Keepalive timeout for #{state.client_id}")
+    # inspect/1, not raw interpolation: client_id is attacker-supplied and the
+    # codec permits CR/LF and ANSI escapes, which would forge log records.
+    Logger.debug("[MqttX.Transport] Keepalive timeout for #{inspect(state.client_id)}")
 
     state =
       if state.connected and not is_nil(state.will_message) do
@@ -1719,14 +1721,22 @@ defmodule MqttX.Transport.Handler do
       properties: will_props
     }
 
-    if will.retain do
+    # The Will's topic, payload and retain flag come from the client's CONNECT
+    # and are never seen by handle_connect, so handle_publish is the only place
+    # that can authorize them. Ask first and store only on acceptance — storing
+    # first let a peer that passed CONNECT write (or, with an empty payload,
+    # delete) a retained message on any topic its ACL forbids, which
+    # deliver_retained_messages/2 would later hand to subscribers unmediated.
+    result = state.handler.handle_publish(will.topic, will.payload, opts, state.handler_state)
+
+    if will.retain and match?({:ok, _}, result) do
       store_retained_message(
         %{topic: will.topic, payload: will.payload, qos: will.qos, properties: will_props},
         state
       )
     end
 
-    state.handler.handle_publish(will.topic, will.payload, opts, state.handler_state)
+    result
   end
 
   # Handle retained message storage

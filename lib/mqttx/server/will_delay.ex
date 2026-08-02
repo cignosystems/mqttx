@@ -88,7 +88,12 @@ defmodule MqttX.Server.WillDelay do
       properties: will_props
     }
 
-    if will.retain do
+    # Same rule as the immediate Will path in MqttX.Transport.Handler: the Will
+    # is attacker-supplied and handle_publish is its only authorization gate, so
+    # ask first and store the retained entry only if the handler accepted it.
+    result = ctx.handler.handle_publish(will.topic, will.payload, opts, ctx.handler_state)
+
+    if will.retain and match?({:ok, _}, result) do
       store_retained(
         will.topic,
         will.payload,
@@ -99,7 +104,7 @@ defmodule MqttX.Server.WillDelay do
       )
     end
 
-    ctx.handler.handle_publish(will.topic, will.payload, opts, ctx.handler_state)
+    result
   end
 
   defp store_retained(topic, <<>>, _qos, _props, table, _max) do

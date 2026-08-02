@@ -259,6 +259,27 @@ defmodule MqttX.IntegrationTest do
     {server_pid, port}
   end
 
+  # A broker that answers CONNACK with an Assigned Client Identifier.
+  defp assigned_id_broker(listen, test_pid) do
+    spawn(fn ->
+      {:ok, sock} = :gen_tcp.accept(listen)
+      {:ok, _data} = :gen_tcp.recv(sock, 0, 5000)
+
+      connack =
+        encode_packet!(5, %{
+          type: :connack,
+          session_present: false,
+          reason_code: 0,
+          properties: %{assigned_client_identifier: "server-assigned-id"}
+        })
+
+      :gen_tcp.send(sock, connack)
+      send(test_pid, :connack_sent)
+      Process.sleep(2000)
+      :gen_tcp.close(sock)
+    end)
+  end
+
   defp encode_packet!(version, packet) do
     {:ok, data} = MqttX.Packet.Codec.encode(version, packet)
     data
@@ -1568,29 +1589,39 @@ defmodule MqttX.IntegrationTest do
       :gen_tcp.close(listen)
     end
 
-    test "client applies assigned_client_identifier from CONNACK" do
+    test "client applies assigned_client_identifier when it sent a zero-length client id" do
       {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
       {:ok, port} = :inet.port(listen)
 
-      test_pid = self()
+      assigned_id_broker(listen, self())
 
-      spawn(fn ->
-        {:ok, sock} = :gen_tcp.accept(listen)
-        {:ok, _data} = :gen_tcp.recv(sock, 0, 5000)
+      {:ok, client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "",
+          protocol_version: 5
+        )
 
-        connack =
-          encode_packet!(5, %{
-            type: :connack,
-            session_present: false,
-            reason_code: 0,
-            properties: %{assigned_client_identifier: "server-assigned-id"}
-          })
+      assert_receive :connack_sent, 5000
+      Process.sleep(100)
 
-        :gen_tcp.send(sock, connack)
-        send(test_pid, :connack_sent)
-        Process.sleep(2000)
-        :gen_tcp.close(sock)
-      end)
+      state = :sys.get_state(client)
+      assert state.client_id == "server-assigned-id"
+
+      GenServer.stop(client, :normal, 1000)
+      :gen_tcp.close(listen)
+    end
+
+    test "client ignores assigned_client_identifier when it supplied its own client id" do
+      # §3.2.2.3.7: the server assigns an identifier only because a zero-length
+      # one was found in CONNECT. Honouring it otherwise let any broker rename
+      # the connection — and the name used to select the session-store record
+      # this client writes (see MqttX.Client.SessionKeyTest).
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+
+      assigned_id_broker(listen, self())
 
       {:ok, client} =
         MqttX.Client.connect(
@@ -1604,7 +1635,7 @@ defmodule MqttX.IntegrationTest do
       Process.sleep(100)
 
       state = :sys.get_state(client)
-      assert state.client_id == "server-assigned-id"
+      assert state.client_id == "original-id"
 
       GenServer.stop(client, :normal, 1000)
       :gen_tcp.close(listen)

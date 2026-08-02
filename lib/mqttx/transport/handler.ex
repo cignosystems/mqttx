@@ -7,6 +7,8 @@ defmodule MqttX.Transport.Handler do
 
   alias MqttX.Packet.Codec
   alias MqttX.Telemetry
+  alias MqttX.Packet.ReasonCodes, as: RC
+  import MqttX.Packet.ReasonCodes, only: [is_error_code: 1]
 
   require Logger
 
@@ -513,7 +515,7 @@ defmodule MqttX.Transport.Handler do
     # cannot make us accumulate up to its declared size (§3.1.2.11.4).
     case max_size && Codec.declared_length(buffer) do
       {:ok, declared} when declared > max_size ->
-        send_disconnect(state, 0x95, %{})
+        send_disconnect(state, RC.packet_too_large(), %{})
         {:close, :packet_too_large, %{state | buffer: <<>>, graceful_disconnect: true}}
 
       _ ->
@@ -539,7 +541,7 @@ defmodule MqttX.Transport.Handler do
   # Reject any non-CONNECT/AUTH packet before CONNECT is processed (MQTT spec requirement)
   defp handle_packet(%{type: type} = _packet, %{connected: false} = state)
        when type not in [:connect, :auth] do
-    send_disconnect(state, 0x82, %{})
+    send_disconnect(state, RC.protocol_error(), %{})
     {:close, :protocol_error, state}
   end
 
@@ -548,7 +550,7 @@ defmodule MqttX.Transport.Handler do
   # previous keepalive timer (which would later kill the session and fire
   # the will spuriously).
   defp handle_packet(%{type: :connect}, %{connected: true} = state) do
-    send_disconnect(state, 0x82, %{})
+    send_disconnect(state, RC.protocol_error(), %{})
     {:close, :protocol_error, state}
   end
 
@@ -568,7 +570,10 @@ defmodule MqttX.Transport.Handler do
     if protocol_version not in state.supported_versions do
       # §3.2.2.2: reject with Unacceptable Protocol Version. v5 uses 0x84;
       # earlier versions use 0x01.
-      reason_code = if protocol_version >= 5, do: 0x84, else: 0x01
+      reason_code =
+        if protocol_version >= 5,
+          do: RC.unsupported_protocol_version(),
+          else: RC.v3_unacceptable_protocol_version()
 
       connack = %{
         type: :connack,
@@ -595,7 +600,7 @@ defmodule MqttX.Transport.Handler do
         connack = %{
           type: :connack,
           session_present: false,
-          reason_code: 0x02,
+          reason_code: RC.v3_identifier_rejected(),
           properties: %{}
         }
 
@@ -605,7 +610,7 @@ defmodule MqttX.Transport.Handler do
 
         Telemetry.server_client_connect_exception(
           duration,
-          Map.put(telemetry_meta, :reason_code, 0x02)
+          Map.put(telemetry_meta, :reason_code, RC.v3_identifier_rejected())
         )
 
         {:close, :identifier_rejected, state}
@@ -633,8 +638,10 @@ defmodule MqttX.Transport.Handler do
         handle_publish_with_topic(packet, resolved_topic, state)
 
       {:error, :topic_alias_invalid, state} ->
-        send_disconnect(state, 0x94, %{})
-        {:close, {:server_disconnect, 0x94}, %{state | graceful_disconnect: true}}
+        send_disconnect(state, RC.topic_alias_invalid(), %{})
+
+        {:close, {:server_disconnect, RC.topic_alias_invalid()},
+         %{state | graceful_disconnect: true}}
     end
   catch
     {:message_rate_limited, rate_limited_packet, current_state} ->
@@ -642,7 +649,7 @@ defmodule MqttX.Transport.Handler do
         puback = %{
           type: :puback,
           packet_id: rate_limited_packet.packet_id,
-          reason_code: 0x96,
+          reason_code: RC.message_rate_too_high(),
           properties: %{}
         }
 
@@ -653,7 +660,7 @@ defmodule MqttX.Transport.Handler do
         pubrec = %{
           type: :pubrec,
           packet_id: rate_limited_packet.packet_id,
-          reason_code: 0x96,
+          reason_code: RC.message_rate_too_high(),
           properties: %{}
         }
 
@@ -807,7 +814,7 @@ defmodule MqttX.Transport.Handler do
     # set a non-zero SEI at CONNECT; 0 → non-zero is a Protocol Error.
     cond do
       is_integer(new_sei) and new_sei > 0 and (state.session_expiry_interval || 0) == 0 ->
-        send_disconnect(state, 0x82, %{})
+        send_disconnect(state, RC.protocol_error(), %{})
         {:close, :protocol_error, state}
 
       true ->
@@ -816,7 +823,7 @@ defmodule MqttX.Transport.Handler do
         Telemetry.server_client_disconnect(%{client_id: state.client_id, reason: :normal})
 
         state =
-          if reason_code == 0x04 and not is_nil(state.will_message) do
+          if reason_code == RC.disconnect_with_will_message() and not is_nil(state.will_message) do
             maybe_publish_will(state)
             %{state | will_message: nil}
           else
@@ -864,7 +871,7 @@ defmodule MqttX.Transport.Handler do
           pubrel = %{
             type: :pubrel,
             packet_id: packet.packet_id,
-            reason_code: 0x92,
+            reason_code: RC.packet_identifier_not_found(),
             properties: %{}
           }
 
@@ -878,7 +885,7 @@ defmodule MqttX.Transport.Handler do
         # sent must NOT trigger another PUBREL. Wait for the original PUBCOMP.
         {:ok, state}
 
-      _entry when reason_code >= 0x80 ->
+      _entry when is_error_code(reason_code) ->
         # §4.3.3: an error PUBREC aborts the flow — discard the message and
         # do NOT send PUBREL.
         Logger.debug(
@@ -914,7 +921,7 @@ defmodule MqttX.Transport.Handler do
         pubcomp = %{
           type: :pubcomp,
           packet_id: packet.packet_id,
-          reason_code: 0x92,
+          reason_code: RC.packet_identifier_not_found(),
           properties: %{}
         }
 
@@ -1016,7 +1023,7 @@ defmodule MqttX.Transport.Handler do
   # re-authentication on an already-connected session. Receiving an AUTH packet
   # with no preceding CONNECT and no enhanced-auth context is a Protocol Error.
   defp handle_packet(%{type: :auth}, %{connected: false, protocol_version: nil} = state) do
-    send_disconnect(state, 0x82, %{})
+    send_disconnect(state, RC.protocol_error(), %{})
     {:close, :protocol_error, state}
   end
 
@@ -1032,7 +1039,7 @@ defmodule MqttX.Transport.Handler do
             # A second CONNACK on a live connection is a protocol violation.
             auth_ok = %{
               type: :auth,
-              reason_code: 0x00,
+              reason_code: RC.success(),
               properties: %{authentication_method: method}
             }
 
@@ -1053,7 +1060,7 @@ defmodule MqttX.Transport.Handler do
         {:continue, response_data, new_handler_state} ->
           auth_resp = %{
             type: :auth,
-            reason_code: 0x18,
+            reason_code: RC.continue_authentication(),
             properties: %{
               authentication_method: method,
               authentication_data: response_data
@@ -1084,13 +1091,13 @@ defmodule MqttX.Transport.Handler do
       end
     else
       if state.connected do
-        send_disconnect(state, 0x8C, %{})
+        send_disconnect(state, RC.bad_authentication_method(), %{})
         {:close, :auth_not_supported, %{state | graceful_disconnect: true}}
       else
         connack = %{
           type: :connack,
           session_present: false,
-          reason_code: 0x8C,
+          reason_code: RC.bad_authentication_method(),
           properties: %{}
         }
 
@@ -1248,7 +1255,7 @@ defmodule MqttX.Transport.Handler do
         pubrec = %{
           type: :pubrec,
           packet_id: packet.packet_id,
-          reason_code: 0x93,
+          reason_code: RC.receive_maximum_exceeded(),
           properties: %{}
         }
 
@@ -1259,7 +1266,7 @@ defmodule MqttX.Transport.Handler do
         puback = %{
           type: :puback,
           packet_id: packet.packet_id,
-          reason_code: 0x93,
+          reason_code: RC.receive_maximum_exceeded(),
           properties: %{}
         }
 
@@ -1336,7 +1343,7 @@ defmodule MqttX.Transport.Handler do
 
     for {pid, _} <- Registry.lookup(MqttX.Server.ConnectionRegistry, key), pid != self() do
       Logger.info("[MqttX.Transport] Session takeover for #{inspect(client_id)}")
-      send(pid, {:server_disconnect, 0x8E, %{}})
+      send(pid, {:server_disconnect, RC.session_taken_over(), %{}})
     end
 
     :ok
@@ -1757,8 +1764,7 @@ defmodule MqttX.Transport.Handler do
     end
   end
 
-  defp normalize_topic_key(topic) when is_list(topic), do: Enum.join(topic, "/")
-  defp normalize_topic_key(topic) when is_binary(topic), do: topic
+  defp normalize_topic_key(topic), do: MqttX.Topic.flatten(topic)
 
   # Deliver retained messages matching subscribed topics. State is threaded so
   # we can allocate packet IDs from the real next_packet_id counter rather than
@@ -1781,10 +1787,7 @@ defmodule MqttX.Transport.Handler do
 
     {state, expired_keys} =
       Enum.reduce(exact_subs, {state, []}, fn {sub, _normalized}, {st, exp_acc} ->
-        topic_key = get_topic_filter(sub)
-
-        topic_key =
-          if is_list(topic_key), do: Enum.join(topic_key, "/"), else: to_string(topic_key)
+        topic_key = sub |> get_topic_filter() |> MqttX.Topic.flatten()
 
         case :ets.lookup(st.retained_table, topic_key) do
           [{^topic_key, _norm_list, payload, qos, timestamp, expiry_interval}] ->
@@ -1904,18 +1907,9 @@ defmodule MqttX.Transport.Handler do
 
   defp get_topic_filter(%{topic: topic}), do: topic
   defp get_topic_filter(topic) when is_binary(topic), do: topic
-  defp get_topic_filter(topic) when is_list(topic), do: Enum.join(topic, "/")
+  defp get_topic_filter(topic) when is_list(topic), do: MqttX.Topic.flatten(topic)
 
   # Canonical string form of a subscription's topic filter (for the
   # subscribed_filters set)
-  defp filter_key(sub) do
-    case get_topic_filter(sub) do
-      topic when is_binary(topic) -> topic
-      topic when is_list(topic) -> Enum.join(Enum.map(topic, &segment_to_string/1), "/")
-    end
-  end
-
-  defp segment_to_string(:single_level), do: "+"
-  defp segment_to_string(:multi_level), do: "#"
-  defp segment_to_string(seg) when is_binary(seg), do: seg
+  defp filter_key(sub), do: sub |> get_topic_filter() |> MqttX.Topic.flatten()
 end

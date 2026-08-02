@@ -123,6 +123,5 @@ defmodule MqttX.Server.WillDelay do
     end
   end
 
-  defp topic_key(topic) when is_list(topic), do: Enum.join(topic, "/")
-  defp topic_key(topic) when is_binary(topic), do: topic
+  defp topic_key(topic), do: MqttX.Topic.flatten(topic)
 end

@@ -91,14 +91,14 @@ ordered roughly by ratio of impact to effort.
 
 ### Smaller polish (low risk, do whenever)
 
-- Several reason-code literals (`0x82`, `0x94`, `0x95`, `0x93`, `0x92`, `0x8C`,
-  `0x84`, `0x18`) appear inline across `handler.ex`. Pull to a shared
-  module attribute file (`MqttX.Packet.ReasonCodes`).
-- Packet-type and property-id constants are duplicated in `codec.ex` and
-  `properties.ex`. Pick one source of truth. (The third copy, `types.ex`,
-  was dead code and removed in 0.11.1.)
-- `connection.ex` is a ~2200-line monolithic GenServer. Split connect/handshake,
-  retry logic, topic-alias logic into helper modules.
-- `MqttX.Topic.flatten/1` switched from binary concat to iodata, but other
-  paths (`handler.ex:normalize_topic_key/1` etc.) still do `Enum.join("/")` per
-  call — fine for retained delivery but worth sharing a single helper.
+- `connection.ex` (~2050 lines): the proxy tunnel and topic-alias logic are
+  extracted (`MqttX.Client.Proxy`, `MqttX.Client.TopicAlias`); the QoS
+  retry/resend logic is still inline because it is entangled with
+  `send_packet/2` socket I/O — extracting it means threading a send callback
+  through, so do it only as part of a deliberate connect/handshake split.
+
+Done in this section: reason-code literals in `handler.ex` are named via
+`MqttX.Packet.ReasonCodes`; packet-type/property-id constants have one source
+of truth each (`codec.ex` / `properties.ex` — the duplicate `types.ex` was
+removed); topic joins share `MqttX.Topic.flatten/1` (which is wildcard-aware,
+unlike the `Enum.join("/")` calls it replaced).

@@ -406,7 +406,7 @@ defmodule MqttX.Client.Connection do
 
           # Apply outgoing topic alias (MQTT 5.0)
           {publish_topic, publish_properties, state} =
-            apply_outgoing_topic_alias(topic, properties, state)
+            MqttX.Client.TopicAlias.apply_outgoing(topic, properties, state)
 
           packet = %{
             type: :publish,
@@ -900,81 +900,8 @@ defmodule MqttX.Client.Connection do
   end
 
   defp open_tcp(%{proxy: proxy} = state) do
-    proxy_host = to_charlist(Keyword.fetch!(proxy, :host))
-    proxy_port = Keyword.get(proxy, :port, 3128)
-
-    with :ok <- validate_proxy_target(state.host),
-         {:ok, socket} <-
-           :gen_tcp.connect(proxy_host, proxy_port, [:binary, active: false], @connect_timeout),
-         :ok <- :gen_tcp.send(socket, proxy_connect_request(state.host, state.port, proxy)),
-         :ok <- await_proxy_response(socket, <<>>) do
-      {:ok, socket}
-    else
-      {:error, reason} -> {:error, {:proxy, reason}}
-    end
+    MqttX.Client.Proxy.connect(state.host, state.port, proxy, @connect_timeout)
   end
-
-  # The host is interpolated into the CONNECT request line and Host header —
-  # CR/LF (or whitespace/NUL) would let a caller-supplied host inject
-  # additional HTTP headers into the proxy request.
-  defp validate_proxy_target(host) when is_binary(host) do
-    if String.match?(host, ~r/[\r\n\0\s]/) do
-      {:error, :invalid_proxy_target}
-    else
-      :ok
-    end
-  end
-
-  defp validate_proxy_target(_host), do: :ok
-
-  defp proxy_connect_request(host, port, proxy) do
-    auth_header =
-      case Keyword.get(proxy, :auth) do
-        {user, pass} ->
-          "Proxy-Authorization: Basic #{Base.encode64("#{user}:#{pass}")}\r\n"
-
-        nil ->
-          ""
-      end
-
-    "CONNECT #{host}:#{port} HTTP/1.1\r\n" <>
-      "Host: #{host}:#{port}\r\n" <>
-      auth_header <>
-      "\r\n"
-  end
-
-  defp await_proxy_response(socket, buffer) when byte_size(buffer) < 8192 do
-    case :gen_tcp.recv(socket, 0, @connect_timeout) do
-      {:ok, data} ->
-        buffer = buffer <> data
-
-        if String.contains?(buffer, "\r\n\r\n") do
-          case buffer do
-            <<"HTTP/1.", _minor, " 200", _rest::binary>> ->
-              :ok
-
-            <<"HTTP/1.", _minor, " ", status::binary-size(3), _rest::binary>> ->
-              # A hostile/broken proxy can send a non-numeric status —
-              # Integer.parse avoids raising inside the GenServer (which would
-              # kill the process and lose reconnect/backoff state).
-              case Integer.parse(status) do
-                {code, _} -> {:error, {:proxy_status, code}}
-                :error -> {:error, :bad_proxy_response}
-              end
-
-            _ ->
-              {:error, :bad_proxy_response}
-          end
-        else
-          await_proxy_response(socket, buffer)
-        end
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp await_proxy_response(_socket, _buffer), do: {:error, :bad_proxy_response}
 
   defp ssl_upgrade(tcp_socket, ssl_opts) do
     case :ssl.connect(tcp_socket, ssl_opts, @connect_timeout) do
@@ -1326,7 +1253,7 @@ defmodule MqttX.Client.Connection do
 
   defp handle_packet(%{type: :publish} = packet, state) do
     # Handle topic alias (MQTT 5.0)
-    case resolve_incoming_topic_alias(packet, state) do
+    case MqttX.Client.TopicAlias.resolve_incoming(packet, state) do
       {:ok, topic, state} ->
         handle_publish_packet(%{packet | topic: topic}, topic, state)
 
@@ -1629,12 +1556,6 @@ defmodule MqttX.Client.Connection do
   # spec = 65535).
   defp inbound_receive_maximum(state) do
     Map.get(state.connect_properties || %{}, :receive_maximum, 65_535)
-  end
-
-  # The Topic Alias Maximum we advertised in CONNECT (§3.1.2.11.5 — absent
-  # means 0, i.e. the broker may not use aliases at all).
-  defp advertised_topic_alias_maximum(state) do
-    Map.get(state.connect_properties || %{}, :topic_alias_maximum, 0)
   end
 
   defp send_packet(state, packet) do
@@ -2067,37 +1988,6 @@ defmodule MqttX.Client.Connection do
     state.inflight_tx_count < max_allowed
   end
 
-  # ============================================================================
-  # Topic Alias Helpers (MQTT 5.0)
-  # ============================================================================
-
-  # Apply outgoing topic alias for PUBLISH (MQTT 5.0)
-  # If server supports topic aliases, reuse alias for repeated topics to save bandwidth
-  defp apply_outgoing_topic_alias(topic, properties, %{server_topic_alias_maximum: max} = state)
-       when max > 0 and not is_map_key(properties, :topic_alias) do
-    case Map.get(state.topic_to_alias, topic) do
-      nil when state.next_alias <= max ->
-        # Assign new alias: send topic + alias (server learns the mapping)
-        alias_id = state.next_alias
-        new_props = Map.put(properties, :topic_alias, alias_id)
-        new_map = Map.put(state.topic_to_alias, topic, alias_id)
-        {topic, new_props, %{state | topic_to_alias: new_map, next_alias: alias_id + 1}}
-
-      nil ->
-        # All aliases used, send normally
-        {topic, properties, state}
-
-      alias_id ->
-        # Reuse existing alias: send empty topic + alias
-        new_props = Map.put(properties, :topic_alias, alias_id)
-        {"", new_props, state}
-    end
-  end
-
-  defp apply_outgoing_topic_alias(topic, properties, state) do
-    {topic, properties, state}
-  end
-
   # Handle WebSocket framed data — decode frames and append payloads to MQTT
   # buffer. Threads the fragmentation state across reads so a multi-frame
   # message split across TCP boundaries is reassembled correctly.
@@ -2161,37 +2051,4 @@ defmodule MqttX.Client.Connection do
   end
 
   defp log_reason_string(_props), do: :ok
-
-  # Resolve topic alias for incoming PUBLISH messages.
-  #
-  # The codec normalizes non-empty topics to a list of segments; only the
-  # alias-without-topic form arrives as the empty binary "".
-  defp resolve_incoming_topic_alias(packet, state) do
-    topic_alias = get_in(packet, [:properties, :topic_alias])
-    topic = packet.topic
-
-    cond do
-      # No alias in packet
-      is_nil(topic_alias) ->
-        {:ok, topic, state}
-
-      # §3.3.2.3.4: Topic Alias 0 is a Protocol Error, and the broker must not
-      # exceed the Topic Alias Maximum we advertised in CONNECT.
-      topic_alias < 1 or topic_alias > advertised_topic_alias_maximum(state) ->
-        {:error, :invalid_topic_alias}
-
-      # Alias with topic: store the mapping
-      topic != "" and topic != [] ->
-        alias_to_topic = Map.put(state.alias_to_topic, topic_alias, topic)
-        {:ok, topic, %{state | alias_to_topic: alias_to_topic}}
-
-      # Alias only: look up from stored mapping. An unmapped alias is a
-      # protocol error (§3.3.2.3.4) — never deliver with a made-up topic.
-      true ->
-        case Map.fetch(state.alias_to_topic, topic_alias) do
-          {:ok, resolved_topic} -> {:ok, resolved_topic, state}
-          :error -> {:error, :unknown_topic_alias}
-        end
-    end
-  end
 end

@@ -8,7 +8,7 @@ Notes for humans and AI assistants modifying this library itself. If you are
 - `lib/mqttx/packet/` — wire codec (`codec.ex`, `properties.ex`, `varint.ex`, `types.ex`)
 - `lib/mqttx/topic.ex` — topic validation, normalization, wildcard matching, shared subs
 - `lib/mqttx/transport/handler.ex` — per-connection broker state machine (~1900 LoC, big file)
-- `lib/mqttx/server/` — broker pieces: `server.ex`, `router.ex`, `rate_limiter.ex`, `will_delay.ex`
+- `lib/mqttx/server/` — broker pieces: `server.ex`, `router.ex`, `retained_store.ex`, `rate_limiter.ex`, `will_delay.ex`
 - `lib/mqttx/client/connection.ex` — client GenServer (~2200 LoC)
 - `lib/mqttx/client/websocket.ex` — RFC 6455 client framing
 - `lib/mqttx/session/` — `Store` behaviour + ETS implementation; `ETSOwner` keeps the
@@ -54,21 +54,9 @@ ordered roughly by ratio of impact to effort.
 - **Will Delay cancel-on-reconnect across nodes.** `MqttX.Server.WillDelay`
   cancels by client_id within a single BEAM. For a clustered setup, the cancel
   must be broadcast (Phoenix.PubSub or `:pg`).
-- **Wildcard retained-message match on subscribe.** `deliver_retained_messages/2`
-  does `:ets.foldl` over the entire retained table for any subscription that
-  contains a `+`/`#`. Replace with a topic trie keyed by literal/`+`/`#` (with
-  separate `$`-prefix root). Same data structure could back the subscription
-  trie in `router.ex`.
 
 ### Larger (each ~day-plus)
 
-- **Route outbound PUBLISH through the router.** The handler currently
-  `send_publish`es directly from the user callback's return values, bypassing
-  the router. As a result `subscription_identifier`, `no_local`, and
-  `retain_as_published` are computed but discarded. Refactor so `handle_info`
-  publish-tuples and retained-on-subscribe paths fan out through
-  `MqttX.Server.Router.match/3` and the per-subscription opts are applied per
-  outbound PUBLISH.
 - **Persistent session store + expiry sweep.** `MqttX.Session.Store` covers
   CRUD on `subscriptions`, `pending_messages`, `packet_id`. Add (additively,
   no signature change to the behaviour) fields for QoS 2 inbound packet IDs,
@@ -101,4 +89,15 @@ Done in this section: reason-code literals in `handler.ex` are named via
 `MqttX.Packet.ReasonCodes`; packet-type/property-id constants have one source
 of truth each (`codec.ex` / `properties.ex` — the duplicate `types.ex` was
 removed); topic joins share `MqttX.Topic.flatten/1` (which is wildcard-aware,
-unlike the `Enum.join("/")` calls it replaced).
+unlike the `Enum.join("/")` calls it replaced); wildcard retained-message
+match on subscribe no longer folds the whole table through Elixir —
+`MqttX.Server.RetainedStore` keys rows by segment list in an `:ordered_set`
+and compiles each filter to an ETS match spec, so a literal prefix bounds the
+traversal (the `$`-guard and size cap moved there too, deduplicating
+`handler.ex` and `will_delay.ex`); outbound PUBLISH routes through the router
+— the handler keeps a per-connection `MqttX.Server.Router`, `handle_info`
+publish-tuples fan out through `Router.match/3` with per-subscription opts
+applied (granted-QoS cap, retain-as-published, no_local via a `:publisher`
+opt, subscription identifiers), retained-on-subscribe carries the
+subscription identifier, and CONNACK now advertises
+`subscription_identifier_available: 1`.

@@ -297,6 +297,13 @@ Phoenix.PubSub.broadcast(MyApp.PubSub, "client:device-123",
   {:downlink, "device-123/cmd", "reboot"})
 ```
 
+When the topic matches one of the client's subscriptions, the delivery honors
+that subscription's options: QoS is capped at the granted QoS, `retain` is
+forwarded only for Retain-As-Published subscriptions, and subscription
+identifiers are attached. Pass `publisher: originating_client_id` in the opts
+to honor `no_local`. A publish matching no subscription is sent exactly as
+given.
+
 ### MQTT 5.0 persistent sessions (resume after disconnect)
 
 In MQTT 5.0 the client tells the broker how long to keep its session via
@@ -443,7 +450,7 @@ All 15 packet types are supported:
 
 Fully compliant with MQTT 3.1, 3.1.1, and 5.0 specifications:
 
-- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_handling), server keepalive override
+- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_as_published, retain_handling, subscription identifiers), server keepalive override
 - **Client**: server_keep_alive override, assigned_client_identifier, maximum_packet_size enforcement, server_reference handling, enhanced AUTH (multi-step), flow control (receive_maximum)
 
 Validated against Mosquitto (104 automated protocol tests across TCP and WebSocket) and EMQX Cloud (49 interop tests covering all QoS levels, properties, session persistence, and subscription options).
@@ -459,7 +466,7 @@ Validated against Mosquitto (104 automated protocol tests across TCP and WebSock
 | `receive_maximum` | `65535` | Yes (`transport_opts`) |
 | `retain_available` | `1` | No |
 | `wildcard_subscription_available` | `1` | No |
-| `subscription_identifier_available` | `0` | No |
+| `subscription_identifier_available` | `1` | No |
 | `server_keep_alive` | Not sent | Yes (`transport_opts`) |
 | `maximum_packet_size` | Not sent | Yes (`transport_opts`) |
 

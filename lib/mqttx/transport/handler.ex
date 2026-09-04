@@ -6,6 +6,7 @@ defmodule MqttX.Transport.Handler do
   # Each transport constructs a `send_fn` closure at connection time.
 
   alias MqttX.Packet.Codec
+  alias MqttX.Server.Router
   alias MqttX.Telemetry
   alias MqttX.Packet.ReasonCodes, as: RC
   import MqttX.Packet.ReasonCodes, only: [is_error_code: 1]
@@ -83,6 +84,11 @@ defmodule MqttX.Transport.Handler do
       # retain_handling=1 ("send retained only if the subscription is new",
       # §3.8.3.1) and for capping retained delivery at the granted QoS
       subscribed_filters: MapSet.new(),
+      # This connection's subscription index. Outbound publishes returned from
+      # handle_info fan out through it so the per-subscription options
+      # (granted QoS, no_local, retain_as_published, subscription_identifier)
+      # are applied to each delivery.
+      router: Router.new(),
       next_packet_id: 1,
       # Retained store cap (per listener; :infinity to disable)
       max_retained_messages:
@@ -460,7 +466,7 @@ defmodule MqttX.Transport.Handler do
 
         {:publish, topic, payload, new_handler_state} ->
           new_state =
-            send_publish(%{state | handler_state: new_handler_state}, topic, payload, %{
+            route_outbound_publish(%{state | handler_state: new_handler_state}, topic, payload, %{
               qos: 0,
               retain: false
             })
@@ -469,7 +475,12 @@ defmodule MqttX.Transport.Handler do
 
         {:publish, topic, payload, opts, new_handler_state} ->
           new_state =
-            send_publish(%{state | handler_state: new_handler_state}, topic, payload, opts)
+            route_outbound_publish(
+              %{state | handler_state: new_handler_state},
+              topic,
+              payload,
+              opts
+            )
 
           {:noreply, new_state}
 
@@ -681,7 +692,13 @@ defmodule MqttX.Transport.Handler do
 
     case handler.handle_subscribe(packet.topics, state.handler_state) do
       {:ok, granted_qos, new_handler_state} ->
-        acks = Enum.map(granted_qos, fn qos -> {:ok, qos} end)
+        # A grant of 0..2 accepts the subscription at that QoS; a reason code
+        # >= 0x80 rejects that topic (§3.9.3). Anything else is normalized to
+        # 0x80 Unspecified error — previously it crashed the SUBACK encoder.
+        # The SUBACK MUST carry exactly one code per requested filter
+        # (§3.9.3): a short grant list is padded with 0x80 (those filters are
+        # rejected, not silently ignored) and a long one is truncated.
+        acks = normalize_subscribe_grants(granted_qos, length(packet.topics), state)
 
         suback = %{
           type: :suback,
@@ -692,26 +709,56 @@ defmodule MqttX.Transport.Handler do
 
         send_packet(state, suback, state.protocol_version)
 
+        # A rejected filter is not established: it gets no retained delivery
+        # and is not added to the routing index. (A rejected RE-subscribe
+        # leaves any existing subscription for that filter intact, matching
+        # §3.8.4 — replacement applies only to accepted subscriptions.)
+        subscription_identifier = Map.get(packet.properties || %{}, :subscription_identifier)
+
         # Retained delivery must honor the GRANTED QoS (not the requested
         # one) and retain_handling=1 semantics (only for new subscriptions).
         enriched_topics =
           packet.topics
-          |> Enum.zip(granted_qos)
-          |> Enum.map(fn {sub, granted} ->
-            granted = if is_integer(granted) and granted in 0..2, do: granted, else: 0
+          |> Enum.zip(acks)
+          |> Enum.flat_map(fn
+            {sub, {:ok, granted}} ->
+              [
+                sub
+                |> Map.put(:qos, min(Map.get(sub, :qos, 0), granted))
+                |> Map.put(
+                  :already_subscribed,
+                  MapSet.member?(state.subscribed_filters, filter_key(sub))
+                )
+                |> Map.put(:subscription_identifier, subscription_identifier)
+              ]
 
-            sub
-            |> Map.put(:qos, min(Map.get(sub, :qos, 0), granted))
-            |> Map.put(
-              :already_subscribed,
-              MapSet.member?(state.subscribed_filters, filter_key(sub))
-            )
+            {_sub, {:error, _code}} ->
+              []
           end)
 
-        state = deliver_retained_messages(state, enriched_topics)
+        router =
+          Enum.reduce(enriched_topics, state.router, fn sub, router ->
+            opts = [
+              qos: sub.qos,
+              no_local: Map.get(sub, :no_local, false),
+              retain_as_published: Map.get(sub, :retain_as_published, false)
+            ]
+
+            opts =
+              if subscription_identifier,
+                do: opts ++ [subscription_identifier: subscription_identifier],
+                else: opts
+
+            # The flattened binary form (not the decoded segment list) so
+            # Router.subscribe parses $share/... into a shared-group entry —
+            # and so it matches the binary the UNSUBSCRIBE path removes
+            Router.subscribe(router, filter_key(sub), state.client_id, opts)
+          end)
+
+        state = deliver_retained_messages(%{state | router: router}, enriched_topics)
 
         subscribed =
-          Enum.reduce(packet.topics, state.subscribed_filters, fn sub, acc ->
+          Enum.reduce(enriched_topics, state.subscribed_filters, fn sub, acc ->
             MapSet.put(acc, filter_key(sub))
           end)
 
@@ -765,7 +812,18 @@ defmodule MqttX.Transport.Handler do
             MapSet.delete(acc, filter_key(topic))
           end)
 
-        {:ok, %{state | handler_state: new_handler_state, subscribed_filters: subscribed}}
+        router =
+          Enum.reduce(packet.topics, state.router, fn topic, router ->
+            Router.unsubscribe(router, filter_key(topic), state.client_id)
+          end)
+
+        {:ok,
+         %{
+           state
+           | handler_state: new_handler_state,
+             subscribed_filters: subscribed,
+             router: router
+         }}
 
       {:disconnect, reason_code, new_handler_state} ->
         send_disconnect(state, reason_code, %{})
@@ -1389,6 +1447,85 @@ defmodule MqttX.Transport.Handler do
     end
   end
 
+  # Normalize a handle_subscribe grant list into SUBACK acks — exactly one
+  # per requested filter. 0..2 accepts at that QoS; an error reason code
+  # (§2.4, via is_error_code/1) rejects; anything else becomes 0x80. For
+  # pre-5 clients the only failure return code is 0x80 (v3.1.1 §3.9.3), so
+  # v5-only codes are collapsed to it on the wire.
+  defp normalize_subscribe_grants(granted_qos, topic_count, state) do
+    if length(granted_qos) != topic_count do
+      Logger.warning(
+        "[MqttX.Transport] handle_subscribe returned #{length(granted_qos)} grants " <>
+          "for #{topic_count} filters (client #{inspect(state.client_id)}) — " <>
+          "missing grants are rejected with 0x80"
+      )
+    end
+
+    granted_qos
+    |> Enum.concat(Stream.duplicate(RC.unspecified_error(), topic_count))
+    |> Enum.take(topic_count)
+    |> Enum.map(fn
+      qos when qos in [0, 1, 2] ->
+        {:ok, qos}
+
+      code when is_integer(code) and is_error_code(code) and code <= 0xFF ->
+        if state.protocol_version == 5,
+          do: {:error, code},
+          else: {:error, RC.unspecified_error()}
+
+      _ ->
+        {:error, RC.unspecified_error()}
+    end)
+  end
+
+  # Fan an application-initiated publish (a handle_info return value) out
+  # through this connection's subscription index, applying each matching
+  # subscription's options: QoS capped at the granted QoS (§3.8.4), the
+  # retain flag forwarded only when the subscription set Retain As Published
+  # (§3.3.1.3), no_local suppression against `opts[:publisher]` (§3.8.3.1),
+  # and Subscription Identifiers attached (§3.3.4).
+  #
+  # A publish matching no subscription is sent as-is — the historical
+  # contract, kept for brokers that make delivery decisions themselves.
+  defp route_outbound_publish(state, topic, payload, opts) do
+    publisher = Map.get(opts, :publisher)
+    opts = Map.delete(opts, :publisher)
+
+    case Router.match(state.router, topic, publisher) do
+      [] ->
+        if publisher != nil and Router.match(state.router, topic) != [] do
+          # Every matching subscription was no_local with respect to the
+          # publisher — suppress rather than fall back to a direct send.
+          state
+        else
+          send_publish(state, topic, payload, opts)
+        end
+
+      matches ->
+        # At most one entry for normal subscriptions (Router collapses per
+        # client), plus one per matching shared group.
+        Enum.reduce(matches, state, fn {_client, sub_opts}, st ->
+          qos = min(Map.get(opts, :qos, 0), Map.get(sub_opts, :qos, 0))
+
+          # `&&`, not `and`: the codec accepts any truthy retain (retain: 1),
+          # and the no-match fallback tolerates it, so this path must too
+          retain =
+            !!(Map.get(opts, :retain, false) && Map.get(sub_opts, :retain_as_published, false))
+
+          properties = Map.get(opts, :properties, %{})
+
+          properties =
+            case List.wrap(Map.get(sub_opts, :subscription_identifier)) do
+              [] -> properties
+              [id] -> Map.put(properties, :subscription_identifier, id)
+              ids -> Map.put(properties, :subscription_identifier, ids)
+            end
+
+          send_publish(st, topic, payload, %{qos: qos, retain: retain, properties: properties})
+        end)
+    end
+  end
+
   # Send PUBLISH packet to client. QoS > 0 sends are gated on the client's
   # advertised Receive Maximum (§3.3.4): excess messages queue and drain as
   # acks free capacity, instead of flooding constrained clients.
@@ -1512,7 +1649,7 @@ defmodule MqttX.Transport.Handler do
       receive_maximum: state.server_receive_maximum,
       retain_available: 1,
       wildcard_subscription_available: 1,
-      subscription_identifier_available: 0
+      subscription_identifier_available: 1
     }
 
     props =
@@ -1740,41 +1877,19 @@ defmodule MqttX.Transport.Handler do
   end
 
   # Handle retained message storage
-  # Store (or clear, for empty payloads) a retained message. Runs only after
-  # the user handler accepted the publish. The store is bounded by
-  # :max_retained_messages (existing topics can always be overwritten).
-  defp store_retained_message(%{payload: payload} = packet, state)
-       when payload in [nil, <<>>] do
-    :ets.delete(state.retained_table, normalize_topic_key(packet.topic))
-    :ok
-  end
-
+  # Runs only after the user handler accepted the publish. Storage rules
+  # (empty-payload clear, :max_retained_messages cap, expiry bookkeeping)
+  # live in MqttX.Server.RetainedStore.
   defp store_retained_message(packet, state) do
-    table = state.retained_table
-    topic_key = normalize_topic_key(packet.topic)
-    max = state.max_retained_messages
-
-    if max && not :ets.member(table, topic_key) && :ets.info(table, :size) >= max do
-      Logger.warning(
-        "[MqttX.Transport] Retained store full (#{max} topics) — dropping retained message for #{inspect(topic_key)}"
-      )
-
-      :ok
-    else
-      normalized_list = MqttX.Topic.normalize(topic_key)
-      timestamp = System.system_time(:second)
-      expiry_interval = Map.get(packet.properties || %{}, :message_expiry_interval)
-
-      :ets.insert(
-        table,
-        {topic_key, normalized_list, packet.payload, packet.qos, timestamp, expiry_interval}
-      )
-
-      :ok
-    end
+    MqttX.Server.RetainedStore.store(
+      state.retained_table,
+      packet.topic,
+      packet.payload,
+      packet.qos,
+      Map.get(packet, :properties),
+      state.max_retained_messages
+    )
   end
-
-  defp normalize_topic_key(topic), do: MqttX.Topic.flatten(topic)
 
   # Deliver retained messages matching subscribed topics. State is threaded so
   # we can allocate packet IDs from the real next_packet_id counter rather than
@@ -1783,101 +1898,14 @@ defmodule MqttX.Transport.Handler do
   defp deliver_retained_messages(state, topics) do
     now = System.system_time(:second)
 
-    normalized_subs =
-      Enum.map(topics, fn sub ->
-        filter = get_topic_filter(sub)
-        normalized = MqttX.Topic.normalize(filter)
-        {sub, normalized}
+    Enum.reduce(topics, state, fn sub, st ->
+      matches = MqttX.Server.RetainedStore.match(st.retained_table, get_topic_filter(sub))
+
+      Enum.reduce(matches, st, fn {topic, payload, qos, timestamp, expiry_interval}, st ->
+        send_retained(st, topic, payload, qos, timestamp, expiry_interval, sub, now)
       end)
-
-    {exact_subs, wildcard_subs} =
-      Enum.split_with(normalized_subs, fn {_sub, normalized} ->
-        not Enum.any?(normalized, fn seg -> seg == :single_level or seg == :multi_level end)
-      end)
-
-    {state, expired_keys} =
-      Enum.reduce(exact_subs, {state, []}, fn {sub, _normalized}, {st, exp_acc} ->
-        topic_key = sub |> get_topic_filter() |> MqttX.Topic.flatten()
-
-        case :ets.lookup(st.retained_table, topic_key) do
-          [{^topic_key, _norm_list, payload, qos, timestamp, expiry_interval}] ->
-            if expired?(timestamp, expiry_interval, now) do
-              {st, [topic_key | exp_acc]}
-            else
-              {send_retained(st, topic_key, payload, qos, timestamp, expiry_interval, sub, now),
-               exp_acc}
-            end
-
-          [{^topic_key, payload, qos, timestamp, expiry_interval}] ->
-            if expired?(timestamp, expiry_interval, now) do
-              {st, [topic_key | exp_acc]}
-            else
-              {send_retained(st, topic_key, payload, qos, timestamp, expiry_interval, sub, now),
-               exp_acc}
-            end
-
-          [{^topic_key, payload, qos}] ->
-            {send_retained(st, topic_key, payload, qos, nil, nil, sub, now), exp_acc}
-
-          [] ->
-            {st, exp_acc}
-        end
-      end)
-
-    {state, expired_keys} =
-      if wildcard_subs == [] do
-        {state, expired_keys}
-      else
-        :ets.foldl(
-          fn entry, {st, expired_acc} ->
-            {retained_topic, normalized_topic, payload, qos, timestamp, expiry_interval} =
-              case entry do
-                {topic, norm, payload, qos, ts, exp} ->
-                  {topic, norm, payload, qos, ts, exp}
-
-                {topic, payload, qos, ts, exp} ->
-                  {topic, MqttX.Topic.normalize(topic), payload, qos, ts, exp}
-
-                {topic, payload, qos} ->
-                  {topic, MqttX.Topic.normalize(topic), payload, qos, nil, nil}
-              end
-
-            if expired?(timestamp, expiry_interval, now) do
-              {st, [retained_topic | expired_acc]}
-            else
-              st =
-                Enum.reduce(wildcard_subs, st, fn {sub, sub_normalized}, st ->
-                  if MqttX.Topic.matches?(sub_normalized, normalized_topic) do
-                    send_retained(
-                      st,
-                      retained_topic,
-                      payload,
-                      qos,
-                      timestamp,
-                      expiry_interval,
-                      sub,
-                      now
-                    )
-                  else
-                    st
-                  end
-                end)
-
-              {st, expired_acc}
-            end
-          end,
-          {state, expired_keys},
-          state.retained_table
-        )
-      end
-
-    Enum.each(expired_keys, fn key -> :ets.delete(state.retained_table, key) end)
-    state
+    end)
   end
-
-  defp expired?(nil, _, _now), do: false
-  defp expired?(_, nil, _now), do: false
-  defp expired?(ts, exp, now), do: now - ts > exp
 
   defp send_retained(state, topic, payload, qos, timestamp, expiry_interval, sub, now) do
     # retain_handling (§3.8.3.1): 2 = never send on subscribe;
@@ -1902,6 +1930,14 @@ defmodule MqttX.Transport.Handler do
         if remaining_expiry,
           do: %{message_expiry_interval: remaining_expiry},
           else: %{}
+
+      # §3.3.2.3.8: retained messages sent on subscribe carry the
+      # subscription's Subscription Identifier, if the SUBSCRIBE had one
+      properties =
+        case Map.get(sub, :subscription_identifier) do
+          nil -> properties
+          id -> Map.put(properties, :subscription_identifier, id)
+        end
 
       # Route through send_publish so QoS > 0 retained deliveries are tracked
       # in the in-flight maps (retransmission, PUBREC/PUBACK matching) and

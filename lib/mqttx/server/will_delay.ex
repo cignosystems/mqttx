@@ -93,40 +93,19 @@ defmodule MqttX.Server.WillDelay do
     # ask first and store the retained entry only if the handler accepted it.
     result = ctx.handler.handle_publish(will.topic, will.payload, opts, ctx.handler_state)
 
+    # The store honors the listener's retained cap — a delayed Will must not
+    # be a way around it (existing topics can always be overwritten).
     if will.retain and match?({:ok, _}, result) do
-      store_retained(
+      MqttX.Server.RetainedStore.store(
+        ctx.retained_table,
         will.topic,
         will.payload,
         will.qos,
         will_props,
-        ctx.retained_table,
         Map.get(ctx, :max_retained_messages)
       )
     end
 
     result
   end
-
-  defp store_retained(topic, <<>>, _qos, _props, table, _max) do
-    :ets.delete(table, topic_key(topic))
-    :ok
-  end
-
-  defp store_retained(topic, payload, qos, props, table, max) do
-    key = topic_key(topic)
-
-    # Honor the listener's retained-store cap — a delayed Will must not be a
-    # way around it (existing topics can always be overwritten).
-    if max && not :ets.member(table, key) && :ets.info(table, :size) >= max do
-      :ok
-    else
-      normalized_list = MqttX.Topic.normalize(key)
-      timestamp = System.system_time(:second)
-      expiry_interval = Map.get(props || %{}, :message_expiry_interval)
-      :ets.insert(table, {key, normalized_list, payload, qos, timestamp, expiry_interval})
-      :ok
-    end
-  end
-
-  defp topic_key(topic), do: MqttX.Topic.flatten(topic)
 end

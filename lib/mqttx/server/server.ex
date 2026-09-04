@@ -145,10 +145,13 @@ defmodule MqttX.Server do
   @doc """
   Handle a SUBSCRIBE request.
 
-  Returns the list of granted QoS values for each topic.
+  Returns one grant per requested topic, in order: `0`, `1`, or `2` accepts
+  the subscription at that QoS; a reason code `>= 0x80` (e.g. `0x87` Not
+  authorized) rejects that topic in the SUBACK — the rejected filter gets no
+  retained delivery and is not added to the connection's routing index.
   """
   @callback handle_subscribe([subscribe_topic()], state()) ::
-              {:ok, [0 | 1 | 2], state()}
+              {:ok, [0 | 1 | 2 | reason_code()], state()}
               | {:disconnect, reason_code(), state()}
               | {:disconnect, reason_code(), map(), state()}
 
@@ -207,6 +210,23 @@ defmodule MqttX.Server do
   - `{:disconnect, reason_code, state}` - Send DISCONNECT and close connection
   - `{:disconnect, reason_code, properties, state}` - Send DISCONNECT with properties and close
   - `{:stop, reason, state}` - Close the connection
+
+  ## Publish routing
+
+  A `{:publish, ...}` return is matched against the client's subscriptions,
+  and each matching subscription's options are applied to the delivery:
+
+  - QoS is capped at the granted QoS (§3.8.4)
+  - the `retain` opt is forwarded only if the subscription set
+    Retain As Published; otherwise the flag is cleared (§3.3.1.3)
+  - the subscription's Subscription Identifier(s) are attached (§3.3.4)
+  - pass `publisher: originating_client_id` in `opts` to honor `no_local`
+    subscriptions: delivery is suppressed when the originating client is this
+    client (§3.8.3.1). The key is stripped before sending.
+
+  A publish that matches none of the client's subscriptions is sent as-is
+  (QoS and retain taken verbatim from `opts`), preserving the behavior of
+  releases before 0.12 for brokers that make delivery decisions themselves.
   """
   @callback handle_info(message :: term(), state()) ::
               {:ok, state()}

@@ -98,15 +98,7 @@ defmodule MqttX.Transport.Ranch do
   end
 
   defp create_retained_table(port) do
-    table_name = :"mqttx_ranch_retained_#{port}"
-
-    case :ets.whereis(table_name) do
-      :undefined ->
-        :ets.new(table_name, [:named_table, :public, :set])
-
-      _ref ->
-        table_name
-    end
+    MqttX.Server.RetainedStore.create_table(:"mqttx_ranch_retained_#{port}")
   end
 
   @impl MqttX.Transport

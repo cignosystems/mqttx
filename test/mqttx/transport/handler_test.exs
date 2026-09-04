@@ -189,7 +189,7 @@ defmodule MqttX.Transport.HandlerTest do
 
   setup do
     {:ok, agent} = Agent.start_link(fn -> [] end)
-    retained_table = :ets.new(:handler_test_retained, [:public, :set])
+    retained_table = MqttX.Server.RetainedStore.new_table()
     send_fn = fn data -> send(self(), {:sent, data}) end
 
     {:ok, agent: agent, retained_table: retained_table, send_fn: send_fn}
@@ -1554,7 +1554,9 @@ defmodule MqttX.Transport.HandlerTest do
       assert connack.type == :connack
       assert connack.properties.retain_available == true
       assert connack.properties.wildcard_subscription_available == true
-      assert connack.properties.subscription_identifier_available == false
+      # Supported since outbound publishes route through the subscription
+      # index (MqttX.Server.Router)
+      assert connack.properties.subscription_identifier_available == true
     end
   end
 
@@ -1566,7 +1568,7 @@ defmodule MqttX.Transport.HandlerTest do
       # Insert a retained message
       :ets.insert(
         ctx.retained_table,
-        {"rh/topic", ["rh", "topic"], "retained-payload", 0, System.system_time(:second), nil}
+        {["rh", "topic"], "rh/topic", "retained-payload", 0, System.system_time(:second), nil}
       )
 
       # Subscribe with retain_handling: 2 (don't send retained)
@@ -1595,7 +1597,7 @@ defmodule MqttX.Transport.HandlerTest do
       # Insert a retained message
       :ets.insert(
         ctx.retained_table,
-        {"rh0/topic", ["rh0", "topic"], "retained-payload", 0, System.system_time(:second), nil}
+        {["rh0", "topic"], "rh0/topic", "retained-payload", 0, System.system_time(:second), nil}
       )
 
       # Subscribe with retain_handling: 0 (send retained)
@@ -1615,6 +1617,351 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, {pub, <<>>}} = Codec.decode(5, IO.iodata_to_binary(pub_data))
       assert pub.type == :publish
       assert pub.payload == "retained-payload"
+    end
+  end
+
+  describe "outbound publish routing (per-subscription options)" do
+    defp subscribe_v5(state, topics, properties \\ %{}) do
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :subscribe,
+          packet_id: 10,
+          topics: topics,
+          properties: properties
+        })
+
+      {:ok, state} = Proto.handle_data(data, state)
+      # Drop the SUBACK (and any retained deliveries) from the mailbox
+      drain_mailbox()
+      state
+    end
+
+    defp info_publish(state, topic, payload, opts) do
+      {:noreply, state} = Proto.handle_info({:send_publish, topic, payload, opts}, state)
+      state
+    end
+
+    defp decode_last_publish do
+      assert_received {:sent, data}
+      {:ok, {pub, <<>>}} = Codec.decode(5, IO.iodata_to_binary(data))
+      assert pub.type == :publish
+      pub
+    end
+
+    test "QoS is capped at the granted QoS of the matching subscription", ctx do
+      state = connect_publisher_v5(ctx, "route-qos")
+      drain_mailbox()
+      state = subscribe_v5(state, [%{topic: "cap/t", qos: 0}])
+
+      info_publish(state, "cap/t", "hi", %{qos: 1, retain: false})
+
+      pub = decode_last_publish()
+      assert pub.qos == 0
+      assert pub.packet_id == nil
+    end
+
+    test "retain is forwarded only when the subscription set retain_as_published", ctx do
+      state = connect_publisher_v5(ctx, "route-rap")
+      drain_mailbox()
+
+      state =
+        subscribe_v5(state, [
+          %{topic: "rap/on", qos: 0, retain_as_published: true},
+          %{topic: "rap/off", qos: 0, retain_as_published: false}
+        ])
+
+      info_publish(state, "rap/on", "x", %{qos: 0, retain: true})
+      assert decode_last_publish().retain == true
+
+      info_publish(state, "rap/off", "x", %{qos: 0, retain: true})
+      assert decode_last_publish().retain == false
+    end
+
+    test "no_local suppresses delivery when opts[:publisher] is this client", ctx do
+      state = connect_publisher_v5(ctx, "route-nl")
+      drain_mailbox()
+      state = subscribe_v5(state, [%{topic: "nl/t", qos: 0, no_local: true}])
+
+      info_publish(state, "nl/t", "own", %{qos: 0, retain: false, publisher: "route-nl"})
+      refute_received {:sent, _}
+
+      info_publish(state, "nl/t", "other", %{qos: 0, retain: false, publisher: "someone-else"})
+      assert decode_last_publish().payload == "other"
+    end
+
+    test "subscription identifiers of all matching subscriptions are attached", ctx do
+      state = connect_publisher_v5(ctx, "route-ids")
+      drain_mailbox()
+
+      state = subscribe_v5(state, [%{topic: "ids/#", qos: 0}], %{subscription_identifier: 1})
+      state = subscribe_v5(state, [%{topic: "ids/leaf", qos: 0}], %{subscription_identifier: 9})
+
+      info_publish(state, "ids/leaf", "x", %{qos: 0, retain: false})
+
+      pub = decode_last_publish()
+      ids = pub.properties.subscription_identifier
+      assert Enum.sort(List.wrap(ids)) == [1, 9]
+    end
+
+    test "a publish matching no subscription is sent as-is (historical contract)", ctx do
+      state = connect_publisher_v5(ctx, "route-fallback")
+      drain_mailbox()
+
+      info_publish(state, "unsubscribed/t", "x", %{qos: 1, retain: true})
+
+      pub = decode_last_publish()
+      assert pub.qos == 1
+      assert is_integer(pub.packet_id)
+      assert pub.retain == true
+    end
+
+    test "UNSUBSCRIBE removes the subscription's options from routing", ctx do
+      state = connect_publisher_v5(ctx, "route-unsub")
+      drain_mailbox()
+      state = subscribe_v5(state, [%{topic: "unsub/t", qos: 0}])
+
+      # Capped while subscribed
+      info_publish(state, "unsub/t", "x", %{qos: 1, retain: false})
+      assert decode_last_publish().qos == 0
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :unsubscribe,
+          packet_id: 11,
+          topics: ["unsub/t"],
+          properties: %{}
+        })
+
+      {:ok, state} = Proto.handle_data(data, state)
+      drain_mailbox()
+
+      # Falls back to a direct send once no subscription matches
+      info_publish(state, "unsub/t", "x", %{qos: 1, retain: false})
+      assert decode_last_publish().qos == 1
+    end
+
+    test "a rejected subscription (SUBACK failure code) is not routed and gets no retained delivery",
+         ctx do
+      defmodule RejectSecondSubHandler do
+        use MqttX.Server
+
+        @impl true
+        def init(_opts), do: %{}
+        @impl true
+        def handle_connect(_client_id, _credentials, state), do: {:ok, state}
+        @impl true
+        def handle_subscribe(topics, state) do
+          # Grant the first topic, reject any others with 0x87 Not authorized
+          {:ok,
+           Enum.with_index(topics)
+           |> Enum.map(fn
+             {t, 0} -> t.qos
+             {_t, _} -> 0x87
+           end), state}
+        end
+
+        @impl true
+        def handle_disconnect(_reason, _state), do: :ok
+      end
+
+      {:ok, state} =
+        Proto.init(RejectSecondSubHandler, [], ctx.retained_table, nil, ctx.send_fn)
+
+      {:ok, state} = Proto.handle_data(connect_packet_v5("route-reject"), state)
+      drain_mailbox()
+
+      :ets.insert(
+        ctx.retained_table,
+        {["denied", "t"], "denied/t", "secret", 0, System.system_time(:second), nil}
+      )
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :subscribe,
+          packet_id: 12,
+          topics: [%{topic: "ok/t", qos: 0}, %{topic: "denied/t", qos: 0}],
+          properties: %{}
+        })
+
+      {:ok, _state} = Proto.handle_data(data, state)
+
+      assert_received {:sent, suback_data}
+      {:ok, {suback, <<>>}} = Codec.decode(5, IO.iodata_to_binary(suback_data))
+      assert suback.type == :suback
+
+      # No retained PUBLISH for the rejected filter
+      refute_received {:sent, _}
+    end
+
+    test "a shared subscription is routed (and unsubscribable) via its group entry", ctx do
+      state = connect_publisher_v5(ctx, "route-shared")
+      drain_mailbox()
+      state = subscribe_v5(state, [%{topic: "$share/g/jobs/#", qos: 0}])
+
+      # The shared filter must match its REAL topics (not a literal "$share"
+      # trie path), so the granted-QoS cap applies
+      info_publish(state, "jobs/t1", "x", %{qos: 1, retain: false})
+      assert decode_last_publish().qos == 0
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :unsubscribe,
+          packet_id: 14,
+          topics: ["$share/g/jobs/#"],
+          properties: %{}
+        })
+
+      {:ok, state} = Proto.handle_data(data, state)
+      drain_mailbox()
+
+      # Cleanly removed: falls back to a direct send
+      info_publish(state, "jobs/t1", "x", %{qos: 1, retain: false})
+      assert decode_last_publish().qos == 1
+    end
+
+    test "a non-boolean truthy retain value does not crash routing", ctx do
+      state = connect_publisher_v5(ctx, "route-retain-1")
+      drain_mailbox()
+      state = subscribe_v5(state, [%{topic: "trap/t", qos: 0, retain_as_published: true}])
+
+      info_publish(state, "trap/t", "x", %{qos: 0, retain: 1})
+      assert decode_last_publish().retain == true
+    end
+
+    test "retained delivery on subscribe carries the subscription identifier", ctx do
+      state = connect_publisher_v5(ctx, "route-ret-id")
+      drain_mailbox()
+
+      :ets.insert(
+        ctx.retained_table,
+        {["retid", "t"], "retid/t", "v", 0, System.system_time(:second), nil}
+      )
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :subscribe,
+          packet_id: 13,
+          topics: [%{topic: "retid/#", qos: 0}],
+          properties: %{subscription_identifier: 42}
+        })
+
+      {:ok, _state} = Proto.handle_data(data, state)
+
+      assert_received {:sent, _suback}
+      pub = decode_last_publish()
+      assert pub.payload == "v"
+      assert pub.retain == true
+      assert pub.properties.subscription_identifier == 42
+    end
+  end
+
+  describe "SUBACK grant normalization" do
+    defmodule RejectAllSubHandler do
+      use MqttX.Server
+
+      @impl true
+      def init(_opts), do: %{}
+      @impl true
+      def handle_connect(_client_id, _credentials, state), do: {:ok, state}
+      @impl true
+      def handle_subscribe(topics, state), do: {:ok, Enum.map(topics, fn _ -> 0x87 end), state}
+      @impl true
+      def handle_disconnect(_reason, _state), do: :ok
+    end
+
+    defmodule ShortGrantHandler do
+      use MqttX.Server
+
+      @impl true
+      def init(_opts), do: %{}
+      @impl true
+      def handle_connect(_client_id, _credentials, state), do: {:ok, state}
+      @impl true
+      def handle_subscribe(_topics, state), do: {:ok, [0], state}
+      @impl true
+      def handle_disconnect(_reason, _state), do: :ok
+    end
+
+    test "v5-only reason codes are collapsed to 0x80 for a v3.1.1 client", ctx do
+      {:ok, state} = Proto.init(RejectAllSubHandler, [], ctx.retained_table, nil, ctx.send_fn)
+
+      connect = %{
+        type: :connect,
+        protocol_version: 4,
+        client_id: "v4-reject",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
+      }
+
+      {:ok, data} = Codec.encode(4, connect)
+      {:ok, state} = Proto.handle_data(data, state)
+      drain_mailbox()
+
+      {:ok, data} =
+        Codec.encode(4, %{
+          type: :subscribe,
+          packet_id: 20,
+          topics: [%{topic: "a/t", qos: 0}],
+          properties: %{}
+        })
+
+      {:ok, _state} = Proto.handle_data(data, state)
+
+      assert_received {:sent, suback_data}
+      {:ok, {suback, <<>>}} = Codec.decode(4, IO.iodata_to_binary(suback_data))
+      assert suback.type == :suback
+      # v3.1.1 §3.9.3: the only failure return code is 0x80 — 0x87 must not leak
+      assert [{:error, 0x80}] = suback.acks
+    end
+
+    test "a v5 client receives the specific rejection code", ctx do
+      {:ok, state} = Proto.init(RejectAllSubHandler, [], ctx.retained_table, nil, ctx.send_fn)
+      {:ok, state} = Proto.handle_data(connect_packet_v5("v5-reject"), state)
+      drain_mailbox()
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :subscribe,
+          packet_id: 21,
+          topics: [%{topic: "a/t", qos: 0}],
+          properties: %{}
+        })
+
+      {:ok, _state} = Proto.handle_data(data, state)
+
+      assert_received {:sent, suback_data}
+      {:ok, {suback, <<>>}} = Codec.decode(5, IO.iodata_to_binary(suback_data))
+      assert [{:error, 0x87}] = suback.acks
+    end
+
+    test "a short grant list is padded with 0x80 so the SUBACK stays valid", ctx do
+      {:ok, state} = Proto.init(ShortGrantHandler, [], ctx.retained_table, nil, ctx.send_fn)
+      {:ok, state} = Proto.handle_data(connect_packet_v5("short-grant"), state)
+      drain_mailbox()
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :subscribe,
+          packet_id: 22,
+          topics: [%{topic: "a/t", qos: 0}, %{topic: "b/t", qos: 1}],
+          properties: %{}
+        })
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:ok, _state} = Proto.handle_data(data, state)
+        end)
+
+      assert log =~ "returned 1 grants for 2 filters"
+
+      assert_received {:sent, suback_data}
+      {:ok, {suback, <<>>}} = Codec.decode(5, IO.iodata_to_binary(suback_data))
+      # One code per requested filter (§3.9.3): the granted one, then 0x80
+      assert [{:ok, 0}, {:error, 0x80}] = suback.acks
     end
   end
 
@@ -1810,7 +2157,7 @@ defmodule MqttX.Transport.HandlerTest do
 
     test "takeover is scoped per listener — a different retained table does not evict", ctx do
       _incumbent = connect_client_v5(ctx, "scoped-id")
-      other_table = :ets.new(:other_listener_retained, [:public, :set])
+      other_table = MqttX.Server.RetainedStore.new_table()
       parent = self()
 
       spawn_link(fn ->
@@ -1925,7 +2272,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       :ets.insert(
         ctx.retained_table,
-        {"rh1/topic", ["rh1", "topic"], "retained-1", 0, System.system_time(:second), nil}
+        {["rh1", "topic"], "rh1/topic", "retained-1", 0, System.system_time(:second), nil}
       )
 
       sub = %{
@@ -1951,7 +2298,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       :ets.insert(
         ctx.retained_table,
-        {"rh1e/topic", ["rh1e", "topic"], "retained-1", 0, System.system_time(:second), nil}
+        {["rh1e", "topic"], "rh1e/topic", "retained-1", 0, System.system_time(:second), nil}
       )
 
       sub = %{

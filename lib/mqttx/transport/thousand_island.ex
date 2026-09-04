@@ -117,16 +117,7 @@ defmodule MqttX.Transport.ThousandIsland do
   end
 
   defp create_retained_table(port) do
-    table_name = :"mqttx_retained_#{port}"
-
-    case :ets.whereis(table_name) do
-      :undefined ->
-        :ets.new(table_name, [:named_table, :public, :set])
-
-      _ref ->
-        # Table already exists, return the name
-        table_name
-    end
+    MqttX.Server.RetainedStore.create_table(:"mqttx_retained_#{port}")
   end
 
   @impl MqttX.Transport

@@ -103,6 +103,14 @@ Servers are *per-connection* state machines — `state` is one device's state.
 For app-wide state (subscriber registry, message bus), use Phoenix.PubSub or
 `:pg` from inside the callbacks.
 
+A `{:publish, topic, payload, opts, state}` return from `handle_info` is
+matched against the device's subscriptions (since 0.12): QoS is capped at the
+granted QoS, `retain` is forwarded only for Retain-As-Published
+subscriptions, subscription identifiers are attached, and passing
+`publisher: client_id` in `opts` honors `no_local`. A publish matching no
+subscription is still sent as-is. `handle_subscribe` may reject individual
+topics by granting a reason code `>= 0x80` (e.g. `0x87`) instead of a QoS.
+
 ## Idiomatic patterns
 
 ### Receive messages on the client

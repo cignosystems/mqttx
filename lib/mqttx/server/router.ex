@@ -105,14 +105,20 @@ defmodule MqttX.Server.Router do
     extra_opts = Keyword.drop(opts, [:qos])
     client_opts = Map.put(Map.new(extra_opts), :qos, qos)
 
-    # Insert into trie
+    # Insert into trie (a resubscribe replaces the stored opts, §3.8.4)
     trie = trie_insert(router.trie, normalized, client, client_opts)
 
-    # Track in by_client index
+    # Track in by_client index — a resubscribe must not duplicate the entry
+    # or inflate the count
+    entry = {:normal, normalized}
     client_entries = Map.get(router.by_client, client, [])
-    by_client = Map.put(router.by_client, client, [{:normal, normalized} | client_entries])
 
-    %{router | trie: trie, by_client: by_client, count: router.count + 1}
+    if entry in client_entries do
+      %{router | trie: trie}
+    else
+      by_client = Map.put(router.by_client, client, [entry | client_entries])
+      %{router | trie: trie, by_client: by_client, count: router.count + 1}
+    end
   end
 
   defp subscribe_shared(router, group, topic_filter, client, opts) do
@@ -131,18 +137,32 @@ defmodule MqttX.Server.Router do
         # Create new group
         %{filter: normalized, members: [{client, member_opts}], index: 0},
         fn existing_group ->
-          # Add client to existing group if not already a member
+          # A resubscribe replaces the member's opts in place (§3.8.4) —
+          # membership order is preserved so round-robin is unaffected
           if Enum.any?(existing_group.members, fn {c, _} -> c == client end) do
-            existing_group
+            members =
+              Enum.map(existing_group.members, fn
+                {^client, _old_opts} -> {client, member_opts}
+                other -> other
+              end)
+
+            %{existing_group | members: members}
           else
             %{existing_group | members: existing_group.members ++ [{client, member_opts}]}
           end
         end
       )
 
-    # Track in by_client index
+    # Track in by_client index — a resubscribe must not duplicate the entry
+    entry = {:shared, group, normalized}
     client_entries = Map.get(router.by_client, client, [])
-    by_client = Map.put(router.by_client, client, [{:shared, group, normalized} | client_entries])
+
+    by_client =
+      if entry in client_entries do
+        router.by_client
+      else
+        Map.put(router.by_client, client, [entry | client_entries])
+      end
 
     %{router | shared_groups: shared_groups, by_client: by_client}
   end
@@ -288,16 +308,14 @@ defmodule MqttX.Server.Router do
   def match(router, topic, publisher \\ nil) do
     normalized = normalize_topic(topic)
 
-    # Get regular subscription matches via trie traversal. A client with
-    # several overlapping subscriptions gets ONE delivery at the maximum
-    # matching QoS (§3.3.4), not an arbitrary one.
+    # no_local is filtered per subscription BEFORE collapsing (§3.8.3.1): the
+    # client must still receive the message via any matching subscription
+    # without no_local, even when a higher-QoS no_local one also matches.
     regular_matches =
-      trie_match(router.trie, normalized)
-      |> Enum.group_by(fn {client, _opts} -> client end)
-      |> Enum.map(fn {_client, entries} ->
-        Enum.max_by(entries, fn {_c, opts} -> Map.get(opts, :qos, 0) end)
-      end)
+      router.trie
+      |> trie_match(normalized)
       |> filter_no_local(publisher)
+      |> collapse_per_client()
 
     # Get shared subscription matches (one per group, round-robin)
     shared_matches =
@@ -330,16 +348,12 @@ defmodule MqttX.Server.Router do
   def match_and_advance(router, topic, publisher \\ nil) do
     normalized = normalize_topic(topic)
 
-    # Get regular subscription matches via trie traversal. A client with
-    # several overlapping subscriptions gets ONE delivery at the maximum
-    # matching QoS (§3.3.4), not an arbitrary one.
+    # Same per-subscription no_local-before-collapse ordering as match/3
     regular_matches =
-      trie_match(router.trie, normalized)
-      |> Enum.group_by(fn {client, _opts} -> client end)
-      |> Enum.map(fn {_client, entries} ->
-        Enum.max_by(entries, fn {_c, opts} -> Map.get(opts, :qos, 0) end)
-      end)
+      router.trie
+      |> trie_match(normalized)
       |> filter_no_local(publisher)
+      |> collapse_per_client()
 
     # Get shared subscription matches and advance indices
     {shared_matches, updated_shared_groups} =
@@ -470,7 +484,21 @@ defmodule MqttX.Server.Router do
 
   # Match a topic against the trie, collecting all matching subscribers.
   # For each segment, we branch into: exact match, :single_level, and :multi_level.
-  defp trie_match(node, []) do
+  #
+  # §4.7.2: a topic whose FIRST level starts with '$' (e.g. $SYS/...) must not
+  # be matched by filters whose first level is a wildcard — only the exact
+  # branch is taken at the root for such topics. The recursion below the first
+  # level is unrestricted (same rule as MqttX.Topic.matches?/2).
+  defp trie_match(node, [<<"$", _::binary>> = segment | rest]) do
+    case Map.get(node.children, segment) do
+      nil -> []
+      child -> trie_match_inner(child, rest)
+    end
+  end
+
+  defp trie_match(node, topic), do: trie_match_inner(node, topic)
+
+  defp trie_match_inner(node, []) do
     # Exact end of topic - collect subscribers here
     subscribers = Map.to_list(node.subscribers)
 
@@ -484,19 +512,19 @@ defmodule MqttX.Server.Router do
     subscribers ++ multi_subs
   end
 
-  defp trie_match(node, [segment | rest]) do
+  defp trie_match_inner(node, [segment | rest]) do
     # 1. Exact segment match
     exact_matches =
       case Map.get(node.children, segment) do
         nil -> []
-        child -> trie_match(child, rest)
+        child -> trie_match_inner(child, rest)
       end
 
     # 2. Single-level wildcard (+) match
     single_matches =
       case Map.get(node.children, :single_level) do
         nil -> []
-        child -> trie_match(child, rest)
+        child -> trie_match_inner(child, rest)
       end
 
     # 3. Multi-level wildcard (#) match - matches everything from here
@@ -527,6 +555,29 @@ defmodule MqttX.Server.Router do
   defp segment_key(:single_level), do: :single_level
   defp segment_key(:multi_level), do: :multi_level
   defp segment_key(segment), do: segment
+
+  # A client with several overlapping subscriptions gets ONE delivery at the
+  # maximum matching QoS (§3.3.4), not an arbitrary one. When collapsing, the
+  # Subscription Identifiers of ALL matching subscriptions are merged into a
+  # list under :subscription_identifier — §3.3.4 requires every matching
+  # subscription's identifier on a combined delivery.
+  defp collapse_per_client(matches) do
+    matches
+    |> Enum.group_by(fn {client, _opts} -> client end)
+    |> Enum.map(fn {_client, entries} ->
+      {client, opts} = Enum.max_by(entries, fn {_c, opts} -> Map.get(opts, :qos, 0) end)
+
+      ids =
+        Enum.flat_map(entries, fn {_c, o} ->
+          List.wrap(Map.get(o, :subscription_identifier))
+        end)
+
+      case ids do
+        [] -> {client, opts}
+        _ -> {client, Map.put(opts, :subscription_identifier, ids)}
+      end
+    end)
+  end
 
   # Filter out subscriptions with no_local when publisher matches subscriber
   defp filter_no_local(matches, nil), do: matches

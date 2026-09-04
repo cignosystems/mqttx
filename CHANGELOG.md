@@ -2,7 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.11.2] - 2026-08-02
+## [Unreleased]
+
+### Added
+
+- **Subscription Identifiers are now supported server-side** (MQTT 5.0
+  §3.3.2.3.8). CONNACK advertises `subscription_identifier_available: 1`;
+  identifiers arriving in SUBSCRIBE are attached to matching outbound
+  publishes — merged into one list when several of the client's
+  subscriptions match a delivery — and to retained messages delivered on
+  subscribe.
+- **`handle_subscribe/2` can reject individual topics** by returning a reason
+  code `>= 0x80` (e.g. `0x87` Not authorized) in place of a granted QoS. The
+  rejected filter is answered with that code in the SUBACK (collapsed to
+  `0x80` for pre-5 clients, whose only failure return code is `0x80`),
+  receives no retained delivery, and is not added to the routing index — an
+  existing subscription for the same filter is left intact per §3.8.4.
+  Previously a reason-code grant crashed the SUBACK encoder and took the
+  connection down. A grant list whose length differs from the requested
+  topic list is now also normalized (missing grants reject with `0x80`)
+  instead of producing a protocol-invalid SUBACK.
+- **`no_local` subscriptions are honored for broker-initiated publishes.**
+  Pass `publisher: originating_client_id` in the opts of a
+  `{:publish, topic, payload, opts, state}` return from `handle_info` and
+  delivery is suppressed on subscriptions the client made with
+  `no_local: true` when it is itself the publisher (§3.8.3.1).
+
+### Changed
+
+- **Outbound publishes from `handle_info` are routed through the client's
+  subscriptions.** Each `{:publish, ...}` return is matched against what the
+  client actually subscribed to, and the per-subscription options — granted
+  QoS cap (§3.8.4), Retain As Published (§3.3.1.3), Subscription
+  Identifiers — are applied to the delivery instead of being computed and
+  discarded. Two behavior changes when a matching subscription exists: QoS is
+  capped at the granted QoS, and the `retain` flag reaches the client only if
+  the subscription set `retain_as_published` (previously it was forwarded
+  verbatim). A publish matching none of the client's subscriptions is still
+  sent as-is, so brokers that make delivery decisions themselves are
+  unaffected.
+
+- **Wildcard retained-message delivery no longer scans the whole store.** A
+  `+`/`#` subscription used to fold every retained entry through an
+  Elixir-side match. The retained store is now an `:ordered_set` keyed by
+  topic segments, and each filter compiles to a single ETS match spec whose
+  literal prefix bounds the traversal — on a 100k-topic store, matching
+  `tenant42/+/temp` drops from ~11 ms to well under 0.1 ms. Behavior
+  (retain_handling, `$`-topic exclusion, expiry, the
+  `:max_retained_messages` cap) is unchanged. Note for hot-upgraded nodes
+  only: the in-memory table format changed, so retained messages stored by an
+  older version in a still-running BEAM are not visible to the new code;
+  a normal restart is unaffected (the store has never survived restarts).
 
 ### Added
 

@@ -62,7 +62,7 @@ end
 | `handle_auth(method, data, state)` | `{:ok, state}`, `{:continue, data, state}`, or `{:error, reason_code, state}` *(optional, MQTT 5.0 enhanced auth)* |
 | `handle_session_expired(client_id, state)` | `:ok` (optional) |
 
-Use `handle_info/2` with `{:publish, topic, payload, state}` to push messages to connected clients from external events (e.g., PubSub).
+Use `handle_info/2` with `{:publish, topic, payload, state}` to push messages to connected clients from external events (e.g., PubSub). When the topic matches one of the client's subscriptions, the delivery honors the subscription's options: QoS is capped at the granted QoS, `retain` is forwarded only if the subscription set Retain As Published, and subscription identifiers are attached. Pass `publisher: originating_client_id` in the opts to honor `no_local` subscriptions. A publish matching no subscription is sent exactly as given.
 
 Any callback that returns `{:disconnect, reason_code, state}` or `{:disconnect, reason_code, properties, state}` will send an MQTT 5.0 DISCONNECT packet to the client and close the connection.
 
@@ -341,7 +341,7 @@ For MQTT 5.0 connections, the server automatically includes these properties in 
 | `maximum_packet_size` | *(if configured)* | Max incoming packet size in bytes |
 | `retain_available` | `1` | Retained messages supported |
 | `wildcard_subscription_available` | `1` | Wildcard subscriptions supported |
-| `subscription_identifier_available` | `0` | Subscription identifiers not supported |
+| `subscription_identifier_available` | `1` | Subscription identifiers attached to routed deliveries |
 
 ### Publish Properties
 

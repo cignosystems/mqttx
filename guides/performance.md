@@ -12,10 +12,10 @@ The key bottlenecks at scale are not the number of connections, but the **hot pa
 |----------|-----------|--------------|
 | Topic matching | Every PUBLISH | Trie-based router: O(L+K) vs O(N) |
 | Packet encoding | Every outgoing packet | iodata output, zero binary copy |
-| Buffer handling | Every TCP chunk | Empty-buffer fast path |
+| Buffer handling | Every TCP chunk | Wait for the declared length; assemble once |
 | Callback dispatch | Every incoming packet | Cached `function_exported?` |
 | Flow control check | Every QoS 1/2 publish | Direct counter vs O(N) scan |
-| Retained delivery | Every SUBSCRIBE | ETS lookup for exact topics |
+| Retained delivery | Every SUBSCRIBE | ETS match spec per filter, prefix-bounded |
 
 ## Topic Router
 
@@ -57,16 +57,17 @@ For a typical 50-byte PUBLISH packet, this saves one 50-byte allocation and copy
 
 ## Buffer Handling
 
-TCP delivers data in arbitrarily-sized chunks. In the common case, a complete MQTT packet arrives in a single TCP frame and the receive buffer is empty. The optimized path:
+TCP delivers data in arbitrarily-sized chunks. In the common case a complete MQTT packet arrives in one read and the receive buffer is empty, so the read is handed straight to the decoder — no copy — and the `rest` returned by `Codec.decode` is a zero-copy sub-binary of the original data.
 
-```elixir
-buffer = case state.buffer do
-  <<>> -> data          # Common case: no copy, just use the new data
-  buf  -> buf <> data   # Partial packet pending: concat
-end
-```
+The interesting case is a packet that spans many reads. The obvious `buffer <> data` followed by a decode attempt is quadratic: decoding pattern-matches the buffer, and a binary that has been matched loses the BEAM's in-place append optimization, so every read re-copies everything buffered so far. Instead, once the fixed header of an incomplete packet has arrived its total length is known, and `MqttX.Packet.Buffer` simply collects reads (an iolist cons per read — no copy, no match) until that many bytes are in hand, then flattens and decodes exactly once. The same buffer serves the broker, the client, and the client's WebSocket frame layer.
 
-The `<<>>` match is a constant-time check. When the buffer is empty (the majority case with typical MQTT packet sizes < TCP MSS), we skip binary concatenation entirely. The `rest` returned by `Codec.decode` is already a zero-copy sub-binary reference into the original data.
+Measured on the broker, one PUBLISH arriving in 1460-byte segments (`bench/server.exs`):
+
+| Packet | `buf <> data` per read | Declared-length reassembly |
+|--------|------------------------|----------------------------|
+| 1 MiB (default `max_packet_size`) | 22 ms | 0.3 ms |
+| 4 MiB | 366 ms | 0.8 ms |
+| 16 MiB | 7.1 s | 5 ms |
 
 ## Callback Dispatch
 
@@ -98,21 +99,44 @@ The counter is incremented when sending PUBREC (QoS 2 received) and decremented 
 
 ## Retained Message Delivery
 
-When a client subscribes, the server delivers matching retained messages from ETS. The optimized approach:
+When a client subscribes, the server delivers matching retained messages from an ETS `ordered_set` keyed by the topic's segment list (`MqttX.Server.RetainedStore`).
 
-1. **Exact topic subscriptions** (no wildcards): Direct `ets.lookup/2` — O(1) per subscription.
-2. **Wildcard subscriptions**: Table scan with pre-normalized topic lists. Topic filters are normalized once before the scan, and retained messages store a pre-computed normalized list alongside the string key, avoiding `String.split/2` in the inner loop.
+1. **Exact topic subscriptions** (no wildcards): the filter *is* the key — one `ets.lookup/2`.
+2. **Wildcard subscriptions**: the filter compiles to a single ETS match spec — literal segments bound, `+` a wildcard segment, `#` a wildcard tail — so matching runs inside ETS, and a literal prefix bounds the traversal to that key range. A lone `#` is the one filter that must still visit everything.
 
-For a server with 10,000 retained messages and a client subscribing to 5 exact topics, this reduces from 50,000 comparisons (5 filters x 10,000 messages) to 5 hash lookups.
+Measured against 100,000 retained topics (`bench/server.exs`):
+
+| Filter | Hits | Time |
+|--------|------|------|
+| `tenant42/device7/temp` (exact) | 1 | 0.4 µs |
+| `tenant42/device7/#` | 10 | 2 µs |
+| `tenant42/+/temp` | 100 | 88 µs |
+| `+/device7/temp` (no literal prefix) | 100 | 2.8 ms |
+| `#` | 100,000 | 19 ms |
+
+## Measured Throughput
+
+End-to-end over loopback, MqttX client against MqttX broker, Apple M4 Pro (64 GB), Elixir 1.20 / OTP 29 — `mix run bench/e2e.exs`. One publisher; "fan-out" is one PUBLISH forwarded to 50 subscribed connections through a `handle_info` publish tuple per connection, as in the PubSub-bridge pattern. Rates are per second; QoS 1 includes the round trip for every PUBACK, with the client's default `max_inflight: 100`.
+
+| Scenario | 100 B | 4 KiB | 64 KiB |
+|----------|-------|-------|--------|
+| Uplink QoS 0, TCP | 164k msg/s | 100k msg/s (408 MB/s) | 25k msg/s (1.6 GB/s) |
+| Uplink QoS 1, TCP | 98k msg/s | 82k msg/s | 18k msg/s (1.2 GB/s) |
+| Fan-out 1 → 50, TCP | 450k deliveries/s | 425k deliveries/s (1.7 GB/s) | 117k deliveries/s (7.7 GB/s) |
+| Uplink QoS 0, WebSocket | 153k msg/s | 58k msg/s | 7k msg/s (460 MB/s) |
+| Uplink QoS 1, WebSocket | 77k msg/s | 45k msg/s | 6k msg/s |
+| Fan-out 1 → 50, WebSocket | 478k deliveries/s | 447k deliveries/s | 102k deliveries/s (6.7 GB/s) |
+
+The single-publisher uplink figures are bounded by one process doing a `GenServer.call` per publish; many publishers scale with cores. `test/mqttx/load_test.exs` (`mix test --include load`) runs the same shape with 20 concurrent QoS 1 publishers and a 1 → 20 fan-out, asserting that every message arrives exactly as often as it should and every QoS 1 publish is acknowledged.
 
 ## Capacity Planning
 
 > **Read this first.** The numbers below are derived from architectural
-> analysis and the codec benchmarks above — **not** from end-to-end load
-> tests. This project does not yet ship a load harness, so treat them as a
-> starting point for your own measurements, not as guarantees. Real capacity
-> depends on message sizes, subscription fan-out, retained-store size, TLS vs
-> plaintext, and above all the work your handler callbacks do.
+> analysis plus the codec and end-to-end measurements above, all taken on
+> one developer machine over loopback. Treat them as a starting point for
+> your own measurements with `bench/e2e.exs`, not as guarantees. Real
+> capacity depends on message sizes, subscription fan-out, retained-store
+> size, TLS vs plaintext, and above all the work your handler callbacks do.
 
 ### Per-device resource usage
 

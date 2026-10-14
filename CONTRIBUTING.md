@@ -17,6 +17,8 @@ Notes for humans and AI assistants modifying this library itself. If you are
 - `lib/mqttx/payload/` — pluggable payload codecs (raw / json / protobuf)
 - `test/mqttx/integration_test.exs`, `test/mqttx/interop_emqx_test.exs`,
   `test/mosquitto_validation.exs` — broker + client integration / interop suites
+- `bench/` — Benchee suites (`codec.exs`, `server.exs`, `e2e.exs`);
+  `test/mqttx/load_test.exs` — end-to-end load validation (`--include load`)
 
 ## Running tests
 
@@ -34,6 +36,31 @@ Notes for humans and AI assistants modifying this library itself. If you are
   Note: with default EMQX config anonymous access is allowed, so the
   "rejects wrong credentials" test is only meaningful against a broker with
   password auth enabled (set `EMQX_USERNAME`/`EMQX_PASSWORD` accordingly).
+- Load validation — many clients, many messages, real sockets; asserts
+  completeness (every message arrives exactly as often as it should, every
+  QoS 1 publish is acknowledged, nothing disconnects), not speed:
+
+  ```sh
+  mix test --include load
+  ```
+
+## Benchmarks
+
+`bench/` holds [Benchee](https://hex.pm/packages/benchee) suites (dev
+dependency). Each takes `BENCH_TIME` (seconds per scenario) and prints a
+Benchee table; `e2e.exs` adds a messages-per-second summary.
+
+```sh
+mix run bench/codec.exs      # encode/decode per packet type
+mix run bench/server.exs     # Router.match, RetainedStore.match, receive-buffer reassembly
+mix run bench/e2e.exs        # client <-> broker over loopback: uplink QoS 0/1, fan-out 1 -> N
+BENCH_TRANSPORT=ws BENCH_SUBSCRIBERS=20 mix run bench/e2e.exs
+```
+
+When a change moves a hot path, refresh the numbers in
+`guides/performance.md` from these — do not reason about them from first
+principles. Two of the fixes in 0.12 (retained-store match specs, the
+receive buffer) were quadratic paths that only showed up under measurement.
 
 ## Known test environment couplings
 

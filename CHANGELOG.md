@@ -22,6 +22,12 @@ All notable changes to this project will be documented in this file.
 - **`clean_session: true` deletes the stored session.** The
   `MqttX.Session.Store` docs promised `delete/2` on a clean start (§3.1.2.4)
   but the client never called it, leaving stale records behind.
+- **Benchmarks and an end-to-end load test.** `bench/` holds Benchee suites
+  for the codec, the router / retained store / receive buffer, and
+  client-to-broker throughput over loopback (TCP or WebSocket);
+  `mix test --include load` runs a many-client completeness check. The
+  [Performance guide](https://hexdocs.pm/mqttx/performance.html) now carries
+  measured end-to-end numbers instead of estimates.
 - **Subscription Identifiers are now supported server-side** (MQTT 5.0
   §3.3.2.3.8). CONNACK advertises `subscription_identifier_available: 1`;
   identifiers arriving in SUBSCRIBE are attached to matching outbound
@@ -87,6 +93,16 @@ All notable changes to this project will be documented in this file.
   `:timeout`. It now fails at once with `{:error, :packet_too_large}` — or
   `{:error, :frame_too_large}` for an oversized WebSocket frame — and retries
   with the usual backoff.
+
+- **Exit signals no longer reach a broker handler's `handle_info/2`.** The
+  ThousandIsland transport traps exits, so when a process the handler had
+  linked to went down — a `Registry` or Phoenix.PubSub partition (both link
+  to registrants), a `Task` — the `{:EXIT, pid, reason}` message was passed
+  to `handle_info/2`, and a handler without a catch-all clause (such as the
+  README's PubSub-bridge example) crashed with a `FunctionClauseError`. The
+  connection now does what a non-trapping process would: a `:normal` exit is
+  ignored and any other closes the connection, with `handle_disconnect/2`
+  receiving `{:linked_process_exit, reason}`. Found by the new load test.
 
 ### Security
 

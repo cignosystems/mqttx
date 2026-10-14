@@ -1856,6 +1856,63 @@ defmodule MqttX.Transport.HandlerTest do
     end
   end
 
+  describe "exit signals from linked processes" do
+    # A handler whose handle_info/2 has NO catch-all — like the README's
+    # PubSub-bridge example. An {:EXIT, ...} reaching it would raise.
+    defmodule StrictInfoHandler do
+      use MqttX.Server
+
+      @impl true
+      def init(opts), do: %{agent: Keyword.fetch!(opts, :agent)}
+      @impl true
+      def handle_connect(_client_id, _credentials, state), do: {:ok, state}
+      @impl true
+      def handle_info({:downlink, topic, payload}, state), do: {:publish, topic, payload, state}
+
+      @impl true
+      def handle_disconnect(reason, state) do
+        Agent.update(state.agent, &[{:disconnect, reason} | &1])
+        :ok
+      end
+    end
+
+    defp connect_strict(ctx, client_id) do
+      {:ok, state} =
+        Proto.init(StrictInfoHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+
+      {:ok, state} = Proto.handle_data(connect_packet_v5(client_id), state)
+      drain_mailbox()
+      state
+    end
+
+    test "a :normal exit is ignored and never reaches handle_info/2", ctx do
+      state = connect_strict(ctx, "exit-normal")
+
+      assert {:noreply, ^state} = Proto.handle_info({:EXIT, self(), :normal}, state)
+      refute_received {:sent, _}
+    end
+
+    test "an abnormal exit closes the connection like a lost link would", ctx do
+      state = connect_strict(ctx, "exit-shutdown")
+
+      assert {:stop, :normal, closed} = Proto.handle_info({:EXIT, self(), :shutdown}, state)
+      assert closed.disconnect_notified
+
+      assert [{:disconnect, {:linked_process_exit, :shutdown}}] =
+               Agent.get(ctx.agent, & &1) |> Enum.filter(&match?({:disconnect, _}, &1))
+    end
+
+    test "the application's own messages still reach handle_info/2", ctx do
+      state = connect_strict(ctx, "exit-downlink")
+
+      assert {:noreply, _} = Proto.handle_info({:downlink, "d/cmd", "go"}, state)
+      assert_received {:sent, data}
+      {:ok, {pub, <<>>}} = Codec.decode(5, IO.iodata_to_binary(data))
+      assert pub.type == :publish
+      assert pub.payload == "go"
+    end
+  end
+
   describe "SUBACK grant normalization" do
     defmodule RejectAllSubHandler do
       use MqttX.Server

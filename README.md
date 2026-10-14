@@ -667,7 +667,7 @@ multi-node deployment.
 | **MQTT 5.0 Enhanced Auth** | Partial | AUTH exchange and re-authentication implemented; no built-in SCRAM/external providers |
 | **Telemetry Docs** | Done | See the [Telemetry guide](https://hexdocs.pm/mqttx/telemetry.html) |
 | **Property-based Tests** | Done | StreamData round-trips + decode/encode fuzzing of the codec |
-| **End-to-end Load Tests** | Planned | Benchee-based throughput validation under realistic workloads |
+| **End-to-end Load Tests** | Done | Benchee suites in `bench/` (codec, router/retained/buffer, client↔broker over loopback) + `mix test --include load`; numbers in the [Performance guide](https://hexdocs.pm/mqttx/performance.html#measured-throughput) |
 
 ## License
 

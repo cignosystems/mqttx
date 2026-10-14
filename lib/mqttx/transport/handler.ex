@@ -439,27 +439,26 @@ defmodule MqttX.Transport.Handler do
       "[MqttX.Transport] Idle timeout (#{state.max_idle_timeout}ms) for #{inspect(state.client_id)}"
     )
 
-    # An idle timeout is an abnormal disconnect: publish the Will exactly once
-    # and notify the handler, mirroring the keepalive-timeout path.
-    state =
-      if state.connected and not is_nil(state.will_message) do
-        maybe_publish_will(state)
-        %{state | will_message: nil}
-      else
-        state
-      end
+    abnormal_close(state, :idle_timeout)
+  end
 
-    state =
-      if state.connected and not state.disconnect_notified and state.handler != nil do
-        state.handler.handle_disconnect(:idle_timeout, state.handler_state)
-        %{state | disconnect_notified: true}
-      else
-        state
-      end
+  # Exit signals from linked processes. The ThousandIsland transport traps
+  # exits (to run its close callbacks), so there an exit from a process the
+  # user's handler linked to — a Phoenix.PubSub or Registry partition (both
+  # link to registrants), a Task — arrives as a message instead of killing the
+  # connection as it does on the other transports. Give it the semantics a
+  # non-trapping process would have: ignore :normal, otherwise close. It is
+  # never passed to handle_info/2, whose contract is the application's own
+  # messages; a handler without a catch-all clause used to crash on it.
+  def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
 
-    if state.connected, do: maybe_start_session_expiry(state)
+  def handle_info({:EXIT, pid, reason}, state) do
+    Logger.warning(
+      "[MqttX.Transport] Linked process #{inspect(pid)} exited (#{inspect(reason)}) — " <>
+        "closing connection #{inspect(state.client_id)}"
+    )
 
-    {:stop, :normal, state}
+    abnormal_close(state, {:linked_process_exit, reason})
   end
 
   def handle_info(message, state) do
@@ -521,6 +520,31 @@ defmodule MqttX.Transport.Handler do
   end
 
   # ---------- Private functions ----------
+
+  # An abnormal disconnect decided server-side (idle ceiling, linked-process
+  # exit): publish the Will exactly once and notify the handler exactly once,
+  # mirroring the keepalive-timeout path, then stop.
+  defp abnormal_close(state, reason) do
+    state =
+      if state.connected and not is_nil(state.will_message) do
+        maybe_publish_will(state)
+        %{state | will_message: nil}
+      else
+        state
+      end
+
+    state =
+      if state.connected and not state.disconnect_notified and state.handler != nil do
+        state.handler.handle_disconnect(reason, state.handler_state)
+        %{state | disconnect_notified: true}
+      else
+        state
+      end
+
+    if state.connected, do: maybe_start_session_expiry(state)
+
+    {:stop, :normal, state}
+  end
 
   # Process incoming data buffer
   defp process_buffer(buffer, state) do

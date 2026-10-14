@@ -227,6 +227,10 @@ defmodule MqttX.Server do
   A publish that matches none of the client's subscriptions is sent as-is
   (QoS and retain taken verbatim from `opts`), preserving the behavior of
   releases before 0.12 for brokers that make delivery decisions themselves.
+
+  Exit signals from processes the handler linked to (`{:EXIT, pid, reason}`)
+  are not delivered here: a `:normal` exit is ignored, any other closes the
+  connection and `handle_disconnect/2` receives `{:linked_process_exit, reason}`.
   """
   @callback handle_info(message :: term(), state()) ::
               {:ok, state()}

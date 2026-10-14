@@ -59,7 +59,9 @@ defmodule MqttX.MixProject do
       # Dev/test
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
-      {:stream_data, "~> 1.1", only: [:dev, :test]}
+      {:stream_data, "~> 1.1", only: [:dev, :test]},
+      # Benchmarks and load tests (bench/, `mix run bench/<name>.exs`)
+      {:benchee, "~> 1.5", only: :dev}
     ]
   end
 

@@ -529,10 +529,10 @@ Architected to scale from tens of thousands to **roughly a million concurrent de
 - **Trie-based topic router**: O(L+K) matching where L = topic depth, K = matching subscriptions — independent of total subscription count
 - **iodata encoding**: Socket sends use iodata directly, avoiding binary copies on every packet
 - **Zero-copy binary references**: Decoder returns sub-binaries for payload and topic
-- **Empty-buffer fast path**: Skips binary concatenation when the TCP buffer is empty (common case)
+- **Declared-length reassembly**: A packet spanning many TCP reads is collected without copying and assembled once — linear, where per-read concatenation was quadratic
 - **Cached callback dispatch**: `function_exported?` computed once at connection init, not per message
 - **Direct inflight counter**: O(1) flow control check instead of scanning pending_acks
-- **ETS-optimized retained delivery**: O(1) lookup for exact topic subscriptions
+- **ETS match-spec retained delivery**: Exact filters are one lookup; wildcard filters traverse only the key range their literal prefix bounds
 
 Capacity depends on hardware, so these figures are anchored to instance sizes
 rather than given as a single ceiling. Devices are the practical targets from
@@ -551,8 +551,9 @@ none of which improve with more cores — so horizontal scaling usually beats a
 larger instance. Message-rate figures assume small QoS 0 payloads, plaintext
 TCP, and a handler doing negligible work.
 
-> **These are estimates from architectural analysis and the codec benchmarks
-> below — not end-to-end load tests.** See the
+> **The device counts are estimates from architectural analysis** — nobody
+> has load-tested a million connections here. Per-message cost, on the other
+> hand, is measured end to end (below). See the
 > [Performance & Scaling guide](https://hexdocs.pm/mqttx/performance.html) for the sizing formula,
 > per-vCPU throughput, and the caveats behind each number.
 
@@ -563,6 +564,21 @@ TCP, and a handler doing negligible work.
 | PUBLISH encode | 5.05M ips | 1.72M ips | **2.9x faster** |
 | SUBSCRIBE encode | 3.42M ips | 0.82M ips | **4.2x faster** |
 | PUBLISH decode | 2.36M ips | 2.25M ips | ~same |
+
+**End-to-end, MqttX client ↔ MqttX broker over loopback** — measured on the
+same machine with `mix run bench/e2e.exs` (one publisher; fan-out is one
+PUBLISH forwarded to 50 subscribed connections):
+
+| Scenario | 100 B | 4 KiB | 64 KiB |
+|----------|-------|-------|--------|
+| Uplink QoS 0 | 164k msg/s | 100k msg/s | 25k msg/s (1.6 GB/s) |
+| Uplink QoS 1 (every PUBACK awaited) | 98k msg/s | 82k msg/s | 18k msg/s |
+| Fan-out 1 → 50 | 450k deliveries/s | 425k deliveries/s | 117k deliveries/s (7.7 GB/s) |
+
+WebSocket figures, the receive-buffer and retained-store measurements, and
+how to run the suites yourself are in
+[Measured Throughput](https://hexdocs.pm/mqttx/performance.html#measured-throughput);
+`mix test --include load` runs a many-client completeness check.
 
 The performance guide also covers [VM tuning](https://hexdocs.pm/mqttx/performance.html#vm-tuning) (`+P`/`+Q`
 limits, which you *must* raise past 65K connections), OS tuning, and

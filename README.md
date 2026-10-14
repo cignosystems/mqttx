@@ -169,10 +169,16 @@ the broker through the tunnel:
 {:ok, client} = MqttX.Client.connect(
   host: "localhost",
   client_id: "persistent_client",
+  protocol_version: 5,
   clean_session: false,          # maintain session across reconnects
+  connect_properties: %{session_expiry_interval: 3600},  # v5 default is 0 = ends at disconnect
   session_store: MqttX.Session.ETSStore  # built-in ETS store
 )
 ```
+
+The stored record carries `expires_at` from the negotiated Session Expiry
+Interval; an expired record is discarded on the next connect and the ETS store
+sweeps expired records periodically.
 
 ### Packet Codec (Standalone)
 

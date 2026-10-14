@@ -57,12 +57,6 @@ ordered roughly by ratio of impact to effort.
 
 ### Larger (each ~day-plus)
 
-- **Persistent session store + expiry sweep.** `MqttX.Session.Store` covers
-  CRUD on `subscriptions`, `pending_messages`, `packet_id`. Add (additively,
-  no signature change to the behaviour) fields for QoS 2 inbound packet IDs,
-  Will message + delay, session expiry timestamp. Spawn a sweeper that calls
-  `delete/2` for expired sessions. Pre-existing comment in `ets_store.ex`
-  explicitly notes lack of restart durability.
 - **Server-side receive buffer iolist.** `handler.ex:handle_data/2` accumulates
   incoming bytes via `buf <> data` — O(n²) on fragmented large packets. Same
   pattern in `connection.ex:handle_info({:tcp, …})`. Switch to iolist
@@ -100,4 +94,11 @@ publish-tuples fan out through `Router.match/3` with per-subscription opts
 applied (granted-QoS cap, retain-as-published, no_local via a `:publisher`
 opt, subscription identifiers), retained-on-subscribe carries the
 subscription identifier, and CONNACK now advertises
-`subscription_identifier_available: 1`.
+`subscription_identifier_available: 1`; the persisted client session carries
+`expires_at`/`saved_at` from the negotiated Session Expiry Interval, an
+expired record is discarded on load, `MqttX.Session.ETSOwner` sweeps every
+table it owns, and a clean start calls `delete/2` as the store contract
+always said (QoS 2 inbound ids were already persisted as `{:rx, id}`
+entries; Will message + delay are server-side session state, which this
+broker does not keep — see the README roadmap row for server-side session
+persistence).

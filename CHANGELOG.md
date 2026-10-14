@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Session records expire.** `MqttX.Client` now tracks the negotiated
+  Session Expiry Interval (CONNECT property, overridden by CONNACK per
+  §3.2.2.3.2, revisable on DISCONNECT per §3.14.2.2.2) and writes
+  `expires_at` and `saved_at` into the persisted session (additive — older
+  records and custom stores are unaffected). An expired record is discarded
+  on load instead of replaying stale in-flight QoS 1/2 state against a
+  broker that already dropped the session, and `MqttX.Session.ETSStore`
+  sweeps expired records on an interval (`sweep_expired/2` to run one on
+  demand; `config :mqttx, session_sweep_interval: ms` to tune). MQTT 3.1.1
+  sessions and `0xFFFFFFFF` never expire. Note the MQTT 5.0 default interval
+  is 0, so a v5 client that wants its session to outlive a disconnect must
+  send `connect_properties: %{session_expiry_interval: n}` — this was always
+  true broker-side; the local record now agrees.
+- **`clean_session: true` deletes the stored session.** The
+  `MqttX.Session.Store` docs promised `delete/2` on a clean start (§3.1.2.4)
+  but the client never called it, leaving stale records behind.
 - **Subscription Identifiers are now supported server-side** (MQTT 5.0
   §3.3.2.3.8). CONNACK advertises `subscription_identifier_available: 1`;
   identifiers arriving in SUBSCRIBE are attached to matching outbound

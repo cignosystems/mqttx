@@ -123,4 +123,43 @@ defmodule MqttX.Session.StoreTest do
       assert loaded2 == client2_data
     end
   end
+
+  describe "expiry sweep" do
+    setup do
+      table_name = :"session_sweep_#{:erlang.unique_integer([:positive])}"
+      {:ok, state} = ETSStore.init(table: table_name)
+      {:ok, state: state, table: table_name}
+    end
+
+    test "sweep_expired/2 deletes only records whose expires_at has passed",
+         %{state: state, table: table} do
+      now = 1_000_000
+
+      :ok = ETSStore.save("expired", %{packet_id: 1, expires_at: now - 1}, state)
+      :ok = ETSStore.save("expiring-now", %{packet_id: 2, expires_at: now}, state)
+      :ok = ETSStore.save("future", %{packet_id: 3, expires_at: now + 1}, state)
+      :ok = ETSStore.save("never", %{packet_id: 4, expires_at: nil}, state)
+      :ok = ETSStore.save("legacy", %{packet_id: 5}, state)
+
+      assert ETSStore.sweep_expired(table, now) == 2
+
+      assert :not_found = ETSStore.load("expired", state)
+      assert :not_found = ETSStore.load("expiring-now", state)
+      assert {:ok, _} = ETSStore.load("future", state)
+      assert {:ok, _} = ETSStore.load("never", state)
+      assert {:ok, _} = ETSStore.load("legacy", state)
+    end
+
+    test "ETSOwner sweeps every table it owns", %{state: state} do
+      past = System.system_time(:second) - 60
+      :ok = ETSStore.save("stale", %{packet_id: 1, expires_at: past}, state)
+      :ok = ETSStore.save("fresh", %{packet_id: 2, expires_at: past + 3_600}, state)
+
+      # Tables created through ETSStore.init/1 are registered with the owner
+      assert MqttX.Session.ETSOwner.sweep_now() >= 1
+
+      assert :not_found = ETSStore.load("stale", state)
+      assert {:ok, _} = ETSStore.load("fresh", state)
+    end
+  end
 end

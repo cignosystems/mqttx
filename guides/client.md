@@ -168,6 +168,8 @@ For QoS 1/2 reliability across reconnects, disable clean sessions and provide a 
 
 The built-in `MqttX.Session.ETSStore` persists for the lifetime of the BEAM VM. Implement the `MqttX.Session.Store` behaviour for custom backends (Redis, database, etc.).
 
+Persisted records carry `expires_at`, derived from the MQTT 5.0 Session Expiry Interval you send in `connect_properties` (the broker's CONNACK value wins if it sends one, and a `disconnect/2` with `properties: %{session_expiry_interval: n}` revises it). With MQTT 5.0 the interval defaults to `0` — the session ends at disconnect — so pass `connect_properties: %{session_expiry_interval: seconds}` (or `0xFFFFFFFF` for never) if you want it to survive. MQTT 3.1.1 sessions never expire locally. An expired record is discarded on the next connect instead of replaying stale in-flight state, and the ETS store sweeps expired records every 60 seconds (`config :mqttx, session_sweep_interval: ms`).
+
 ## Receiving Messages
 
 Pass a `:handler` module that implements `handle_mqtt_event/3` to process incoming messages and lifecycle events:

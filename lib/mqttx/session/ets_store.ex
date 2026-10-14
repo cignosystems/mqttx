@@ -28,6 +28,13 @@ defmodule MqttX.Session.ETSStore do
         session_store: {MqttX.Session.ETSStore, table: :my_sessions}
       )
 
+  ## Expiry
+
+  Records carry `expires_at` (see `MqttX.Session.Store`). `MqttX.Session.ETSOwner`
+  sweeps every table it owns on an interval (default 60s, configurable with
+  `config :mqttx, session_sweep_interval: ms`), deleting expired records;
+  `sweep_expired/2` runs the same sweep on demand.
+
   ## Limitations
 
   - Sessions are lost when the BEAM VM restarts
@@ -74,5 +81,19 @@ defmodule MqttX.Session.ETSStore do
   def delete(client_id, %{table: table}) do
     :ets.delete(table, client_id)
     :ok
+  end
+
+  @doc """
+  Delete every session in `table` whose `expires_at` is at or before `now`
+  (unix seconds). Returns the number of sessions deleted.
+
+  Records without an integer `expires_at` (pre-5 sessions, `0xFFFFFFFF`, or
+  records written before expiry was tracked) are never swept.
+  """
+  @spec sweep_expired(atom() | :ets.tid(), integer()) :: non_neg_integer()
+  def sweep_expired(table, now \\ System.system_time(:second)) do
+    :ets.select_delete(table, [
+      {{:_, %{expires_at: :"$1"}}, [{:is_integer, :"$1"}, {:"=<", :"$1", now}], [true]}
+    ])
   end
 end

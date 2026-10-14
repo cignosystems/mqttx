@@ -92,6 +92,11 @@ defmodule MqttX.Client.Connection do
     :will,
     # CONNECT properties (MQTT 5.0: session_expiry_interval, topic_alias_maximum, etc.)
     connect_properties: %{},
+    # Negotiated Session Expiry Interval in seconds (§3.1.2.11.2): the CONNECT
+    # value, overridden by CONNACK (§3.2.2.3.2) and revisable on DISCONNECT
+    # (§3.14.2.2.2). nil = never expires (pre-5 clients, or 0xFFFFFFFF).
+    # Drives `expires_at` on the persisted session record.
+    session_expiry_interval: nil,
     # HTTP CONNECT proxy: [host:, port:, auth: {user, pass}] or nil (direct)
     proxy: nil,
     transport: :tcp,
@@ -301,13 +306,19 @@ defmodule MqttX.Client.Connection do
     # Initialize session store if configured
     {session_store, session_store_state} = init_session_store(Keyword.get(opts, :session_store))
 
-    # Load existing session if not clean_session
+    # Load existing session if not clean_session; a clean start discards any
+    # previously saved record (§3.1.2.4) — the store contract promises delete/2
+    # is called here.
     {packet_id, pending_acks, subscriptions} =
       if not clean_session and session_store do
         load_session(client_id, session_store, session_store_state)
       else
+        if session_store, do: discard_session(client_id, session_store, session_store_state)
         {1, %{}, %{}}
       end
+
+    protocol_version = Keyword.get(opts, :protocol_version, 5)
+    connect_properties = Keyword.get(opts, :connect_properties, %{})
 
     handler = Keyword.get(opts, :handler)
 
@@ -322,7 +333,7 @@ defmodule MqttX.Client.Connection do
       keepalive: Keyword.get(opts, :keepalive, @default_keepalive),
       handler: handler,
       handler_state: Keyword.get(opts, :handler_state),
-      protocol_version: Keyword.get(opts, :protocol_version, 5),
+      protocol_version: protocol_version,
       transport: transport,
       ssl_opts: Keyword.get(opts, :ssl_opts, []),
       ws_path: Keyword.get(opts, :ws_path, "/mqtt"),
@@ -343,7 +354,8 @@ defmodule MqttX.Client.Connection do
       pending_acks: pending_acks,
       max_inflight: Keyword.get(opts, :max_inflight, @default_max_inflight),
       will: build_will(opts),
-      connect_properties: Keyword.get(opts, :connect_properties, %{}),
+      connect_properties: connect_properties,
+      session_expiry_interval: initial_session_expiry(protocol_version, connect_properties),
       # Code.ensure_loaded?/1 first: in dev/iex the handler module may simply
       # not be loaded yet, and a bare function_exported?/3 would silently
       # classify it as callback-less, discarding every event forever.
@@ -611,6 +623,14 @@ defmodule MqttX.Client.Connection do
     end
 
     close_socket(state)
+    # §3.14.2.2.2: the client may revise its Session Expiry Interval on
+    # DISCONNECT — record it before the final save so expires_at is right
+    state = %{
+      state
+      | session_expiry_interval:
+          Map.get(properties, :session_expiry_interval, state.session_expiry_interval)
+    }
+
     save_session(state)
     {:stop, :normal, %{state | connected: false, socket: nil}}
   end
@@ -1093,6 +1113,9 @@ defmodule MqttX.Client.Connection do
         receive_maximum: Map.get(props, :receive_maximum, 65535),
         server_maximum_packet_size: Map.get(props, :maximum_packet_size),
         server_topic_alias_maximum: Map.get(props, :topic_alias_maximum, 0),
+        # §3.2.2.3.2: a Session Expiry Interval in CONNACK replaces ours
+        session_expiry_interval:
+          Map.get(props, :session_expiry_interval, state.session_expiry_interval),
         topic_to_alias: %{},
         next_alias: 1,
         alias_to_topic: %{}
@@ -1899,8 +1922,47 @@ defmodule MqttX.Client.Connection do
     init_session_store({module, []})
   end
 
+  # v5 defaults the Session Expiry Interval to 0 (session ends at network
+  # disconnect, §3.1.2.11.2); pre-5 sessions have no expiry of their own.
+  defp initial_session_expiry(5, connect_properties),
+    do: Map.get(connect_properties || %{}, :session_expiry_interval, 0)
+
+  defp initial_session_expiry(_version, _connect_properties), do: nil
+
+  # 0xFFFFFFFF means the session never expires (§3.1.2.11.2)
+  @session_never_expires 0xFFFFFFFF
+
+  defp session_expires_at(nil, _now), do: nil
+  defp session_expires_at(@session_never_expires, _now), do: nil
+  defp session_expires_at(interval, now) when is_integer(interval), do: now + interval
+  defp session_expires_at(_other, _now), do: nil
+
+  defp discard_session(client_id, store, store_state) do
+    case store.delete(client_id, store_state) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[MqttX.Client] Failed to delete persisted session for #{inspect(client_id)}: #{inspect(reason)}"
+        )
+    end
+  end
+
   defp load_session(client_id, store, store_state) do
+    now = System.system_time(:second)
+
     case store.load(client_id, store_state) do
+      {:ok, %{expires_at: expires_at}} when is_integer(expires_at) and expires_at <= now ->
+        # The broker has (or is entitled to have) discarded this session, so
+        # replaying its in-flight QoS 1/2 state would be wrong — start fresh.
+        Logger.info(
+          "[MqttX.Client] Persisted session for #{inspect(client_id)} expired — starting fresh"
+        )
+
+        discard_session(client_id, store, store_state)
+        {1, %{}, %{}}
+
       {:ok, session} ->
         packet_id = Map.get(session, :packet_id, 1)
         pending_acks = Map.get(session, :pending_acks, %{})
@@ -1969,10 +2031,17 @@ defmodule MqttX.Client.Connection do
 
   defp save_session(state) do
     if not is_nil(state.session_store) and not state.clean_session do
+      now = System.system_time(:second)
+
       session = %{
         packet_id: state.packet_id,
         pending_acks: state.pending_acks,
-        subscriptions: state.subscriptions
+        subscriptions: state.subscriptions,
+        saved_at: now,
+        # The broker's expiry clock starts at network disconnect; computing
+        # from the save instant is conservative (never later than the real
+        # expiry) so a stale record is dropped rather than replayed.
+        expires_at: session_expires_at(state.session_expiry_interval, now)
       }
 
       # session_key, not client_id: the store is keyed by what we configured, so

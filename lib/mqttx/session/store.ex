@@ -12,13 +12,38 @@ defmodule MqttX.Session.Store do
 
   ## Session Data Structure
 
-  Sessions are stored as maps with the following structure:
+  Sessions are opaque maps written by `MqttX.Client`; a store only needs to
+  round-trip them. The fields (all additive — older records lacking a key
+  load fine):
 
       %{
-        subscriptions: [%{topic: "sensor/#", qos: 1}],
-        pending_messages: [%{packet_id: 1, topic: "...", payload: "..."}],
-        packet_id: 42
+        # next packet identifier to allocate
+        packet_id: 42,
+        # granted subscriptions, replayed after a reconnect with
+        # session_present=false
+        subscriptions: %{"sensors/#" => %{spec: %{qos: 1}, properties: %{}}},
+        # in-flight QoS 1/2 state, outbound ({:tx, id}) AND inbound QoS 2
+        # ({:rx, id}) so neither side of a handshake is lost across restarts
+        pending_acks: %{{:tx, 1} => %{...}, {:rx, 7} => %{...}},
+        # unix seconds the record was written
+        saved_at: 1_756_600_000,
+        # unix seconds after which the broker may have discarded the session
+        # (from the negotiated Session Expiry Interval); nil = never
+        expires_at: 1_756_603_600
       }
+
+  ## Expiry
+
+  `expires_at` is derived from the MQTT 5.0 Session Expiry Interval —
+  the CONNECT property, overridden by CONNACK, revisable on DISCONNECT.
+  Pre-5 sessions and `0xFFFFFFFF` never expire (`nil`). The client discards
+  (and deletes) an expired record on load rather than replaying stale
+  in-flight state against a broker that already dropped the session.
+
+  `MqttX.Session.ETSStore` sweeps expired records periodically. A custom
+  store is expected to do the same in whatever way suits its backend
+  (a TTL, a scheduled `DELETE WHERE expires_at <= now`, …); nothing in the
+  client enumerates sessions, so the behaviour has no sweep callback.
 
   ## Usage
 
@@ -73,9 +98,11 @@ defmodule MqttX.Session.Store do
 
   @type client_id :: binary()
   @type session :: %{
-          subscriptions: [%{topic: binary(), qos: 0 | 1 | 2}],
-          pending_messages: [map()],
-          packet_id: non_neg_integer()
+          optional(:packet_id) => non_neg_integer(),
+          optional(:subscriptions) => %{binary() => map()},
+          optional(:pending_acks) => %{{:tx | :rx, non_neg_integer()} => map()},
+          optional(:saved_at) => integer(),
+          optional(:expires_at) => integer() | nil
         }
   @type state :: term()
 

@@ -26,7 +26,7 @@ jobs:
           - elixir: '1.20'
             otp: '29'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup Elixir
         uses: erlef/setup-beam@v1
@@ -35,7 +35,7 @@ jobs:
           otp-version: ${{ matrix.otp }}
 
       - name: Cache deps
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: deps
           key: deps-${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
@@ -53,11 +53,18 @@ jobs:
       - name: Run tests
         run: mix test
 
+      # Excluded from `mix test` by tag (see test/test_helper.exs): many
+      # clients and messages over real sockets, asserting completeness. Runs
+      # on every matrix pair because socket behaviour is where OTP versions
+      # differ.
+      - name: Run load test
+        run: mix test --include load test/mqttx/load_test.exs
+
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup Elixir
         uses: erlef/setup-beam@v1
@@ -66,14 +73,14 @@ jobs:
           otp-version: '29'
 
       - name: Cache deps
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: deps
           key: deps-${{ runner.os }}-29-1.20-${{ hashFiles('**/mix.lock') }}
           restore-keys: deps-${{ runner.os }}-29-1.20-
 
       - name: Cache PLT
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: _build/dev/*.plt
           key: plt-${{ runner.os }}-29-1.20-${{ hashFiles('**/mix.lock') }}
@@ -91,7 +98,7 @@ jobs:
     needs: [test, dialyzer]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup Elixir
         uses: erlef/setup-beam@v1
@@ -100,7 +107,7 @@ jobs:
           otp-version: '29'
 
       - name: Cache deps
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: deps
           key: deps-${{ runner.os }}-29-1.20-${{ hashFiles('**/mix.lock') }}

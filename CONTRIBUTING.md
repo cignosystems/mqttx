@@ -5,7 +5,8 @@ Notes for humans and AI assistants modifying this library itself. If you are
 
 ## Repo layout shortcuts
 
-- `lib/mqttx/packet/` — wire codec (`codec.ex`, `properties.ex`, `varint.ex`, `types.ex`)
+- `lib/mqttx/packet/` — wire codec (`codec.ex`, `properties.ex`, `varint.ex`) and `buffer.ex`, the receive-side
+  reassembly buffer shared by the broker handler and the client
 - `lib/mqttx/topic.ex` — topic validation, normalization, wildcard matching, shared subs
 - `lib/mqttx/transport/handler.ex` — per-connection broker state machine (~1900 LoC, big file)
 - `lib/mqttx/server/` — broker pieces: `server.ex`, `router.ex`, `retained_store.ex`, `rate_limiter.ex`, `will_delay.ex`
@@ -55,13 +56,6 @@ ordered roughly by ratio of impact to effort.
   cancels by client_id within a single BEAM. For a clustered setup, the cancel
   must be broadcast (Phoenix.PubSub or `:pg`).
 
-### Larger (each ~day-plus)
-
-- **Server-side receive buffer iolist.** `handler.ex:handle_data/2` accumulates
-  incoming bytes via `buf <> data` — O(n²) on fragmented large packets. Same
-  pattern in `connection.ex:handle_info({:tcp, …})`. Switch to iolist
-  accumulation with `IO.iodata_to_binary/1` only at decode time.
-
 ### API-changing (worth a deliberate minor bump)
 
 - **Payload codec PFI / content-type wiring.** `MqttX.Payload` callbacks are
@@ -101,4 +95,9 @@ table it owns, and a clean start calls `delete/2` as the store contract
 always said (QoS 2 inbound ids were already persisted as `{:rx, id}`
 entries; Will message + delay are server-side session state, which this
 broker does not keep — see the README roadmap row for server-side session
-persistence).
+persistence); receive-side reassembly is linear — `MqttX.Packet.Buffer` waits
+for a packet's declared length and flattens once instead of `buf <> data` plus
+a decode attempt per read (which re-copied the whole buffer every time), used
+by `handler.ex`, the client's TCP/TLS path and its WebSocket frame buffer;
+the client now applies `:max_packet_size` to every packet, not just the first
+in a read.

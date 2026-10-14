@@ -70,6 +70,46 @@ All notable changes to this project will be documented in this file.
   older version in a still-running BEAM are not visible to the new code;
   a normal restart is unaffected (the store has never survived restarts).
 
+### Fixed
+
+- **Receiving a large packet across many reads was quadratic.** Both the
+  broker and the client appended each read to the buffer and re-attempted a
+  decode, which re-copied everything buffered so far on every read. A packet
+  now waits for the length its fixed header declares and is assembled once:
+  measured on the broker, a 1 MiB packet (the default limit) arriving in
+  1460-byte segments drops from ~22 ms of CPU to ~0.3 ms, and a 16 MiB one —
+  reachable with a raised `max_packet_size` — from ~7 s to ~5 ms. The same
+  change applies to the client over TCP/TLS and to its WebSocket frame
+  buffer.
+- **An over-limit packet during the client handshake stalled `connect`.**
+  The connection was torn down but left marked as connecting, so
+  `await_connect: true` waited out the 5 s handshake deadline and reported
+  `:timeout`. It now fails at once with `{:error, :packet_too_large}` — or
+  `{:error, :frame_too_large}` for an oversized WebSocket frame — and retries
+  with the usual backoff.
+
+### Security
+
+- **A fragmented WebSocket message had no size limit in the client.** A
+  single frame was capped at 16 MiB, but continuation frames were appended to
+  the message being reassembled without bound. A broker — or anyone on the
+  path of a plain `ws://` connection — could start a message and send
+  non-final fragments forever, growing the client's memory until the VM ran
+  out. `:max_packet_size` could not stop it, because nothing reaches the MQTT
+  layer until the final fragment arrives. A reassembled message is now held
+  to the same 16 MiB ceiling as a single frame; exceeding it closes the
+  connection with `{:protocol_error, :message_too_large}`. One consequence:
+  an MQTT packet over 16 MiB could previously arrive over WebSocket if the
+  broker fragmented it, and is now refused — as it already was when sent as
+  a single frame.
+- **The client enforced `:max_packet_size` only on the first packet of each
+  read.** A packet over the limit that arrived behind another one in the same
+  read was decoded and delivered to the handler, and an over-limit header in
+  that position was kept until more data arrived instead of closing the
+  connection. The declared length of every packet is now checked.
+
+## [0.11.2] - 2026-08-02
+
 ### Added
 
 - **`MqttX.Packet.ReasonCodes`** — named constants for the MQTT 5.0 reason

@@ -34,6 +34,7 @@ defmodule MqttX.Client.Connection do
 
   use GenServer
 
+  alias MqttX.Packet.Buffer
   alias MqttX.Packet.Codec
   alias MqttX.Client.Backoff
   alias MqttX.Telemetry
@@ -746,24 +747,26 @@ defmodule MqttX.Client.Connection do
       if state.transport in [:ws, :wss] do
         handle_ws_data(data, state)
       else
-        buffer =
-          case state.buffer do
-            <<>> -> data
-            buf -> buf <> data
-          end
-
-        %{state | buffer: buffer}
+        push_inbound(state, data)
       end
 
     state =
       cond do
-        # A frame/packet above our ceiling — tear down rather than buffer it
+        # A WebSocket frame above our ceiling — tear down rather than buffer
+        # it. During the handshake that is a failed connect, not a disconnect:
+        # protocol_error_teardown would leave `connecting` set, and the
+        # connection would sit half-open until the handshake deadline.
         state.inbound_error != nil ->
           reason = state.inbound_error
-          protocol_error_teardown(%{state | inbound_error: nil}, reason)
+          state = %{state | inbound_error: nil}
 
-        oversized_inbound?(state) ->
-          protocol_error_teardown(state, :packet_too_large)
+          if state.connecting,
+            do: connect_failed(state, reason),
+            else: protocol_error_teardown(state, reason)
+
+        # A packet of known length is still arriving — nothing to decode yet
+        Buffer.pending?(state.buffer) ->
+          state
 
         state.connecting ->
           process_connack_buffer(state)
@@ -999,7 +1002,7 @@ defmodule MqttX.Client.Connection do
   # Decode CONNACK/AUTH from the buffer while in the :connecting state.
   # Runs inside the normal handle_info loop — never a blocking receive.
   defp process_connack_buffer(state) do
-    case Codec.decode(state.protocol_version, state.buffer) do
+    case decode_inbound(state) do
       {:ok, {%{type: :connack, reason_code: 0} = connack, rest}} ->
         finalize_connection(connack, %{state | buffer: rest})
 
@@ -1041,7 +1044,7 @@ defmodule MqttX.Client.Connection do
         connect_failed(state, :protocol_error)
 
       {:error, :incomplete} ->
-        state
+        park_inbound(state)
 
       {:error, reason} ->
         connect_failed(state, reason)
@@ -1254,7 +1257,7 @@ defmodule MqttX.Client.Connection do
   end
 
   defp process_buffer(state) do
-    case Codec.decode(state.protocol_version, state.buffer) do
+    case decode_inbound(state) do
       {:ok, {packet, rest}} ->
         state = handle_packet(packet, state)
 
@@ -1267,7 +1270,7 @@ defmodule MqttX.Client.Connection do
         end
 
       {:error, :incomplete} ->
-        state
+        park_inbound(state)
 
       {:error, reason} ->
         # §4.13: a malformed packet requires closing the connection. Leaving
@@ -1277,8 +1280,30 @@ defmodule MqttX.Client.Connection do
     end
   end
 
-  # Reject a packet whose DECLARED remaining length exceeds our ceiling before
-  # the body is buffered (§3.1.2.11.4), mirroring the server-side guard.
+  # Append received MQTT bytes to the reassembly buffer. While a packet of
+  # known length is still arriving this neither copies nor re-scans what is
+  # already buffered (see MqttX.Packet.Buffer); otherwise `buffer` is left as
+  # the binary for the decode loop.
+  defp push_inbound(state, data) do
+    case Buffer.push(state.buffer, data) do
+      {:ready, binary} -> %{state | buffer: binary}
+      {:more, buffer} -> %{state | buffer: buffer}
+    end
+  end
+
+  # Decode the packet at the head of the inbound buffer, first rejecting one
+  # whose DECLARED length exceeds our ceiling (§3.1.2.11.4), mirroring the
+  # server-side guard. The check runs for every packet — and so always before
+  # an incomplete one is parked, which matters: a parked packet accumulates
+  # toward its declared length without being examined again.
+  defp decode_inbound(state) do
+    if oversized_inbound?(state) do
+      {:error, :packet_too_large}
+    else
+      Codec.decode(state.protocol_version, state.buffer)
+    end
+  end
+
   defp oversized_inbound?(%{max_packet_size: nil}), do: false
 
   defp oversized_inbound?(%{max_packet_size: max, buffer: buffer}) do
@@ -1287,6 +1312,9 @@ defmodule MqttX.Client.Connection do
       _ -> false
     end
   end
+
+  # The decoder needs more bytes: keep the tail and wait for them.
+  defp park_inbound(state), do: %{state | buffer: Buffer.stash(state.buffer)}
 
   defp reply_to_connect_waiters(%{connect_waiters: []} = state, _result), do: state
 
@@ -2096,12 +2124,28 @@ defmodule MqttX.Client.Connection do
   # buffer. Threads the fragmentation state across reads so a multi-frame
   # message split across TCP boundaries is reassembled correctly.
   defp handle_ws_data(data, state) do
-    ws_buf = state.ws_buffer <> data
+    case Buffer.push(state.ws_buffer, data) do
+      {:more, ws_buffer} ->
+        # Mid-frame: its length is known and not all of it has arrived
+        %{state | ws_buffer: ws_buffer}
 
+      {:ready, ws_buf} ->
+        decode_ws_frames(ws_buf, state)
+    end
+  end
+
+  defp decode_ws_frames(ws_buf, state) do
     case MqttX.Client.WebSocket.decode_frames(ws_buf, state.ws_frag) do
       {:error, reason} ->
-        # Oversized frame — flag for teardown by the caller
-        %{state | inbound_error: reason, ws_buffer: <<>>}
+        # Oversized frame or message — flag for teardown by the caller, and
+        # let go of whatever was accumulated rather than hold it until the
+        # next connection attempt
+        %{
+          state
+          | inbound_error: reason,
+            ws_buffer: <<>>,
+            ws_frag: MqttX.Client.WebSocket.initial_frag()
+        }
 
       {:ok, payloads, pings, rest, frag} ->
         # RFC 6455 §5.5.2: every Ping must be answered with a Pong echoing
@@ -2110,31 +2154,20 @@ defmodule MqttX.Client.Connection do
           ws_socket_send(state, MqttX.Client.WebSocket.encode_pong(ping_payload))
         end)
 
-        mqtt_data = IO.iodata_to_binary(payloads)
-
-        buffer =
-          case state.buffer do
-            <<>> -> mqtt_data
-            buf -> buf <> mqtt_data
-          end
-
-        %{state | buffer: buffer, ws_buffer: rest, ws_frag: frag}
+        # decode_frames already rejected a tail declaring more than the frame
+        # ceiling, so it is safe to wait for the tail's declared length
+        ws_buffer = Buffer.stash(rest, &MqttX.Client.WebSocket.declared_length/1)
+        state = push_inbound(state, IO.iodata_to_binary(payloads))
+        %{state | ws_buffer: ws_buffer, ws_frag: frag}
 
       {:close, payloads} ->
-        mqtt_data = IO.iodata_to_binary(payloads)
-
-        buffer =
-          case state.buffer do
-            <<>> -> mqtt_data
-            buf -> buf <> mqtt_data
-          end
-
         # Process the final payloads first; the data-handler clause tears the
         # connection down once the buffer has been drained.
+        state = push_inbound(state, IO.iodata_to_binary(payloads))
+
         %{
           state
-          | buffer: buffer,
-            ws_buffer: <<>>,
+          | ws_buffer: <<>>,
             ws_frag: MqttX.Client.WebSocket.initial_frag(),
             ws_close_pending: true
         }

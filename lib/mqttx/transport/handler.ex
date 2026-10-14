@@ -5,6 +5,7 @@ defmodule MqttX.Transport.Handler do
   # This is a pure functional module — no `use GenServer`, no framework dependency.
   # Each transport constructs a `send_fn` closure at connection time.
 
+  alias MqttX.Packet.Buffer
   alias MqttX.Packet.Codec
   alias MqttX.Server.Router
   alias MqttX.Telemetry
@@ -153,28 +154,31 @@ defmodule MqttX.Transport.Handler do
   Process incoming binary data (buffer accumulation + decode loop).
   """
   def handle_data(data, state) do
-    buffer =
-      case state.buffer do
-        <<>> -> data
-        buf -> buf <> data
-      end
-
     # Any inbound bytes count as liveness for the idle ceiling — this is
     # deliberately independent of the MQTT keepalive timer, which does not
     # run when the client negotiated keep_alive: 0.
     state = reset_idle_timer(state)
 
-    case process_buffer(buffer, state) do
-      {:ok, new_state} ->
-        {:ok, new_state}
+    case Buffer.push(state.buffer, data) do
+      {:more, buffer} ->
+        # Mid-packet: its length is known and not all of it has arrived, so
+        # there is nothing to decode. The read is kept without copying or
+        # re-scanning what is already buffered (see MqttX.Packet.Buffer).
+        {:ok, %{state | buffer: buffer}}
 
-      {:close, reason, new_state} ->
-        Logger.debug("[MqttX.Transport] Closing connection: #{inspect(reason)}")
-        {:close, reason, new_state}
+      {:ready, buffer} ->
+        case process_buffer(buffer, state) do
+          {:ok, new_state} ->
+            {:ok, new_state}
 
-      {:error, reason, new_state} ->
-        Logger.warning("[MqttX.Transport] Error: #{inspect(reason)}")
-        {:error, reason, new_state}
+          {:close, reason, new_state} ->
+            Logger.debug("[MqttX.Transport] Closing connection: #{inspect(reason)}")
+            {:close, reason, new_state}
+
+          {:error, reason, new_state} ->
+            Logger.warning("[MqttX.Transport] Error: #{inspect(reason)}")
+            {:error, reason, new_state}
+        end
     end
   end
 
@@ -543,7 +547,9 @@ defmodule MqttX.Transport.Handler do
             end
 
           {:error, :incomplete} ->
-            {:ok, %{state | buffer: buffer}}
+            # The declared length already passed the size check above (when
+            # a limit is configured), so wait for exactly that many bytes
+            {:ok, %{state | buffer: Buffer.stash(buffer)}}
 
           {:error, reason} ->
             {:error, reason, state}

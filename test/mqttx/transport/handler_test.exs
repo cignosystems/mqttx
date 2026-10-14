@@ -2,6 +2,7 @@ defmodule MqttX.Transport.HandlerTest do
   use ExUnit.Case, async: true
 
   alias MqttX.Transport.Handler, as: Proto
+  alias MqttX.Packet.Buffer
   alias MqttX.Packet.Codec
 
   defmodule TestHandler do
@@ -2112,7 +2113,148 @@ defmodule MqttX.Transport.HandlerTest do
       # declared-oversize prefix is buffered as incomplete instead of rejected
       oversized_header = <<3::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
       assert {:ok, buffering} = Proto.handle_data(oversized_header, state)
-      assert buffering.buffer == oversized_header
+      assert Buffer.pending?(buffering.buffer)
+      assert Buffer.size(buffering.buffer) == byte_size(oversized_header)
+    end
+  end
+
+  describe "fragmented delivery" do
+    defp publish_packet(topic, payload) do
+      {:ok, data} =
+        Codec.encode(4, %{
+          type: :publish,
+          topic: topic,
+          payload: payload,
+          qos: 0,
+          retain: false,
+          dup: false,
+          packet_id: nil,
+          properties: %{}
+        })
+
+      IO.iodata_to_binary(data)
+    end
+
+    # Fixed-size pieces, with whatever is left over as a short final piece
+    defp chunk(binary, size) when byte_size(binary) <= size, do: [binary]
+
+    defp chunk(binary, size) do
+      <<part::binary-size(^size), rest::binary>> = binary
+      [part | chunk(rest, size)]
+    end
+
+    defp feed(state, chunks) do
+      Enum.reduce(chunks, state, fn part, state ->
+        assert {:ok, state} = Proto.handle_data(part, state)
+        state
+      end)
+    end
+
+    defp published(ctx) do
+      ctx.agent
+      |> Agent.get(& &1)
+      |> Enum.filter(&match?({:publish, _, _}, &1))
+      |> Enum.reverse()
+    end
+
+    test "a PUBLISH split across many reads is delivered once, intact", ctx do
+      state = connect_client(ctx, "frag-big")
+      payload = :crypto.strong_rand_bytes(60_000)
+      packet = publish_packet("frag/big", payload)
+
+      {head, [last]} = packet |> chunk(1000) |> Enum.split(-1)
+      assert length(head) >= 60
+
+      state = feed(state, head)
+
+      # Mid-packet: parked, nothing delivered, nothing decoded
+      assert Buffer.pending?(state.buffer)
+      assert Buffer.size(state.buffer) == byte_size(packet) - byte_size(last)
+      assert published(ctx) == []
+
+      assert {:ok, state} = Proto.handle_data(last, state)
+      assert state.buffer == <<>>
+      assert published(ctx) == [{:publish, "frag/big", payload}]
+    end
+
+    test "byte-at-a-time delivery decodes (partial fixed header included)", ctx do
+      state = connect_client(ctx, "frag-bytes")
+      # 300 bytes needs a two-byte remaining-length varint, so the header
+      # itself arrives in pieces
+      payload = :binary.copy("p", 300)
+      packet = publish_packet("frag/bytes", payload)
+
+      state = feed(state, chunk(packet, 1))
+
+      assert state.buffer == <<>>
+      assert published(ctx) == [{:publish, "frag/bytes", payload}]
+    end
+
+    test "packets that follow the fragmented one in its final read are processed too", ctx do
+      state = connect_client(ctx, "frag-follow")
+      first = publish_packet("frag/first", :binary.copy("a", 10_000))
+      second = publish_packet("frag/second", "b")
+      third = publish_packet("frag/third", :binary.copy("c", 5_000))
+
+      <<head::binary-size(4_000), rest::binary>> = first
+      <<third_head::binary-size(100), third_rest::binary>> = third
+
+      # read 1: start of `first`; read 2: its tail + all of `second` + start
+      # of `third`; read 3: the rest of `third`
+      state = feed(state, [head, rest <> second <> third_head])
+      assert Buffer.pending?(state.buffer)
+      assert Buffer.size(state.buffer) == 100
+
+      assert [{:publish, "frag/first", _}, {:publish, "frag/second", "b"}] = published(ctx)
+
+      state = feed(state, [third_rest])
+      assert state.buffer == <<>>
+      assert [_, _, {:publish, "frag/third", third_payload}] = published(ctx)
+      assert byte_size(third_payload) == 5_000
+    end
+
+    test "the size limit holds when the oversized header itself arrives in pieces", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{max_packet_size: 64}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+
+      # PUBLISH declaring 200 remaining bytes: type, then a two-byte varint
+      assert {:ok, state} = Proto.handle_data(<<3::4, 0::4>>, state)
+      assert {:ok, state} = Proto.handle_data(<<200>>, state)
+      refute Buffer.pending?(state.buffer)
+
+      # The length is readable only now — rejected before any body arrives
+      assert {:close, :packet_too_large, closed} = Proto.handle_data(<<1>>, state)
+      assert closed.buffer == <<>>
+    end
+
+    test "an over-limit packet is never parked behind a valid one", ctx do
+      opts = [agent: ctx.agent, transport_opts: %{max_packet_size: 4_096}]
+      {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
+
+      {:ok, connect} =
+        Codec.encode(4, %{
+          type: :connect,
+          protocol_version: 4,
+          client_id: "frag-limit",
+          username: nil,
+          password: nil,
+          will: nil,
+          clean_session: true,
+          keep_alive: 0,
+          properties: %{}
+        })
+
+      {:ok, state} = Proto.handle_data(connect, state)
+
+      valid = publish_packet("frag/ok", "fine")
+      # Header only, declaring ~256 MB — the body will never arrive
+      oversized_header = <<3::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
+
+      assert {:close, :packet_too_large, closed} =
+               Proto.handle_data(valid <> oversized_header, state)
+
+      assert closed.buffer == <<>>
+      assert published(ctx) == [{:publish, "frag/ok", "fine"}]
     end
   end
 

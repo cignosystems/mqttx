@@ -24,6 +24,13 @@ defmodule MqttX.Client.WebSocket do
   # make us buffer toward it indefinitely.
   @max_frame_size 16_777_216
 
+  # The same ceiling for a whole message reassembled from fragments. Without
+  # it the per-frame limit is no limit at all: a peer can start a message and
+  # send continuation frames forever, each one small, none of them final. The
+  # MQTT `:max_packet_size` cannot catch that — nothing reaches the MQTT layer
+  # until the final fragment arrives.
+  @max_message_size @max_frame_size
+
   @doc """
   Initial fragmentation state — pass into `decode_frames/2` on first call.
   """
@@ -85,15 +92,39 @@ defmodule MqttX.Client.WebSocket do
   Returns `{:ok, payloads, pings, rest, new_frag_state}` for normal data
   frames — `pings` are the payloads of any Ping frames seen, which RFC 6455
   §5.5.2 requires answering with a matching Pong — `{:close, payloads}` if a
-  Close frame was seen, or `{:error, :frame_too_large}` if a frame declares a
-  payload above the internal ceiling. Callers that don't need to distinguish
-  fragmented messages can use `decode_frames/1` (initial state).
+  Close frame was seen, `{:error, :frame_too_large}` if a frame declares a
+  payload above the internal ceiling, or `{:error, :message_too_large}` if the
+  fragments of one message add up to more than it. Callers that don't need to
+  distinguish fragmented messages can use `decode_frames/1` (initial state).
   """
   def decode_frames(buffer), do: decode_frames(buffer, @initial_frag)
 
   def decode_frames(buffer, frag) do
     decode_frames(buffer, [], [], frag)
   end
+
+  @doc """
+  Total on-the-wire size (header + payload) the frame at the head of `buffer`
+  declares, without decoding it: `{:ok, total_bytes}` once its header has
+  arrived, `:incomplete` otherwise.
+
+  Mirrors `MqttX.Packet.Codec.declared_length/1`, so the receive buffer can
+  wait for a frame of known length instead of re-scanning on every read. A
+  frame above the size ceiling also reports `:incomplete` here — rejecting it
+  is `decode_frames/2`'s job.
+  """
+  @spec declared_length(binary()) :: {:ok, pos_integer()} | :incomplete
+  def declared_length(<<_fin_rsv_opcode, second_byte, rest::binary>> = frame) do
+    mask_bit = Bitwise.bsr(second_byte, 7)
+    len_tag = Bitwise.band(second_byte, 0x7F)
+
+    case decode_length(len_tag, mask_bit, rest) do
+      {:ok, len, _mask_key, payload} -> {:ok, byte_size(frame) - byte_size(payload) + len}
+      _ -> :incomplete
+    end
+  end
+
+  def declared_length(_), do: :incomplete
 
   defp decode_frames(buffer, acc, pings, {frag_buf, frag_type} = frag) do
     case decode_one_frame(buffer) do
@@ -112,12 +143,17 @@ defmodule MqttX.Client.WebSocket do
 
       # Middle fragment (FIN=0, opcode=continuation 0x00)
       {:ok, :fragment_middle, payload, rest} ->
-        decode_frames(rest, acc, pings, {frag_buf <> payload, frag_type})
+        case append_fragment(frag_buf, payload) do
+          {:ok, frag_buf} -> decode_frames(rest, acc, pings, {frag_buf, frag_type})
+          :too_large -> {:error, :message_too_large}
+        end
 
       # Final fragment (FIN=1, opcode=continuation 0x00)
       {:ok, :fragment_end, payload, rest} ->
-        complete = frag_buf <> payload
-        decode_frames(rest, [complete | acc], pings, @initial_frag)
+        case append_fragment(frag_buf, payload) do
+          {:ok, complete} -> decode_frames(rest, [complete | acc], pings, @initial_frag)
+          :too_large -> {:error, :message_too_large}
+        end
 
       # Standalone complete data frame (FIN=1, opcode=binary|text)
       {:ok, type, payload, rest} when type in [:binary, :text] ->
@@ -130,6 +166,14 @@ defmodule MqttX.Client.WebSocket do
         {:ok, Enum.reverse(acc), Enum.reverse(pings), buffer, frag}
     end
   end
+
+  # Checked before appending, so an over-limit message is refused without
+  # first being assembled.
+  defp append_fragment(frag_buf, payload)
+       when byte_size(frag_buf) + byte_size(payload) > @max_message_size,
+       do: :too_large
+
+  defp append_fragment(frag_buf, payload), do: {:ok, frag_buf <> payload}
 
   defp decode_one_frame(<<fin::1, _rsv::3, opcode::4, second_byte, rest::binary>>) do
     mask_bit = Bitwise.bsr(second_byte, 7)

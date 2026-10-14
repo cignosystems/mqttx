@@ -233,12 +233,17 @@ defmodule MqttX.Client do
   - `:properties` - PUBLISH properties map (MQTT 5.0), e.g.
     `%{message_expiry_interval: 60, response_topic: "replies/1",
     correlation_data: "req-42", user_properties: [{"k", "v"}]}`
+  - `:codec` - a `MqttX.Payload` module, e.g. `MqttX.Payload.JSON`. `payload`
+    is then a term: it is encoded with the codec, and the codec's
+    `payload_format_indicator` / `content_type` are added to `:properties`
+    (explicit properties win). An encoding failure returns
+    `{:error, {:codec, reason}}`.
 
   `:ok` means the packet was written to the socket; for QoS 1/2 the
   broker's acknowledgment is tracked in the background (rejections surface
   via `handle_mqtt_event(:publish_error, {topic, packet_id, reason_code}, state)`).
   """
-  @spec publish(pid(), binary(), binary(), keyword()) :: :ok | {:error, term()}
+  @spec publish(pid(), binary(), term(), keyword()) :: :ok | {:error, term()}
   def publish(client, topic, payload, opts \\ []) do
     Connection.publish(client, topic, payload, opts)
   end

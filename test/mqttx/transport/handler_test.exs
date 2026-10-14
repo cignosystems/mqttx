@@ -1820,6 +1820,55 @@ defmodule MqttX.Transport.HandlerTest do
       assert decode_last_publish().qos == 1
     end
 
+    test "a :codec in the publish tuple encodes the payload and sets its properties", ctx do
+      state = connect_publisher_v5(ctx, "route-codec")
+      drain_mailbox()
+      state = subscribe_v5(state, [%{topic: "codec/t", qos: 1}])
+
+      info_publish(state, "codec/t", %{temp: 21.5}, %{
+        qos: 1,
+        retain: false,
+        codec: MqttX.Payload.JSON,
+        properties: %{message_expiry_interval: 30}
+      })
+
+      pub = decode_last_publish()
+      assert pub.payload == ~s({"temp":21.5})
+      assert pub.properties.payload_format_indicator == true
+      assert pub.properties.content_type == "application/json"
+      assert pub.properties.message_expiry_interval == 30
+      assert pub.qos == 1
+    end
+
+    test "a :codec also applies on the no-subscription fallback path", ctx do
+      state = connect_publisher_v5(ctx, "route-codec-fallback")
+      drain_mailbox()
+
+      info_publish(state, "nosub/t", [1, 2, 3], %{
+        qos: 0,
+        retain: false,
+        codec: MqttX.Payload.JSON
+      })
+
+      pub = decode_last_publish()
+      assert pub.payload == "[1,2,3]"
+      assert pub.properties.content_type == "application/json"
+    end
+
+    test "a codec failure drops the publish with a warning instead of crashing", ctx do
+      state = connect_publisher_v5(ctx, "route-codec-fail")
+      drain_mailbox()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          # Raw only accepts binaries
+          info_publish(state, "fail/t", 42, %{qos: 0, retain: false, codec: MqttX.Payload.Raw})
+        end)
+
+      assert log =~ "failed to encode the payload"
+      refute_received {:sent, _}
+    end
+
     test "a non-boolean truthy retain value does not crash routing", ctx do
       state = connect_publisher_v5(ctx, "route-retain-1")
       drain_mailbox()

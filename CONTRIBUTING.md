@@ -83,15 +83,6 @@ ordered roughly by ratio of impact to effort.
   cancels by client_id within a single BEAM. For a clustered setup, the cancel
   must be broadcast (Phoenix.PubSub or `:pg`).
 
-### API-changing (worth a deliberate minor bump)
-
-- **Payload codec PFI / content-type wiring.** `MqttX.Payload` callbacks are
-  `encode/1`/`decode/1`. To auto-set `:payload_format_indicator` and
-  `:content_type` (MQTT 5.0 §3.3.2.3.2/9) the behaviour signature has to
-  change — either a `metadata/0` callback returning `%{pfi: 0|1, content_type:
-  String.t()}` or augmenting encode/decode return tuples. Tied to a clean
-  major bump.
-
 ### Smaller polish (low risk, do whenever)
 
 - `connection.ex` (~2050 lines): the proxy tunnel and topic-alias logic are
@@ -127,4 +118,7 @@ for a packet's declared length and flattens once instead of `buf <> data` plus
 a decode attempt per read (which re-copied the whole buffer every time), used
 by `handler.ex`, the client's TCP/TLS path and its WebSocket frame buffer;
 the client now applies `:max_packet_size` to every packet, not just the first
-in a read.
+in a read; payload codecs declare their PFI / content type through an
+*optional* `metadata/0` callback (so no signature change was needed) and both
+publish paths take a `:codec` option that encodes the term and merges that
+metadata into the properties.

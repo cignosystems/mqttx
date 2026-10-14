@@ -21,6 +21,11 @@ defmodule MqttX.Payload.Protobuf do
 
   @behaviour MqttX.Payload
 
+  # Binary data, so the format indicator stays at its default (0); only the
+  # content type is declared.
+  @impl true
+  def metadata, do: %{content_type: "application/protobuf"}
+
   @impl true
   def encode(struct) when is_struct(struct) do
     if Code.ensure_loaded?(Protox) do

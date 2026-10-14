@@ -477,15 +477,20 @@ defmodule MqttX.Transport.Handler do
           {:noreply, new_state}
 
         {:publish, topic, payload, opts, new_handler_state} ->
-          new_state =
-            route_outbound_publish(
-              %{state | handler_state: new_handler_state},
-              topic,
-              payload,
-              opts
-            )
+          state = %{state | handler_state: new_handler_state}
 
-          {:noreply, new_state}
+          case apply_outbound_codec(payload, opts) do
+            {:ok, payload, opts} ->
+              {:noreply, route_outbound_publish(state, topic, payload, opts)}
+
+            {:error, reason} ->
+              Logger.warning(
+                "[MqttX.Transport] Dropping publish to #{inspect(topic)}: " <>
+                  "#{inspect(opts[:codec])} failed to encode the payload: #{inspect(reason)}"
+              )
+
+              {:noreply, state}
+          end
 
         {:disconnect, reason_code, new_handler_state} ->
           send_disconnect(state, reason_code, %{})
@@ -1507,6 +1512,19 @@ defmodule MqttX.Transport.Handler do
         {:error, RC.unspecified_error()}
     end)
   end
+
+  # A handle_info publish tuple may name a MqttX.Payload codec in opts: the
+  # payload is then a term to encode with it, and the codec's metadata
+  # (payload format indicator, content type) is merged under any explicit
+  # properties — the same contract as MqttX.Client.publish/4's :codec.
+  defp apply_outbound_codec(payload, %{codec: codec} = opts) when not is_nil(codec) do
+    with {:ok, binary, properties} <-
+           MqttX.Payload.encode_with(codec, payload, Map.get(opts, :properties, %{})) do
+      {:ok, binary, opts |> Map.delete(:codec) |> Map.put(:properties, properties)}
+    end
+  end
+
+  defp apply_outbound_codec(payload, opts), do: {:ok, payload, opts}
 
   # Fan an application-initiated publish (a handle_info return value) out
   # through this connection's subscription index, applying each matching

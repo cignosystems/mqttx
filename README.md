@@ -421,6 +421,20 @@ Uses the built-in Erlang JSON module:
 {:ok, binary} = MqttX.Payload.Raw.decode(<<1, 2, 3>>)
 ```
 
+### Publishing with a codec
+
+Pass the term and the codec; the payload is encoded and the codec's MQTT 5.0
+`payload_format_indicator` / `content_type` go out with it:
+
+```elixir
+MqttX.Client.publish(client, "sensors/room1", %{temp: 21.5},
+  qos: 1,
+  codec: MqttX.Payload.JSON
+)
+```
+
+See the [Codec guide](https://hexdocs.pm/mqttx/codec.html#publishing-with-a-codec).
+
 ## Topic Routing
 
 The server includes a topic router with wildcard support:

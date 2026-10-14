@@ -66,9 +66,34 @@ No transformation - binary in, binary out:
 {:ok, binary} = MqttX.Payload.Raw.decode(<<1, 2, 3>>)
 ```
 
+### Publishing with a codec
+
+Pass `codec:` to `MqttX.Client.publish/4` (or the `publish/3` that `use MqttX` injects) and give it the term rather than the bytes. The codec encodes it, and what the codec declares about its output — the MQTT 5.0 Payload Format Indicator and Content Type — is added to the PUBLISH properties, so receivers can tell what they are getting:
+
+```elixir
+MqttX.Client.publish(client, "sensors/room1", %{temp: 21.5},
+  qos: 1,
+  codec: MqttX.Payload.JSON
+)
+# on the wire: payload {"temp":21.5}, payload_format_indicator: 1,
+#              content_type: "application/json"
+```
+
+Properties you pass explicitly win over the codec's. An encoding failure returns `{:error, {:codec, reason}}` and nothing is sent. With MQTT 3.1.1 the term is still encoded; the properties simply have no place on the wire.
+
+A broker handler can do the same from `handle_info/2`:
+
+```elixir
+def handle_info({:downlink, topic, command}, state) do
+  {:publish, topic, command, %{qos: 1, codec: MqttX.Payload.JSON}, state}
+end
+```
+
+On the receiving side the content type arrives in the packet's properties (`packet.properties.content_type` in `handle_mqtt_event(:message, {topic, payload, packet}, state)`; `opts.properties` in `handle_publish/4`), which is how a receiver chooses the codec to decode with.
+
 ### Custom Codecs
 
-Implement `MqttX.Payload` for your own formats:
+Implement `MqttX.Payload` for your own formats. `metadata/0` is optional — define it to declare what your bytes are:
 
 ```elixir
 defmodule MyApp.MsgPackCodec do
@@ -79,6 +104,9 @@ defmodule MyApp.MsgPackCodec do
 
   @impl true
   def decode(binary), do: {:ok, Msgpax.unpack!(binary)}
+
+  @impl true
+  def metadata, do: %{content_type: "application/msgpack"}
 end
 ```
 

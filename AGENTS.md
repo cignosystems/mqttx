@@ -297,7 +297,11 @@ Full list in MQTT 5.0 §2.4.
   patterns. `tenant/{id}/device/{id}/telemetry/{metric}` lets `tenant/+/device/+/telemetry/#`
   fan out cleanly. Avoid encoding multiple dimensions into one segment.
 - **Payload format:** Protobuf for cellular IoT (5-10× smaller than JSON);
-  JSON for backend interop where payload size doesn't dominate.
+  JSON for backend interop where payload size doesn't dominate. Publish with
+  `codec: MqttX.Payload.JSON` (or `.Protobuf`) and pass the term: the codec
+  encodes it and sets the MQTT 5.0 `content_type` /
+  `payload_format_indicator` properties, so receivers can tell what the
+  bytes are.
 - **`max_inflight` on the client:** default 100. Raise only if your broker
   advertises a high `receive_maximum` *and* you're seeing throughput limits;
   otherwise increasing it just delays backpressure.

@@ -22,6 +22,15 @@ All notable changes to this project will be documented in this file.
 - **`clean_session: true` deletes the stored session.** The
   `MqttX.Session.Store` docs promised `delete/2` on a clean start (§3.1.2.4)
   but the client never called it, leaving stale records behind.
+- **Publish with a payload codec.** `MqttX.Client.publish/4` and a broker
+  handler's `{:publish, topic, payload, opts, state}` take `codec:
+  MqttX.Payload.JSON` (or `.Protobuf`, or your own `MqttX.Payload` module)
+  with the payload given as a term: the codec encodes it, and the codec's new
+  optional `metadata/0` callback supplies the MQTT 5.0
+  `payload_format_indicator` and `content_type` properties (explicit
+  properties win). JSON declares UTF-8 text + `application/json`, Protobuf
+  `application/protobuf`. Additive: codecs without `metadata/0` keep working
+  and declare nothing.
 - **Benchmarks and an end-to-end load test.** `bench/` holds Benchee suites
   for the codec, the router / retained store / receive buffer, and
   client-to-broker throughput over loopback (TCP or WebSocket);

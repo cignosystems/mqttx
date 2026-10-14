@@ -216,10 +216,31 @@ defmodule MqttX.Client.Connection do
 
   - `:qos` - QoS level 0, 1, or 2 (default: 0)
   - `:retain` - Retain flag (default: false)
+  - `:properties` - PUBLISH properties map (MQTT 5.0)
+  - `:codec` - a `MqttX.Payload` module. `payload` is then a term, encoded
+    with the codec in the calling process, and the codec's `metadata/0`
+    (Payload Format Indicator, Content Type) is merged into `:properties`
+    underneath any given explicitly. An encoding failure returns
+    `{:error, {:codec, reason}}` without touching the connection.
   """
-  @spec publish(GenServer.server(), binary(), binary(), keyword()) :: :ok | {:error, term()}
+  @spec publish(GenServer.server(), binary(), term(), keyword()) :: :ok | {:error, term()}
   def publish(pid, topic, payload, opts \\ []) do
-    GenServer.call(pid, {:publish, topic, payload, opts})
+    case Keyword.pop(opts, :codec) do
+      {nil, opts} ->
+        GenServer.call(pid, {:publish, topic, payload, opts})
+
+      {codec, opts} ->
+        case MqttX.Payload.encode_with(codec, payload, Keyword.get(opts, :properties, %{})) do
+          {:ok, binary, properties} ->
+            GenServer.call(
+              pid,
+              {:publish, topic, binary, Keyword.put(opts, :properties, properties)}
+            )
+
+          {:error, reason} ->
+            {:error, {:codec, reason}}
+        end
+    end
   end
 
   @doc """

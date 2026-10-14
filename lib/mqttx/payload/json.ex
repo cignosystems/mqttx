@@ -17,6 +17,10 @@ defmodule MqttX.Payload.JSON do
 
   @behaviour MqttX.Payload
 
+  # JSON is UTF-8 text (§3.3.2.3.2: indicator 1 = UTF-8 encoded character data)
+  @impl true
+  def metadata, do: %{payload_format_indicator: 1, content_type: "application/json"}
+
   @impl true
   def encode(term) do
     if Code.ensure_loaded?(JSON) do

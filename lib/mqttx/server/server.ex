@@ -206,7 +206,10 @@ defmodule MqttX.Server do
   Return values:
   - `{:ok, state}` - Continue with updated state
   - `{:publish, topic, payload, state}` - Send PUBLISH to client, then continue
-  - `{:publish, topic, payload, opts, state}` - Send PUBLISH with QoS/retain options
+  - `{:publish, topic, payload, opts, state}` - Send PUBLISH with options:
+    `:qos`, `:retain`, `:properties`, and `:codec` — a `MqttX.Payload`
+    module that encodes `payload` (a term) and adds its
+    `payload_format_indicator` / `content_type` to the properties
   - `{:disconnect, reason_code, state}` - Send DISCONNECT and close connection
   - `{:disconnect, reason_code, properties, state}` - Send DISCONNECT with properties and close
   - `{:stop, reason, state}` - Close the connection

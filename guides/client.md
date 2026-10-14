@@ -345,6 +345,8 @@ MqttX.Client.publish(client, "events/alert", payload,
 )
 ```
 
+Or let a payload codec set `content_type` and `payload_format_indicator` for you and encode the term as well — `codec: MqttX.Payload.JSON` with a map as the payload. See [Publishing with a codec](codec.md#publishing-with-a-codec).
+
 ## Connect Options
 
 | Option | Description | Default |

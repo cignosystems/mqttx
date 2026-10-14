@@ -11,6 +11,68 @@ defmodule MqttX.Payload.PayloadTest do
     end
   end
 
+  defmodule SilentCodec do
+    @behaviour MqttX.Payload
+    @impl true
+    def encode(term), do: {:ok, :erlang.term_to_binary(term)}
+    @impl true
+    def decode(binary), do: {:ok, :erlang.binary_to_term(binary)}
+  end
+
+  describe "metadata" do
+    test "JSON declares UTF-8 text with the JSON media type" do
+      assert MqttX.Payload.JSON.metadata() ==
+               %{payload_format_indicator: 1, content_type: "application/json"}
+    end
+
+    test "Protobuf declares its media type only (binary data keeps the default indicator)" do
+      assert MqttX.Payload.Protobuf.metadata() == %{content_type: "application/protobuf"}
+    end
+
+    test "metadata/1 is empty for codecs that declare nothing" do
+      assert MqttX.Payload.metadata(MqttX.Payload.Raw) == %{}
+      assert MqttX.Payload.metadata(SilentCodec) == %{}
+      assert MqttX.Payload.metadata(MqttX.Payload.JSON) == MqttX.Payload.JSON.metadata()
+    end
+  end
+
+  describe "encode_with/3" do
+    @tag :json
+    test "encodes and merges the codec's metadata into the properties" do
+      assert {:ok, ~s({"a":1}), properties} =
+               MqttX.Payload.encode_with(MqttX.Payload.JSON, %{a: 1}, %{
+                 message_expiry_interval: 5
+               })
+
+      assert properties == %{
+               payload_format_indicator: 1,
+               content_type: "application/json",
+               message_expiry_interval: 5
+             }
+    end
+
+    @tag :json
+    test "explicit properties win over the codec's metadata" do
+      assert {:ok, _, %{content_type: "application/vnd.acme+json", payload_format_indicator: 1}} =
+               MqttX.Payload.encode_with(MqttX.Payload.JSON, [1, 2], %{
+                 content_type: "application/vnd.acme+json"
+               })
+    end
+
+    test "a codec without metadata adds nothing" do
+      assert {:ok, binary, %{}} = MqttX.Payload.encode_with(SilentCodec, {:x, 1})
+      assert :erlang.binary_to_term(binary) == {:x, 1}
+    end
+
+    test "nil properties are treated as empty" do
+      assert {:ok, "raw", %{}} = MqttX.Payload.encode_with(MqttX.Payload.Raw, "raw", nil)
+    end
+
+    test "the codec's encoding error is returned unchanged" do
+      assert {:error, {:not_binary, 42}} = MqttX.Payload.encode_with(MqttX.Payload.Raw, 42)
+    end
+  end
+
   describe "MqttX.Payload.Raw" do
     test "encode returns binary as-is" do
       assert {:ok, "hello"} = MqttX.Payload.Raw.encode("hello")

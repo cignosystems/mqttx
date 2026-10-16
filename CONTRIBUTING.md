@@ -17,6 +17,11 @@ Notes for humans and AI assistants modifying this library itself. If you are
 - `lib/mqttx/payload/` — pluggable payload codecs (raw / json / protobuf)
 - `test/mqttx/integration_test.exs`, `test/mqttx/interop_emqx_test.exs`,
   `test/mosquitto_validation.exs` — broker + client integration / interop suites
+- `test/support/` — compiled test helpers: `MqttX.Test.FakeBroker`, a scriptable
+  TCP "broker" that relays what the client sends to the test process (use it to
+  put the client in a state a real broker would not), and
+  `MqttX.Test.ForwardingHandler`; `test/fixtures/tls/` — a private CA and a
+  `localhost` certificate for the TLS tests (`gen.sh` regenerates them)
 - `bench/` — Benchee suites (`codec.exs`, `server.exs`, `e2e.exs`);
   `test/mqttx/load_test.exs` — end-to-end load validation (`--include load`)
 

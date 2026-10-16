@@ -220,5 +220,33 @@ defmodule MqttX.Server.WillAuthorizationTest do
       assert retained_entries(port) == [],
              "handler rejected the delayed Will but it was still retained"
     end
+
+    test "an accepted retained Will is written to the retained store when it fires" do
+      {_server, port, _} = start_server(AcceptingHandler, [])
+
+      socket =
+        connect_with_will(
+          port,
+          "legit-delayed",
+          %{
+            topic: "sensors/room2/status",
+            payload: "offline",
+            qos: 1,
+            retain: true,
+            properties: %{will_delay_interval: 1}
+          },
+          %{session_expiry_interval: 30}
+        )
+
+      :gen_tcp.close(socket)
+
+      # Nothing until the delay has run
+      refute_receive {:publish_accepted, _, _}, 500
+      assert_receive {:publish_accepted, "sensors/room2/status", "offline"}, 4_000
+      Process.sleep(100)
+
+      assert [{_, "sensors/room2/status", "offline", 1, _, _}] = retained_entries(port),
+             "accepted delayed Will should have been retained"
+    end
   end
 end

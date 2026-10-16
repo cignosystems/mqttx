@@ -9,13 +9,18 @@ defmodule MqttX.MixProject do
       app: :mqttx,
       version: @version,
       elixir: "~> 1.18",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       package: package(),
       docs: docs(),
-      # Honest floor at today's measured level (71.4%); raise as the thin
-      # spots (WillDelay, Payload.Protobuf, SimpleClient) gain tests.
-      test_coverage: [summary: [threshold: 70]],
+      # Honest floor just under today's measured level (85%); raise as the
+      # thin spots (Ranch, the WebSocket server transport, SimpleClient,
+      # Payload.Protobuf) gain tests. test/support is tooling, not the library.
+      test_coverage: [
+        summary: [threshold: 80],
+        ignore_modules: [MqttX.Test.FakeBroker, MqttX.Test.ForwardingHandler]
+      ],
       # Include the optional transport deps in the PLT so dialyzer actually
       # checks the adapter call sites
       dialyzer: [
@@ -41,6 +46,11 @@ defmodule MqttX.MixProject do
       mod: {MqttX.Application, []}
     ]
   end
+
+  # test/support holds helpers shared by test files (a scriptable fake broker,
+  # a forwarding client handler) that have to be compiled, not just required
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
     [

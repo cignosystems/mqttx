@@ -72,7 +72,11 @@ defmodule MqttX.LoadTest do
   @payload :binary.copy(<<"m">>, 256)
 
   setup do
-    {:ok, _} = Registry.start_link(keys: :duplicate, name: MqttX.LoadTest.Registry)
+    # Supervised by the test so it is stopped — synchronously — before the next
+    # test's setup runs. Linked to the test process instead, it was still
+    # shutting down when the next test started it: {:error, {:already_started, _}}
+    # on whichever test the random order put second.
+    start_supervised!({Registry, keys: :duplicate, name: MqttX.LoadTest.Registry})
     received = :counters.new(1, [:write_concurrency])
 
     {:ok, listen} = :gen_tcp.listen(0, [])
@@ -155,15 +159,33 @@ defmodule MqttX.LoadTest do
     assert await(received, expected, 30_000) == expected,
            "broker received #{:counters.get(received, 1)} of #{expected} messages"
 
-    # Every QoS 1 publish must be acknowledged — nothing left in flight
-    Process.sleep(200)
-
-    for client <- clients do
-      assert :sys.get_state(client).pending_acks == %{}
-    end
+    # Every QoS 1 publish must be acknowledged — nothing left in flight. The
+    # last PUBACKs are still on the wire when the publish loops return, so
+    # wait for them rather than for a fixed interval.
+    in_flight = await_drained(clients, 10_000)
+    assert in_flight == %{}, "QoS 1 publishes still unacknowledged: #{inspect(in_flight)}"
 
     refute_received {:disconnected, _}
     teardown(clients, server)
+  end
+
+  # Poll until no client has a QoS 1/2 publish awaiting its ack. Returns what is
+  # still in flight per client — empty once drained, or whatever remains when
+  # the deadline passes.
+  defp await_drained(clients, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    Stream.repeatedly(fn ->
+      for client <- clients,
+          pending = :sys.get_state(client).pending_acks,
+          pending != %{},
+          into: %{},
+          do: {client, Map.keys(pending)}
+    end)
+    |> Enum.find(fn in_flight ->
+      in_flight == %{} or System.monotonic_time(:millisecond) > deadline or
+        (Process.sleep(10) && false)
+    end)
   end
 
   test "fan-out: every subscriber gets every message, intact",

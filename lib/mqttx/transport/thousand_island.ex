@@ -38,12 +38,17 @@ defmodule MqttX.Transport.ThousandIsland do
   - `:max_retained_messages` - Cap on distinct retained topics
     (default: 100_000, `:infinity` disables)
   - `:rate_limit` - Options for `MqttX.Server.RateLimiter` (default: none)
-  - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 65535)
+  - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 65535).
+    A client that exceeds it is disconnected with 0x93 (§4.9)
+  - `:max_outbound_queue` - Cap on QoS > 0 publishes queued per connection
+    while the client's Receive Maximum window is full; beyond it they are
+    dropped with a warning (default: 10_000, `:infinity` disables)
   - `:topic_alias_maximum` - Topic aliases the server accepts (default: 100)
   - `:server_keep_alive` - Override the client's Keep Alive (MQTT 5.0 only)
   - `:supported_versions` - Accepted protocol levels (default: `[3, 4, 5]`)
-  - `:qos2_retry_interval` / `:qos2_max_retries` - Outbound QoS 1/2
-    retransmission tuning (defaults: 5000 ms, 3)
+  - `:qos2_retry_interval` / `:qos2_max_retries` - Deprecated and ignored
+    since 0.12.0: the broker never re-sends QoS 1/2 packets on a live
+    connection (MQTT §4.4)
   """
 
   @behaviour MqttX.Transport

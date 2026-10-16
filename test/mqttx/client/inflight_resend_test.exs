@@ -95,8 +95,8 @@ defmodule MqttX.Client.InflightResendTest do
     assert_receive {:mqtt_event, :disconnected, _}, 5_000
     assert_receive {:mqtt_event, :connected, %{session_present: true}}, 10_000
 
-    # Prompt resend: well before the 5s retry_interval, with dup=1 and the
-    # same packet id
+    # Prompt resend on resumption — the only time §4.4 allows one — with dup=1
+    # and the same packet id
     assert_receive {:broker, :packet, %{type: :publish} = resent}, 3_000
     assert resent.dup == true
     assert resent.packet_id == original.packet_id

@@ -386,11 +386,22 @@ MqttX.Server.start_link(
 ### WebSocket
 
 ```elixir
+# ws://
 MqttX.Server.start_link(
   MyHandler,
   [],
   transport: MqttX.Transport.WebSocket,
   port: 8083
+)
+
+# wss://
+MqttX.Server.start_link(
+  MyHandler,
+  [],
+  transport: MqttX.Transport.WebSocket,
+  port: 8084,
+  scheme: :https,
+  transport_options: [certfile: "/etc/mqttx/cert.pem", keyfile: "/etc/mqttx/key.pem"]
 )
 ```
 
@@ -470,7 +481,7 @@ All 15 packet types are supported:
 
 Fully compliant with MQTT 3.1, 3.1.1, and 5.0 specifications:
 
-- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_as_published, retain_handling, subscription identifiers), server keepalive override
+- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_as_published, retain_handling, subscription identifiers), server keepalive override, enhanced AUTH (exchange before CONNACK, re-authentication)
 - **Client**: server_keep_alive override, assigned_client_identifier, maximum_packet_size enforcement, server_reference handling, enhanced AUTH (multi-step), flow control (receive_maximum)
 
 Validated against Mosquitto (104 automated protocol tests across TCP and WebSocket) and EMQX Cloud (49 interop tests covering all QoS levels, properties, session persistence, and subscription options).
@@ -500,8 +511,7 @@ MqttX.Server.start_link(
     topic_alias_maximum: 100,        # max topic aliases
     receive_maximum: 65535,          # max inflight QoS>0
     max_packet_size: 256_000,        # reject oversized packets
-    qos2_retry_interval: 5000,      # QoS 2 retry timer (ms)
-    qos2_max_retries: 3             # QoS 2 max retries before drop
+    max_outbound_queue: 10_000       # QoS>0 publishes queued per client behind its window
   }],
   transport: MqttX.Transport.ThousandIsland,
   port: 1883
@@ -627,7 +637,6 @@ multi-node deployment.
 | `:ssl_opts` | SSL options, merged **over** the secure baseline (see [TLS/SSL](https://hexdocs.pm/mqttx/client.html#tls-ssl)) | `[]` |
 | `:ws_path` | WebSocket path for `:ws` or `:wss` | `"/mqtt"` |
 | `:proxy` | HTTP CONNECT proxy, e.g. `[host: "proxy.corp", port: 3128, auth: {"u", "p"}]` | `nil` |
-| `:retry_interval` | QoS retry interval (ms) | `5000` |
 | `:max_inflight` | Max pending QoS 1/2 messages | `100` |
 | `:max_packet_size` | Reject inbound packets declaring more than this (`:infinity` disables) | `1 MiB` |
 | `:will_topic` / `:will_payload` / `:will_qos` / `:will_retain` / `:will_properties` | Last Will & Testament | `nil` / `""` / `0` / `false` / `%{}` |
@@ -635,6 +644,11 @@ multi-node deployment.
 | `:session_store` | Session store module | `nil` |
 | `:handler` | Callback module for messages | `nil` |
 | `:handler_state` | Initial handler state | `nil` |
+
+Unacknowledged QoS 1/2 publishes are held until the broker acknowledges them
+and re-sent only when a session is resumed after a reconnect (MQTT §4.4) —
+never on a live connection. `:retry_interval` is deprecated and ignored
+since 0.12.0.
 
 ### MqttX.Server
 
@@ -694,7 +708,7 @@ multi-node deployment.
 | **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
 | **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
 | **Session Persistence (Server)** | Planned | Server-side session persistence (currently client-only) |
-| **MQTT 5.0 Enhanced Auth** | Partial | AUTH exchange and re-authentication implemented; no built-in SCRAM/external providers |
+| **MQTT 5.0 Enhanced Auth** | Done | Challenge–response exchange before CONNACK and re-authentication, on both client and broker, via `handle_auth/3`; the mechanism itself (SCRAM, tokens, …) is the handler's — no built-in providers |
 | **Telemetry Docs** | Done | See the [Telemetry guide](https://hexdocs.pm/mqttx/telemetry.html) |
 | **Property-based Tests** | Done | StreamData round-trips + decode/encode fuzzing of the codec |
 | **End-to-end Load Tests** | Done | Benchee suites in `bench/` (codec, router/retained/buffer, client↔broker over loopback) + `mix test --include load`; numbers in the [Performance guide](https://hexdocs.pm/mqttx/performance.html#measured-throughput) |

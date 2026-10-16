@@ -18,17 +18,23 @@ defmodule MqttX.Packet.ReasonCodes do
   def success, do: 0x00
   def disconnect_with_will_message, do: 0x04
   def continue_authentication, do: 0x18
+  def re_authenticate, do: 0x19
+  def no_subscription_existed, do: 0x11
   def unspecified_error, do: 0x80
   def protocol_error, do: 0x82
+  def implementation_specific_error, do: 0x83
   def unsupported_protocol_version, do: 0x84
+  def not_authorized, do: 0x87
   def bad_authentication_method, do: 0x8C
   def session_taken_over, do: 0x8E
+  def topic_name_invalid, do: 0x90
   def packet_identifier_not_found, do: 0x92
   def receive_maximum_exceeded, do: 0x93
   def topic_alias_invalid, do: 0x94
   def packet_too_large, do: 0x95
   def message_rate_too_high, do: 0x96
   def quota_exceeded, do: 0x97
+  def payload_format_invalid, do: 0x99
 
   @doc "§2.4: codes 0x80 and above indicate failure."
   defguard is_error_code(code) when is_integer(code) and code >= 0x80

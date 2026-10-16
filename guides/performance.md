@@ -95,7 +95,7 @@ if state.inflight_count >= state.server_receive_maximum do
 end
 ```
 
-The counter is incremented when sending PUBREC (QoS 2 received) and decremented when sending PUBCOMP (QoS 2 complete) or when entries are dropped after max retries.
+The counter is incremented when sending PUBREC (QoS 2 received) and decremented when sending PUBCOMP (QoS 2 complete). Nothing expires an entry in between: per MQTT §4.4 a message waiting for PUBREL is held until the connection ends.
 
 ## Retained Message Delivery
 

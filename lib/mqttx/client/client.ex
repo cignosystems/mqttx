@@ -154,7 +154,9 @@ defmodule MqttX.Client do
 
   ### Reliability and limits
 
-  - `:retry_interval` - QoS 1/2 retry interval in ms (default: 5000)
+  - `:retry_interval` - Deprecated and ignored since 0.12.0: unacknowledged
+    QoS 1/2 publishes are re-sent only when a session is resumed, never on a
+    live connection (MQTT §4.4)
   - `:max_inflight` - Max pending QoS 1/2 messages (default: 100)
   - `:max_packet_size` - Reject inbound packets declaring more than this
     (default: 1 MiB; `:infinity` disables)
@@ -171,7 +173,7 @@ defmodule MqttX.Client do
 
   `{:ok, pid}` on success, `{:error, reason}` on failure — including
   `{:error, {:missing_option, :host | :client_id}}` when a required option is
-  absent.
+  absent. Raises `ArgumentError` if `:will_qos` is not 0, 1 or 2.
 
   ## Connection is asynchronous
 
@@ -239,9 +241,25 @@ defmodule MqttX.Client do
     (explicit properties win). An encoding failure returns
     `{:error, {:codec, reason}}`.
 
+  ## Returns
+
   `:ok` means the packet was written to the socket; for QoS 1/2 the
   broker's acknowledgment is tracked in the background (rejections surface
   via `handle_mqtt_event(:publish_error, {topic, packet_id, reason_code}, state)`).
+
+  `{:error, reason}` with one of:
+
+  - `:not_connected` - no live session; the call does not queue
+  - `:invalid_qos` - `:qos` is not 0, 1 or 2
+  - `:qos_not_supported` - `:qos` exceeds the Maximum QoS the broker
+    advertised in CONNACK (MQTT 5.0 §3.2.2.3.4; AWS IoT Core, for one,
+    advertises 1). The QoS is not lowered silently — choose a supported one.
+  - `:retain_not_supported` - `retain: true` but the broker advertised
+    Retain Available = 0 in CONNACK (§3.2.2.3.5)
+  - `:flow_control` - the in-flight QoS 1/2 window (`:max_inflight` or the
+    broker's Receive Maximum) is full
+  - `:packet_too_large` - exceeds the broker's Maximum Packet Size
+  - `{:codec, reason}` - the `:codec` could not encode `payload`
   """
   @spec publish(pid(), binary(), term(), keyword()) :: :ok | {:error, term()}
   def publish(client, topic, payload, opts \\ []) do
@@ -251,9 +269,33 @@ defmodule MqttX.Client do
   @doc """
   Subscribe to one or more topics.
 
+  Blocks until the broker's SUBACK arrives.
+
   ## Options
 
-  - `:qos` - QoS level 0, 1, or 2 (default: 0)
+  - `:qos` - QoS level 0, 1, or 2 (default: 0). Asking for more than the
+    broker's Maximum QoS is fine — it grants a lower level.
+  - `:no_local` - Don't receive own publishes (MQTT 5.0, default: false).
+    Not allowed on a `$share/...` filter (MQTT-3.8.3-4).
+  - `:retain_as_published` - Keep original retain flag (MQTT 5.0, default: false)
+  - `:retain_handling` - 0 = send retained on subscribe, 1 = only if new,
+    2 = don't send (MQTT 5.0, default: 0)
+  - `:properties` - SUBSCRIBE properties map (MQTT 5.0), e.g.
+    `%{subscription_identifier: 1}`
+
+  ## Returns
+
+  `{:ok, granted_qos_list}`, one entry per filter, or `{:error, reason}`:
+
+  - `:not_connected` - no live session
+  - `:invalid_qos` - `:qos` is not 0, 1 or 2
+  - `:invalid_retain_handling` - `:retain_handling` is not 0, 1 or 2
+  - `:no_local_on_shared_subscription` - `no_local: true` with a `$share/`
+    filter
+  - `{:subscription_refused, acks}` - the broker rejected at least one
+    filter; `acks` holds the per-filter results
+
+  Option errors are returned before anything is sent to the broker.
   """
   @spec subscribe(pid(), binary() | [binary()], keyword()) ::
           {:ok, [integer()]} | {:error, term()}

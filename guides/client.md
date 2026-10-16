@@ -19,6 +19,33 @@
 :ok = MqttX.Client.disconnect(client)
 ```
 
+### Return values
+
+`subscribe/3` waits for the SUBACK and returns `{:ok, granted_qos_list}`.
+`publish/4` returns `:ok` as soon as the packet is on the socket; QoS 1/2
+acknowledgements are tracked in the background and a rejection arrives as a
+`:publish_error` event. Both return `{:error, reason}` without sending
+anything when:
+
+| Error | From | Meaning |
+|-------|------|---------|
+| `:not_connected` | both | No live session; calls do not queue |
+| `:invalid_qos` | both | `:qos` is not 0, 1 or 2 |
+| `:qos_not_supported` | `publish` | `:qos` is above the **Maximum QoS** the broker advertised in CONNACK (AWS IoT Core advertises 1). The QoS is not lowered silently — publish again at a supported level |
+| `:retain_not_supported` | `publish` | `retain: true`, but the broker advertised **Retain Available = 0** |
+| `:flow_control` | `publish` | The QoS 1/2 in-flight window (`:max_inflight`, or the broker's Receive Maximum) is full |
+| `:packet_too_large` | `publish` | Larger than the broker's Maximum Packet Size |
+| `{:codec, reason}` | `publish` | The `:codec` could not encode the payload |
+| `:invalid_retain_handling` | `subscribe` | `:retain_handling` is not 0, 1 or 2 |
+| `:no_local_on_shared_subscription` | `subscribe` | `no_local: true` on a `$share/...` filter (a Protocol Error, MQTT-3.8.3-4) |
+| `{:subscription_refused, acks}` | `subscribe` | The broker rejected at least one filter |
+
+Asking `subscribe/3` for a QoS above the broker's Maximum QoS is allowed —
+the broker grants a lower one — so only `publish/4` checks that limit.
+
+An invalid `:will_qos` (not 0, 1 or 2) raises `ArgumentError` from
+`connect/1` itself, since it would make every CONNECT a malformed packet.
+
 ### Connection is asynchronous by default
 
 Without `await_connect: true`, `connect/1` returns as soon as the client
@@ -152,6 +179,12 @@ For secure WebSocket (WSS):
 ```
 
 Default ports: `8083` for `:ws`, `8084` for `:wss`. The `:ws_path` defaults to `"/mqtt"`.
+
+MQTT travels in WebSocket *binary* frames only (MQTT-6.0.0-1). A broker that
+sends a text frame — or a frame with a reserved opcode — gets the connection
+closed; the handler sees `{:disconnected, {:protocol_error, :non_binary_frame}}`
+and the usual reconnect backoff applies. Ping, pong and close control frames
+are handled as before.
 
 ## Session Persistence
 
@@ -321,6 +354,14 @@ Include `authentication_method` in connect properties to initiate enhanced auth:
 )
 ```
 
+The `authentication_method` is what opts the connection into enhanced
+authentication. A broker is not allowed to send AUTH to a client that did not
+include it (MQTT-4.12.0-7), so if one arrives anyway the client treats it as a
+Protocol Error rather than answering it: during the handshake the connect
+attempt fails with `{:protocol_error, :unexpected_auth}`; on a live connection
+the client sends DISCONNECT `0x82`, closes, and the handler receives
+`{:disconnected, {:protocol_error, :unexpected_auth}}`.
+
 ### Server-Negotiated Settings
 
 The client automatically applies MQTT 5.0 CONNACK properties from the broker:
@@ -331,7 +372,12 @@ The client automatically applies MQTT 5.0 CONNACK properties from the broker:
 | `assigned_client_identifier` | Replaces the client's ID when connecting with empty `client_id` |
 | `maximum_packet_size` | Enforced on outgoing packets; oversized sends return `{:error, :packet_too_large}` |
 | `receive_maximum` | Limits concurrent in-flight QoS 1/2 publishes |
+| `maximum_qos` | Enforced on outgoing publishes: a higher `:qos` returns `{:error, :qos_not_supported}` instead of being lowered silently (MQTT-3.2.2-11). Absent = QoS 2 allowed |
+| `retain_available` | When `false`, `publish(..., retain: true)` returns `{:error, :retain_not_supported}` (MQTT-3.2.2-14). Absent = retain allowed |
 | `server_reference` | Logged on CONNACK rejection or server DISCONNECT (for redirect) |
+
+All of these are per-connection: every CONNACK replaces the previous values,
+so a reconnect to a broker with different limits picks them up.
 
 ### Publishing with Properties
 
@@ -364,14 +410,20 @@ Or let a payload codec set `content_type` and `payload_format_indicator` for you
 | `:ssl_opts` | SSL options, merged **over** the secure baseline (see [TLS/SSL](#tls-ssl)) | `[]` |
 | `:ws_path` | WebSocket path for `:ws` or `:wss` | `"/mqtt"` |
 | `:proxy` | HTTP CONNECT proxy, e.g. `[host: "proxy.corp", port: 3128, auth: {"u", "p"}]` | `nil` |
-| `:retry_interval` | QoS retry interval (ms) | `5000` |
 | `:max_inflight` | Max pending QoS 1/2 messages | `100` |
 | `:max_packet_size` | Reject inbound packets declaring more than this (`:infinity` disables) | `1 MiB` |
-| `:will_topic` / `:will_payload` / `:will_qos` / `:will_retain` / `:will_properties` | Last Will & Testament | `nil` / `""` / `0` / `false` / `%{}` |
+| `:will_topic` / `:will_payload` / `:will_qos` / `:will_retain` / `:will_properties` | Last Will & Testament (`:will_qos` must be 0, 1 or 2 — anything else raises `ArgumentError`) | `nil` / `""` / `0` / `false` / `%{}` |
 | `:connect_properties` | MQTT 5.0 CONNECT properties (e.g. `%{session_expiry_interval: 3600}`) | `%{}` |
 | `:session_store` | Session store module | `nil` |
 | `:handler` | Callback module for messages | `nil` |
 | `:handler_state` | Initial handler state | `nil` |
+
+Unacknowledged QoS 1/2 publishes are held until the broker acknowledges them
+and re-sent only when a session is resumed after a reconnect (MQTT §4.4) —
+never on a live connection, where TCP already guarantees delivery and a
+missing acknowledgement means the broker is slow or gone (which the
+keep-alive detects). `:retry_interval` is deprecated and ignored since
+0.12.0.
 
 ---
 

@@ -75,6 +75,8 @@ defmodule MqttX.Server do
   persistence across connections.
   """
 
+  require Logger
+
   @type client_id :: binary()
   @type credentials :: %{username: binary() | nil, password: binary() | nil}
   @type topic :: MqttX.Topic.normalized_topic()
@@ -114,7 +116,11 @@ defmodule MqttX.Server do
   @callback handle_connect(client_id(), credentials(), state()) ::
               {:ok, state()} | {:error, reason_code(), state()}
 
-  @type connect_info :: %{protocol_version: 3 | 4 | 5, keep_alive: non_neg_integer()}
+  @type connect_info :: %{
+          protocol_version: 3 | 4 | 5,
+          keep_alive: non_neg_integer(),
+          authentication_method: binary() | nil
+        }
 
   @doc """
   Handle a client connection with connection metadata.
@@ -124,9 +130,21 @@ defmodule MqttX.Server do
 
     - `protocol_version` — 3 (MQTT 3.1), 4 (MQTT 3.1.1), or 5 (MQTT 5.0)
     - `keep_alive` — client's requested keepalive in seconds
+    - `authentication_method` — the MQTT 5.0 Authentication Method the client
+      asked for, or `nil`. When set, `handle_auth/3` runs after this callback
+      accepts, and the CONNACK waits for that exchange (§4.12)
 
   If both `handle_connect/4` and `handle_connect/3` are defined,
   `handle_connect/4` takes precedence.
+
+  Two notes that apply to both arities. A client that sent a zero-length
+  Client Identifier arrives here with the one the broker assigned (§3.1.3.1;
+  v5 clients learn it from the CONNACK). And the reason code of an
+  `{:error, reason_code, state}` refusal is an MQTT 5.0 code: for a 3.1.1
+  client it is mapped to the nearest CONNACK return code — `0x84` → 1,
+  `0x85` → 2, `0x86` → 4, `0x87` and anything else → 5, server
+  unavailable/busy/redirect codes → 3 — and a v5 client only ever receives a
+  code the CONNACK defines (others become `0x80`).
   """
   @callback handle_connect(client_id(), credentials(), connect_info(), state()) ::
               {:ok, state()} | {:error, reason_code(), state()}
@@ -134,7 +152,16 @@ defmodule MqttX.Server do
   @doc """
   Handle an incoming PUBLISH message.
 
-  Called when a client publishes a message.
+  Called when a client publishes a message. `{:error, reason, state}` refuses
+  it — but the message is still acknowledged (MQTT-3.3.4-1), or the publisher
+  would hold its Packet Identifier in flight forever. A QoS 1 PUBLISH gets a
+  PUBACK whose MQTT 5.0 Reason Code reflects `reason`: `0x87` Not authorized
+  for `:unauthorized`, `:not_authorized` or `:forbidden`; `0x97` for
+  `:quota_exceeded`; `0x90` for `:topic_name_invalid`; `0x99` for
+  `:payload_format_invalid`; an integer that is itself a PUBACK code as given;
+  anything else `0x80`. A pre-5 PUBACK has no code. A QoS 2 PUBLISH is
+  completed with PUBCOMP at PUBREL. `{:disconnect, ...}` ends the connection
+  instead, which also publishes the client's Will.
   """
   @callback handle_publish(topic(), payload(), publish_opts(), state()) ::
               {:ok, state()}
@@ -176,27 +203,52 @@ defmodule MqttX.Server do
   @callback handle_puback(packet_id :: non_neg_integer(), state()) :: {:ok, state()}
 
   @doc """
-  Handle enhanced authentication (MQTT 5.0).
+  Drive an MQTT 5.0 enhanced authentication exchange (§4.12).
 
-  Called when the server receives an AUTH packet for SASL-style authentication.
+  A client opts in by sending an Authentication Method in its CONNECT. Once
+  `handle_connect` has accepted, this callback is called with that method and
+  the CONNECT's Authentication Data (the mechanism's first client message,
+  `nil` if there was none), and then once more for every AUTH packet the
+  client sends in reply to a challenge. The CONNACK is not sent until the
+  exchange ends. The same callback serves re-authentication on a live
+  connection (§4.12.1), where success is answered with AUTH 0x00 instead of a
+  CONNACK.
 
   Return values:
-  - `{:ok, state}` - Authentication complete, send CONNACK success
-  - `{:continue, data, state}` - Send AUTH continue with data, wait for response
-  - `{:error, reason_code, state}` - Authentication failed
+  - `{:ok, state}` - Authentication complete: CONNACK success (or AUTH 0x00)
+  - `{:ok, data, state}` - Complete, with `data` as the mechanism's final
+    server message (e.g. a SCRAM server-final) carried in the CONNACK/AUTH
+  - `{:continue, data, state}` - Send AUTH 0x18 carrying `data` as a challenge
+    and wait for the client's answer
+  - `{:error, reason_code, state}` - Authentication failed: CONNACK with
+    `reason_code` (DISCONNECT when re-authenticating) and the connection
+    closes. `0x87` Not authorized and `0x8C` Bad authentication method are the
+    usual codes
+
+  The default implementation returns `{:error, 0x8C, state}`, so a client that
+  asks for enhanced authentication against a handler without it is refused
+  rather than silently connected. The mechanism itself (SCRAM, a token
+  exchange, …) is the handler's to implement.
 
   ## Example
 
-      def handle_auth("SCRAM-SHA-256", data, state) do
-        case verify_scram(data, state) do
-          {:ok, _} -> {:ok, state}
-          {:continue, challenge} -> {:continue, challenge, state}
-          :error -> {:error, 0x87, state}  # Not authorized
+      def handle_auth("SCRAM-SHA-256", client_first, %{scram: nil} = state) do
+        {challenge, scram} = MyScram.server_first(client_first)
+        {:continue, challenge, %{state | scram: scram}}
+      end
+
+      def handle_auth("SCRAM-SHA-256", client_final, %{scram: scram} = state) do
+        case MyScram.verify(scram, client_final) do
+          {:ok, server_final} -> {:ok, server_final, %{state | scram: nil}}
+          :error -> {:error, 0x87, %{state | scram: nil}}
         end
       end
+
+      def handle_auth(_other_method, _data, state), do: {:error, 0x8C, state}
   """
   @callback handle_auth(method :: binary(), data :: binary() | nil, state()) ::
               {:ok, state()}
+              | {:ok, binary(), state()}
               | {:continue, binary(), state()}
               | {:error, reason_code(), state()}
 
@@ -307,6 +359,11 @@ defmodule MqttX.Server do
   Sends a DISCONNECT packet to the client and closes the connection.
   The `pid` is the transport process handling the client connection.
 
+  A close the broker initiates is not a graceful one: the client's Will, if
+  it set one, is published (§3.1.2.5 — only a client DISCONNECT 0x00 discards
+  it). A `session_expiry_interval` in `properties` is dropped, since only
+  clients may send it (MQTT-3.14.2-2).
+
   ## Example
 
       MqttX.Server.disconnect(client_pid, 0x98)  # Use assigned client identifier
@@ -330,9 +387,34 @@ defmodule MqttX.Server do
   """
   @spec start_link(module(), term(), keyword()) :: {:ok, pid()} | {:error, term()}
   def start_link(handler, handler_opts, opts \\ []) do
+    warn_deprecated_transport_opts(handler_opts)
     transport = Keyword.get(opts, :transport, MqttX.Transport.ThousandIsland)
     transport_opts = Keyword.drop(opts, [:name])
 
     transport.start_link(handler, handler_opts, transport_opts)
   end
+
+  # Retransmission knobs from before 0.12.0. Still accepted so existing
+  # configs keep starting; see the CHANGELOG for the removal plan.
+  @deprecated_transport_opts [:qos2_retry_interval, :qos2_max_retries]
+
+  defp warn_deprecated_transport_opts(handler_opts) when is_list(handler_opts) do
+    transport_opts = Keyword.get(handler_opts, :transport_opts, %{})
+
+    present =
+      if is_map(transport_opts),
+        do: Enum.filter(@deprecated_transport_opts, &Map.has_key?(transport_opts, &1)),
+        else: []
+
+    if present != [] do
+      Logger.warning(
+        "[MqttX.Server] deprecated transport_opts ignored since 0.12.0: " <>
+          Enum.map_join(present, " and ", &inspect/1) <>
+          ". The broker does not re-send QoS 1/2 packets on a live connection " <>
+          "(MQTT §4.4); remove them."
+      )
+    end
+  end
+
+  defp warn_deprecated_transport_opts(_handler_opts), do: :ok
 end

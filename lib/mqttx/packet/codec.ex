@@ -164,6 +164,7 @@ defmodule MqttX.Packet.Codec do
              else: {:ok, %{}, rest3}
            ),
          {:ok, will_topic, rest5} <- decode_utf8_optional_safe(rest4, will_flag),
+         :ok <- validate_will_topic(will_flag, will_topic),
          {:ok, will_payload, rest6} <- decode_binary_optional_safe(rest5, will_flag),
          {:ok, username, rest7} <- decode_utf8_optional_safe(rest6, user_flag),
          {:ok, password, <<>>} <- decode_binary_optional_safe(rest7, pass_flag) do
@@ -209,7 +210,7 @@ defmodule MqttX.Packet.Codec do
          version,
          @connack,
          0,
-         <<_reserved::7, session_present::1, reason_code::8, rest::binary>>
+         <<0::7, session_present::1, reason_code::8, rest::binary>>
        ) do
     with {:ok, props, <<>>} <- Properties.decode(version, rest) do
       {:ok,
@@ -220,6 +221,11 @@ defmodule MqttX.Packet.Codec do
          properties: props
        }}
     end
+  end
+
+  # §3.2.2.1.1: Connect Acknowledge Flags bits 7-1 are reserved and MUST be 0
+  defp decode_packet(_version, @connack, 0, <<_reserved::7, _::1, _reason::8, _::binary>>) do
+    {:error, :malformed_packet}
   end
 
   # PUBLISH — §3.3.1.2 forbids QoS=3; §3.3.1.1 forbids DUP=1 with QoS=0
@@ -283,9 +289,18 @@ defmodule MqttX.Packet.Codec do
     end
   end
 
+  # MQTT-2.2.1-3 (v3.1.1 MQTT-2.3.1-1): a Packet Identifier of 0 is a Malformed
+  # Packet on SUBSCRIBE and UNSUBSCRIBE (PUBLISH is handled with its QoS below).
+  # The receiver could not even encode the SUBACK/UNSUBACK for it.
+  defp decode_packet(_version, type, 2, <<0::16, _rest::binary>>)
+       when type in [@subscribe, @unsubscribe] do
+    {:error, :malformed_packet}
+  end
+
   # SUBSCRIBE — payload MUST contain at least one topic filter (§3.8.3)
   defp decode_packet(version, @subscribe, 2, <<packet_id::16-big, rest::binary>>) do
     with {:ok, props, topics_bin} <- Properties.decode(version, rest),
+         :ok <- ensure_single_subscription_identifier(props),
          {:ok, topics} <- decode_subscribe_topics(version, topics_bin, []),
          :ok <- ensure_nonempty_topics(topics) do
       {:ok,
@@ -459,6 +474,11 @@ defmodule MqttX.Packet.Codec do
   defp encode_throw_to_error(:mqttx_empty_topic_list), do: {:error, :empty_topic_list}
   defp encode_throw_to_error(:mqttx_value_out_of_range), do: {:error, :value_out_of_range}
 
+  defp encode_throw_to_error(:mqttx_dup_requires_qos), do: {:error, :dup_requires_qos}
+
+  defp encode_throw_to_error(:mqttx_password_without_username),
+    do: {:error, :password_without_username}
+
   defp encode_throw_to_error({:mqttx_invalid_property, name}),
     do: {:error, {:invalid_property, name}}
 
@@ -475,9 +495,18 @@ defmodule MqttX.Packet.Codec do
       throw(:mqttx_value_out_of_range)
     end
 
+    # MQTT-3.1.2-14: Will QoS MUST NOT be 3 (our decoder rejects it too)
+    unless is_integer(will_qos) and will_qos in 0..2, do: throw(:mqttx_invalid_qos)
+
     clean = if Map.get(msg, :clean_session, true), do: 1, else: 0
     username_flag = if msg[:username], do: 1, else: 0
     password_flag = if msg[:password], do: 1, else: 0
+
+    # MQTT-3.1.2-22 (v3.1.1 §3.1.2.9): Password Flag requires User Name Flag.
+    # MQTT 5.0 lifts this (§3.1.2.9 allows a password without a user name).
+    if version < 5 and password_flag == 1 and username_flag == 0 do
+      throw(:mqttx_password_without_username)
+    end
 
     proto_name = protocol_name(version)
 
@@ -512,6 +541,9 @@ defmodule MqttX.Packet.Codec do
     if qos not in 0..2, do: throw(:mqttx_invalid_qos)
 
     dup = if Map.get(msg, :dup, false), do: 1, else: 0
+    # §3.3.1.1 (MQTT-3.3.1-2): DUP MUST be 0 for a QoS 0 message
+    if dup == 1 and qos == 0, do: throw(:mqttx_dup_requires_qos)
+
     retain = if Map.get(msg, :retain, false), do: 1, else: 0
 
     topic =
@@ -602,13 +634,20 @@ defmodule MqttX.Packet.Codec do
   end
 
   # UNSUBACK
-  defp encode_packet(version, %{type: :unsuback} = msg) do
+  defp encode_packet(5, %{type: :unsuback} = msg) do
     packet_id = require_packet_id(msg)
-    props = Properties.encode(version, Map.get(msg, :properties, %{}))
+    props = Properties.encode(5, Map.get(msg, :properties, %{}))
     acks = encode_unsuback_acks(Map.get(msg, :acks, []))
 
     variable = [<<packet_id::16-big>>, props, acks]
     {:ok, {<<@unsuback::4, 0::4>>, variable}}
+  end
+
+  # MQTT 3.1.1 §3.11: UNSUBACK is the packet id alone (remaining length 2) —
+  # there are no reason codes, so `acks` is deliberately not emitted.
+  defp encode_packet(_version, %{type: :unsuback} = msg) do
+    packet_id = require_packet_id(msg)
+    {:ok, {<<@unsuback::4, 0::4>>, [<<packet_id::16-big>>]}}
   end
 
   # PINGREQ
@@ -684,6 +723,25 @@ defmodule MqttX.Packet.Codec do
 
   defp ensure_nonempty_topics([]), do: {:error, :protocol_error}
   defp ensure_nonempty_topics(_), do: :ok
+
+  # §3.8.2.1.2: a SUBSCRIBE carries at most one Subscription Identifier.
+  # Properties.decode folds repeats into a list (legitimate for PUBLISH, where
+  # several identifiers are delivered); here a list means a Protocol Error.
+  defp ensure_single_subscription_identifier(%{subscription_identifier: ids}) when is_list(ids),
+    do: {:error, :protocol_error}
+
+  defp ensure_single_subscription_identifier(_props), do: :ok
+
+  # §3.1.3.3 / §4.7: the Will Topic is a Topic Name — non-empty, no wildcards.
+  # Same error the PUBLISH topic path surfaces for an invalid name.
+  defp validate_will_topic(0, _topic), do: :ok
+
+  defp validate_will_topic(1, topic) do
+    case Topic.validate_publish(topic) do
+      {:ok, _} -> :ok
+      {:error, _} = err -> err
+    end
+  end
 
   defp protocol_name(3), do: @protocol_name_3
   defp protocol_name(_), do: @protocol_name
@@ -782,6 +840,13 @@ defmodule MqttX.Packet.Codec do
         t when is_binary(t) -> t
       end
 
+    # §3.1.3.3: a Will Topic is a Topic Name; never emit one the broker must
+    # reject (wildcards / empty) — mirrors the PUBLISH encoder.
+    case Topic.validate_publish(topic) do
+      {:ok, _} -> :ok
+      {:error, _} -> throw(:mqttx_invalid_topic)
+    end
+
     [
       Properties.encode(version, Map.get(will, :properties, %{})),
       encode_utf8(topic),
@@ -802,6 +867,12 @@ defmodule MqttX.Packet.Codec do
   # ACK payload handling (for MQTT 5.0)
   defp decode_ack_payload(5, <<>>) do
     {:ok, 0, %{}}
+  end
+
+  # §3.4.2.2.1 / §3.5.2.2.1 / §3.6.2.2.1 / §3.7.2.2.1: with Remaining Length
+  # less than 4 there is no Property Length byte and the properties are empty.
+  defp decode_ack_payload(5, <<reason_code::8>>) do
+    {:ok, reason_code, %{}}
   end
 
   defp decode_ack_payload(5, <<reason_code::8, rest::binary>>) do
@@ -835,6 +906,8 @@ defmodule MqttX.Packet.Codec do
   end
 
   defp decode_publish_packet_id(0, rest), do: {:ok, nil, rest}
+  # MQTT-2.2.1-3 (v3.1.1 MQTT-2.3.1-1): Packet Identifier 0 is a Malformed Packet
+  defp decode_publish_packet_id(_qos, <<0::16, _rest::binary>>), do: {:error, :malformed_packet}
   defp decode_publish_packet_id(_qos, <<pid::16-big, rest::binary>>), do: {:ok, pid, rest}
   defp decode_publish_packet_id(_qos, _), do: {:error, :malformed_packet}
 
@@ -872,7 +945,13 @@ defmodule MqttX.Packet.Codec do
         {:error, :malformed_packet}
 
       true ->
+        shared = Topic.shared?(name)
+
         case Topic.validate(name) do
+          # MQTT-3.8.3-4: No Local MUST NOT be set on a Shared Subscription
+          {:ok, _normalized} when nl == 1 and shared ->
+            {:error, :protocol_error}
+
           {:ok, normalized} ->
             topic = %{
               topic: normalized,
@@ -903,6 +982,8 @@ defmodule MqttX.Packet.Codec do
         end
 
       qos = Map.get(topic, :qos, 0)
+      # §3.8.3.1 (v3.1.1 MQTT-3.8.3-4): requested QoS MUST be 0, 1 or 2
+      unless is_integer(qos) and qos in 0..2, do: throw(:mqttx_invalid_qos)
 
       # nl/rap/rh exist only in v5 (§3.8.3.1) — emitting them in a v3.1.1
       # SUBSCRIBE produces a packet the broker must reject
@@ -916,6 +997,9 @@ defmodule MqttX.Packet.Codec do
         else
           {0, 0, 0}
         end
+
+      # §3.8.3.1: Retain Handling 3 is a Protocol Error on the receiver
+      unless is_integer(rh) and rh in 0..2, do: throw(:mqttx_value_out_of_range)
 
       [encode_utf8(name), <<0::2, rh::2, rap::1, nl::1, qos::2>>]
     end)

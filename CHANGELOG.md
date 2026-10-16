@@ -58,6 +58,29 @@ All notable changes to this project will be documented in this file.
   `{:publish, topic, payload, opts, state}` return from `handle_info` and
   delivery is suppressed on subscriptions the client made with
   `no_local: true` when it is itself the publisher (§3.8.3.1).
+- **Enhanced authentication now works on the broker.** A CONNECT carrying
+  an Authentication Method (MQTT 5.0 §4.12) used to be answered with a
+  CONNACK at once — the exchange never ran, so the paths that completed it
+  were unreachable. The broker now calls `handle_auth/3` with the CONNECT's
+  Authentication Data after `handle_connect` accepts and holds the CONNACK
+  until the exchange ends: `{:continue, challenge, state}` sends `AUTH 0x18`
+  and feeds the client's answer back through `handle_auth/3`; `{:ok, state}`
+  — or the new `{:ok, server_final, state}`, for mechanisms like SCRAM whose
+  server has a last word — sends `CONNACK 0x00` repeating the method
+  (MQTT-4.12.0-5) and carrying `server_final`; `{:error, reason_code, state}`
+  sends that CONNACK and closes. An AUTH mid-exchange naming another method
+  or not carrying `0x18`, or any other packet, fails the CONNECT (`0x8C` /
+  `0x82`); a stalled exchange is ended by the CONNECT deadline; a drop before
+  CONNACK fires neither the Will nor `handle_disconnect/2`. Re-authentication
+  must name the CONNECT's method (MQTT-4.12.1-1), so an AUTH on a connection
+  that never used enhanced authentication is refused with `0x8C` without
+  consulting the handler. `handle_connect/4`'s `connect_info` gains an
+  `authentication_method` key (`nil` unless requested). The default
+  `handle_auth/3` still returns `{:error, 0x8C, state}`.
+- **`wss://` on the WebSocket broker transport.** `MqttX.Transport.WebSocket`
+  takes `scheme: :https` plus `transport_options: [certfile:, keyfile:, …]`
+  (the same shape as ThousandIsland's SSL transport) and serves MQTT over TLS
+  WebSockets through Bandit. Previously it was HTTP-only.
 
 ### Changed
 
@@ -84,9 +107,102 @@ All notable changes to this project will be documented in this file.
   only: the in-memory table format changed, so retained messages stored by an
   older version in a still-running BEAM are not visible to the new code;
   a normal restart is unaffected (the store has never survived restarts).
+- **QoS 1/2 packets are no longer re-sent on a live connection.** Both the
+  client and the broker ran a timer that re-sent an unacknowledged PUBLISH
+  (with `DUP`) or PUBREL every 5 s and silently discarded the message after
+  three attempts; the broker also re-sent PUBREC on its own and dropped an
+  incoming QoS 2 message that was still waiting for its PUBREL. MQTT 5.0 §4.4
+  forbids re-sending except when a session is resumed [MQTT-4.4.0-1], and
+  3.1.1 tolerates it only as a concession to "older TCP networks". On a live
+  socket a missing acknowledgement means the peer is slow or gone — which the
+  keep-alive detects — not that bytes were lost, and the timed drop lost
+  QoS 1/2 messages without any `:publish_error`. In-flight packets are now
+  held until acknowledged or until the connection ends; the client's re-send
+  on session resumption (`session_present: true`) is unchanged, and
+  backpressure comes from `:max_inflight` and the peer's Receive Maximum as
+  before. One visible consequence: a client that never completes a QoS 2
+  flow now holds one Receive Maximum slot on the broker until it disconnects,
+  where previously the message was dropped after ~15 s and its eventual
+  PUBREL answered as if it had been delivered.
+
+### Deprecated
+
+- `:retry_interval` on `MqttX.Client`, and `:qos2_retry_interval` /
+  `:qos2_max_retries` in the broker's `transport_opts`, are accepted but
+  ignored and log a warning at start; they will be removed in a later
+  release. There is no replacement — in-session retransmission is not part of
+  the protocol (see Changed).
 
 ### Fixed
 
+- **Conformance audit.** Every normative statement of MQTT 5.0 (251) and
+  MQTT 3.1.1 (138) was traced to the code that enforces it, and what did not
+  hold up was fixed:
+  - *Broker.* A QoS 1 PUBLISH that `handle_publish` refused got no PUBACK, so
+    the publisher held the Packet Identifier in flight forever (MQTT-3.3.4-1);
+    it is now acknowledged with a refusal code — see `handle_publish/4`.
+    Receive Maximum overruns were answered with PUBACK/PUBREC 0x93 and
+    rate-limit overruns with 0x96, both DISCONNECT-only codes; the former is
+    now DISCONNECT 0x93 and close (§4.9), the latter PUBACK/PUBREC 0x97 Quota
+    exceeded with the session kept. Will Delay was scheduled under one key and
+    cancelled under another, so a reconnect never cancelled a delayed Will
+    (MQTT-3.1.3-9). Every broker-initiated close — a handler's
+    `{:disconnect, ...}`, `MqttX.Server.disconnect/3`, a protocol error,
+    session takeover — suppressed the Will, which the spec publishes unless
+    the client itself sent DISCONNECT 0x00 (§3.1.2.5); a taken-over connection
+    now drops only a *delayed* Will and no longer arms session expiry for a
+    session the new connection owns. A zero-length v5 Client Identifier ran as
+    `""`; the broker now assigns one, hands it to `handle_connect` and
+    returns it as Assigned Client Identifier (MQTT-3.1.3-6/-7). Handler reason
+    codes reached 3.1.1 clients unmapped in CONNACK (`0x86` → return code 4,
+    `0x87` → 5, …), and a v5 CONNACK or SUBACK could carry codes those packets
+    do not define (now `0x80`). Outbound Packet Identifiers could be reused
+    while still in flight once the counter wrapped (MQTT-2.2.1-4). UNSUBSCRIBE
+    of a filter never subscribed answered `0x00` instead of `0x11`. A SUBACK
+    could grant a QoS above the one requested. A client PUBLISH carrying a
+    Subscription Identifier is refused (MQTT-3.3.4-6). Application-supplied
+    `topic_alias` / `subscription_identifier` properties are stripped from
+    outbound publishes (MQTT-3.1.2-26). A server DISCONNECT never carries
+    Session Expiry Interval (MQTT-3.14.2-2). A live AUTH must be 0x18/0x19 and
+    name its method. An oversized packet during the enhanced-auth exchange
+    gets CONNACK 0x95, not a DISCONNECT (MQTT-3.14.0-1). A WebSocket text
+    frame closes the connection (MQTT-6.0.0-1). The Receive Maximum queue is
+    bounded by the new `:max_outbound_queue` option (default 10 000,
+    previously hard-coded) and ages Message Expiry Interval while a message
+    waits, dropping one that expired (MQTT-3.3.2-6).
+  - *Codec.* A v3.1.1 UNSUBACK carried one payload byte per filter — it has
+    none, and strict clients dropped the connection on every unsubscribe. A
+    v5 PUBACK/PUBREC/PUBREL/PUBCOMP with a Reason Code but no Property Length,
+    the legal short form, was rejected as malformed, tearing down the client
+    connection whenever a broker answered e.g. PUBACK 0x10. Packet Identifier
+    0 is a Malformed Packet on PUBLISH/SUBSCRIBE/UNSUBSCRIBE (MQTT-2.2.1-3).
+    Property strings are UTF-8-validated on encode as they were on decode
+    (MQTT-1.5.4-1/-2). Malformed `$share` filters (`$share//t`, `$share/g`,
+    `$share/g/`, wildcards in the ShareName) are rejected (MQTT-4.8.2-1/-2),
+    as are No Local on a shared subscription (MQTT-3.8.3-4), a repeated
+    Subscription Identifier in SUBSCRIBE, a Will Topic with wildcards,
+    non-zero reserved CONNACK flag bits and — on encode — Will QoS 3,
+    SUBSCRIBE QoS 3, Retain Handling 3, DUP at QoS 0, and a 3.1.1 password
+    without a user name.
+  - *Client.* `publish/4` returns `{:error, :qos_not_supported}` /
+    `{:error, :retain_not_supported}` when the broker's Maximum QoS or Retain
+    Available forbids the publish (MQTT-3.2.2-11/-14) — previously the broker
+    disconnected the client (0x9B/0x9A) and it reconnect-looped. `subscribe/3`
+    returns `{:error, :invalid_qos}`, `{:error, :invalid_retain_handling}` or
+    `{:error, :no_local_on_shared_subscription}` instead of putting an invalid
+    SUBSCRIBE on the wire, and a `:will_qos` outside 0..2 raises at start. A
+    server AUTH arriving when the CONNECT asked for no Authentication Method
+    is a Protocol Error (MQTT-4.12.0-7) instead of being answered. A WebSocket
+    text frame closes the connection. `pending_seq` is restored with a
+    persisted session, so a second resumption re-sends in the original order
+    (MQTT-4.6.0-1). A PUBREC for an unknown id is answered with PUBREL 0x92 on
+    v5 (§3.6.2.1), and acks for ids not in flight no longer drift the send
+    window.
+- **The broker sent DISCONNECT before any CONNACK.** A packet other than
+  CONNECT arriving first — or an AUTH with no CONNECT behind it — was answered
+  with `DISCONNECT 0x82` and the socket closed. MQTT 5.0 forbids a DISCONNECT
+  until a successful CONNACK has been sent (MQTT-3.14.0-1); the connection is
+  now simply closed (§4.13).
 - **Receiving a large packet across many reads was quadratic.** Both the
   broker and the client appended each read to the buffer and re-attempted a
   decode, which re-copied everything buffered so far on every read. A packet

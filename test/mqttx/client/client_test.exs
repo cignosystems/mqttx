@@ -1,6 +1,8 @@
 defmodule MqttX.ClientTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias MqttX.Client
 
   # A port that is guaranteed to refuse connections right now — these tests
@@ -76,17 +78,22 @@ defmodule MqttX.ClientTest do
       GenServer.stop(pid, :normal, 1000)
     end
 
-    test "accepts retry_interval option" do
-      {:ok, pid} =
-        Client.connect(
-          host: "localhost",
-          port: closed_port(),
-          client_id: "test",
-          retry_interval: 10_000
-        )
+    test "accepts the deprecated retry_interval option, with a warning" do
+      log =
+        capture_log(fn ->
+          {:ok, pid} =
+            Client.connect(
+              host: "localhost",
+              port: closed_port(),
+              client_id: "test",
+              retry_interval: 10_000
+            )
 
-      assert is_pid(pid)
-      GenServer.stop(pid, :normal, 1000)
+          assert is_pid(pid)
+          GenServer.stop(pid, :normal, 1000)
+        end)
+
+      assert log =~ ":retry_interval is deprecated and ignored since 0.12.0"
     end
 
     test "accepts session_store option" do

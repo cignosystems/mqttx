@@ -7,9 +7,18 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
 
     ## Usage
 
+        # ws://
         MqttX.Server.start_link(MyHandler, handler_opts,
           transport: MqttX.Transport.WebSocket,
           port: 8083
+        )
+
+        # wss://
+        MqttX.Server.start_link(MyHandler, handler_opts,
+          transport: MqttX.Transport.WebSocket,
+          port: 8084,
+          scheme: :https,
+          transport_options: [certfile: "/etc/mqttx/cert.pem", keyfile: "/etc/mqttx/key.pem"]
         )
 
     ## Options
@@ -17,6 +26,12 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
     - `:port` - Port to listen on (default: 8083)
     - `:ip` - IP address to bind to (default: `{0, 0, 0, 0}`)
     - `:path` - WebSocket path (default: `/mqtt`)
+    - `:scheme` - `:http` for `ws://` (default) or `:https` for `wss://`
+    - `:transport_options` - Socket options for Bandit's listener. With
+      `scheme: :https` this is where the TLS configuration goes — at least
+      `:certfile` and `:keyfile`; any `:ssl` server option is accepted — the
+      same shape `MqttX.Transport.ThousandIsland` takes for `transport_module:
+      ThousandIsland.Transports.SSL`
     - `:max_frame_size` - Largest WebSocket frame accepted, in bytes
       (`:infinity` disables). When unset, websock_adapter's own default
       applies — note that changed in websock_adapter 0.6.0 from `:infinity`
@@ -56,14 +71,29 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
         max_frame_size: Keyword.get(transport_opts, :max_frame_size)
       }
 
+      scheme = Keyword.get(transport_opts, :scheme, :http)
+
+      if scheme not in [:http, :https] do
+        raise ArgumentError, ":scheme must be :http or :https, got: #{inspect(scheme)}"
+      end
+
+      # Bandit turns these into the ThousandIsland listener's socket options;
+      # for :https they are the TLS configuration (certfile, keyfile, ...)
+      transport_options = Keyword.get(transport_opts, :transport_options, [])
+
       bandit_opts = [
         plug: {__MODULE__.Plug, plug_opts},
         port: port,
         ip: ip,
-        scheme: :http
+        scheme: scheme,
+        thousand_island_options: [transport_options: transport_options]
       ]
 
-      Logger.info("[MqttX.Transport.WebSocket] Starting on port #{port}")
+      Logger.info(
+        "[MqttX.Transport.WebSocket] Starting #{if scheme == :https, do: "wss", else: "ws"} " <>
+          "listener on port #{port}"
+      )
+
       Bandit.start_link(bandit_opts)
     end
 
@@ -185,6 +215,13 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
         {:error, _reason, s} ->
           stop_with_frames(s, {1011, ""})
       end
+    end
+
+    # MQTT-6.0.0-1: MQTT travels in binary frames only. A text frame (or any
+    # other data opcode) is a protocol violation that ends the connection;
+    # 1003 is RFC 6455's "cannot accept this data type".
+    def handle_in({_data, [opcode: _other]}, state) do
+      {:stop, :normal, {1003, "MQTT requires binary frames"}, state}
     end
 
     def handle_in(_other, state) do

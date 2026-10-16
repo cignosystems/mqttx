@@ -268,7 +268,9 @@ defmodule MqttX.Transport.HandlerTest do
       assert_received {:sent, connack_data}
       {:ok, {connack, <<>>}} = Codec.decode(4, IO.iodata_to_binary(connack_data))
       assert connack.type == :connack
-      assert connack.reason_code == 0x86
+      # The handler answered 0x86 Bad user name or password; a 3.1.1 CONNACK
+      # only has return codes 1..5, so it goes out as 4 (§3.2.2.3)
+      assert connack.reason_code == 4
     end
   end
 
@@ -419,7 +421,8 @@ defmodule MqttX.Transport.HandlerTest do
       state = connect_client(ctx, "sd-client")
 
       {:stop, :normal, new_state} = Proto.handle_info({:server_disconnect, 0x8E, %{}}, state)
-      assert new_state.graceful_disconnect == true
+      # Server-initiated: not a graceful close, so the Will still publishes (§3.1.2.5)
+      refute new_state.graceful_disconnect
     end
 
     test "ignores unknown messages when handler has no handle_info", ctx do
@@ -542,131 +545,12 @@ defmodule MqttX.Transport.HandlerTest do
       # Inflight count should not have increased
       assert state2.inflight_count == state.inflight_count
     end
-
-    test "retry timer fires and resends PUBREC for stale RX entries", ctx do
-      state = connect_client(ctx, "qos2-retry")
-      drain_mailbox()
-
-      # Manually create a stale pending entry (timestamp in the past)
-      past = System.monotonic_time(:millisecond) - 10_000
-
-      packet = %{
-        type: :publish,
-        topic: "retry/topic",
-        payload: "retry-msg",
-        qos: 2,
-        retain: false,
-        dup: false,
-        packet_id: 30,
-        properties: %{}
-      }
-
-      opts = %{qos: 2, retain: false, dup: false, packet_id: 30, properties: %{}}
-      state = %{state | pending_qos2_rx: %{30 => {packet, opts, past, 0}}}
-
-      {:noreply, new_state} = Proto.handle_info(:check_qos2_retry, state)
-
-      # Should have resent PUBREC
-      assert_received {:sent, pubrec_data}
-      {:ok, {pubrec, <<>>}} = Codec.decode(4, IO.iodata_to_binary(pubrec_data))
-      assert pubrec.type == :pubrec
-      assert pubrec.packet_id == 30
-
-      # Retry count should have incremented
-      {_p, _o, _ts, retries} = new_state.pending_qos2_rx[30]
-      assert retries == 1
-    end
-
-    test "drops entries after max retries", ctx do
-      state = connect_client(ctx, "qos2-drop")
-      drain_mailbox()
-
-      past = System.monotonic_time(:millisecond) - 10_000
-
-      packet = %{
-        type: :publish,
-        topic: "drop/topic",
-        payload: "drop",
-        qos: 2,
-        retain: false,
-        dup: false,
-        packet_id: 40,
-        properties: %{}
-      }
-
-      opts = %{qos: 2, retain: false, dup: false, packet_id: 40, properties: %{}}
-      state = %{state | pending_qos2_rx: %{40 => {packet, opts, past, 3}}, inflight_count: 1}
-
-      {:noreply, new_state} = Proto.handle_info(:check_qos2_retry, state)
-
-      # Entry should be dropped
-      assert new_state.pending_qos2_rx == %{}
-      assert new_state.inflight_count == 0
-    end
   end
 
-  describe "QoS 1 outbound retransmission" do
-    test "retry timer resends QoS 1 PUBLISH with DUP=true and increments retries", ctx do
-      state = connect_client(ctx, "qos1-retry")
-      drain_mailbox()
-
-      past = System.monotonic_time(:millisecond) - 10_000
-
-      packet = %{
-        type: :publish,
-        topic: "qos1/retry",
-        payload: "msg",
-        qos: 1,
-        retain: false,
-        dup: false,
-        packet_id: 50,
-        properties: %{}
-      }
-
-      state = %{state | pending_qos1_tx: %{50 => {packet, past, 0}}}
-
-      {:noreply, new_state} = Proto.handle_info(:check_qos2_retry, state)
-
-      assert_received {:sent, publish_data}
-      {:ok, {resent, <<>>}} = Codec.decode(4, IO.iodata_to_binary(publish_data))
-      assert resent.type == :publish
-      assert resent.qos == 1
-      assert resent.dup == true
-      assert resent.packet_id == 50
-
-      {_p, _ts, retries} = new_state.pending_qos1_tx[50]
-      assert retries == 1
-    end
-
-    test "drops QoS 1 entry after max retries", ctx do
-      state = connect_client(ctx, "qos1-drop")
-      drain_mailbox()
-
-      past = System.monotonic_time(:millisecond) - 10_000
-
-      packet = %{
-        type: :publish,
-        topic: "qos1/drop",
-        payload: "drop",
-        qos: 1,
-        retain: false,
-        dup: false,
-        packet_id: 60,
-        properties: %{}
-      }
-
-      state = %{state | pending_qos1_tx: %{60 => {packet, past, 3}}}
-
-      {:noreply, new_state} = Proto.handle_info(:check_qos2_retry, state)
-
-      assert new_state.pending_qos1_tx == %{}
-    end
-
+  describe "QoS 1 outbound tracking" do
     test "PUBACK clears the pending_qos1_tx entry", ctx do
       state = connect_client(ctx, "qos1-puback")
       drain_mailbox()
-
-      now = System.monotonic_time(:millisecond)
 
       packet = %{
         type: :publish,
@@ -679,7 +563,7 @@ defmodule MqttX.Transport.HandlerTest do
         properties: %{}
       }
 
-      state = %{state | pending_qos1_tx: %{70 => {packet, now, 0}}}
+      state = %{state | pending_qos1_tx: %{70 => packet}}
 
       puback = %{type: :puback, packet_id: 70}
       {:ok, data} = Codec.encode(4, puback)
@@ -892,15 +776,16 @@ defmodule MqttX.Transport.HandlerTest do
       assert_received {:sent, _pubrec2}
       assert state.inflight_count == 2
 
-      # QoS 2 Publish 3 — rejected with 0x93 (inflight at max)
+      # QoS 2 Publish 3 — a Protocol Error: DISCONNECT 0x93 and close (§4.9).
+      # 0x93 is not a PUBREC code, so there is no per-message refusal.
       pub3 = %{pub1 | packet_id: 3, payload: "3"}
       {:ok, d3} = Codec.encode(5, pub3)
-      {:ok, _state} = Proto.handle_data(d3, state)
+      {:close, {:server_disconnect, 0x93}, _state} = Proto.handle_data(d3, state)
 
-      assert_received {:sent, pubrec3_data}
-      {:ok, {pubrec3, <<>>}} = Codec.decode(5, IO.iodata_to_binary(pubrec3_data))
-      assert pubrec3.type == :pubrec
-      assert pubrec3.reason_code == 0x93
+      assert_received {:sent, disconnect_data}
+      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
+      assert disconnect.type == :disconnect
+      assert disconnect.reason_code == 0x93
     end
 
     test "rejects QoS 2 publish when inflight exceeds receive_maximum", ctx do
@@ -945,22 +830,21 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, state} = Proto.handle_data(d1, state)
       assert_received {:sent, _pubrec1}
 
-      # Second QoS 2 — should be rejected with 0x93
+      # Second QoS 2 — DISCONNECT 0x93 and close
       pub2 = %{pub1 | packet_id: 2, payload: "2"}
       {:ok, d2} = Codec.encode(5, pub2)
-      {:ok, _state} = Proto.handle_data(d2, state)
+      {:close, {:server_disconnect, 0x93}, _state} = Proto.handle_data(d2, state)
 
-      assert_received {:sent, pubrec2_data}
-      {:ok, {pubrec2, <<>>}} = Codec.decode(5, IO.iodata_to_binary(pubrec2_data))
-      assert pubrec2.type == :pubrec
-      assert pubrec2.reason_code == 0x93
+      assert_received {:sent, disconnect_data}
+      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
+      assert disconnect.type == :disconnect
+      assert disconnect.reason_code == 0x93
     end
 
-    test "rejects QoS 1 publish with PUBACK 0x93 when inflight reaches receive_maximum",
-         ctx do
+    test "a QoS 1 publish past receive_maximum is also a DISCONNECT 0x93", ctx do
       # §3.1.2.11.3: Receive Maximum bounds QoS 1 AND QoS 2 inbound. Once the
       # limit is filled (e.g. by un-PUBCOMP'd QoS 2 messages), a subsequent
-      # QoS 1 must also be refused — current handler answers with PUBACK 0x93.
+      # QoS 1 is the same Protocol Error.
       {:ok, state} =
         Proto.init(
           TestHandler,
@@ -1003,7 +887,7 @@ defmodule MqttX.Transport.HandlerTest do
       assert_received {:sent, _pubrec}
       assert state.inflight_count == 1
 
-      # Now a QoS 1 must be refused with PUBACK 0x93
+      # Now a QoS 1 is refused with DISCONNECT 0x93
       qos1 = %{
         type: :publish,
         topic: "fc/q1",
@@ -1016,12 +900,12 @@ defmodule MqttX.Transport.HandlerTest do
       }
 
       {:ok, d_qos1} = Codec.encode(5, qos1)
-      {:ok, _state} = Proto.handle_data(d_qos1, state)
+      {:close, {:server_disconnect, 0x93}, _state} = Proto.handle_data(d_qos1, state)
 
-      assert_received {:sent, puback_data}
-      {:ok, {puback, <<>>}} = Codec.decode(5, IO.iodata_to_binary(puback_data))
-      assert puback.type == :puback
-      assert puback.reason_code == 0x93
+      assert_received {:sent, disconnect_data}
+      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
+      assert disconnect.type == :disconnect
+      assert disconnect.reason_code == 0x93
     end
   end
 
@@ -1070,7 +954,8 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, data} = Codec.encode(5, publish)
       {:close, :packet_too_large, new_state} = Proto.handle_data(data, state)
 
-      assert new_state.graceful_disconnect == true
+      # Server-initiated: the Will still publishes (§3.1.2.5)
+      refute new_state.graceful_disconnect
 
       # Should have sent DISCONNECT with 0x95
       assert_received {:sent, disc_data}
@@ -1180,7 +1065,7 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, data} = Codec.encode(5, publish)
       {:close, {:server_disconnect, 0x8E}, new_state} = Proto.handle_data(data, state)
 
-      assert new_state.graceful_disconnect == true
+      refute new_state.graceful_disconnect
 
       # Should have sent DISCONNECT packet
       assert_received {:sent, disc_data}
@@ -1194,7 +1079,7 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       {:stop, :normal, new_state} = Proto.handle_info({:server_disconnect, 0x98, %{}}, state)
-      assert new_state.graceful_disconnect == true
+      refute new_state.graceful_disconnect
 
       assert_received {:sent, disc_data}
       {:ok, {disc, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disc_data))
@@ -1202,7 +1087,7 @@ defmodule MqttX.Transport.HandlerTest do
       assert disc.reason_code == 0x98
     end
 
-    test "will message NOT published on server-initiated disconnect (graceful)", ctx do
+    test "will message IS published on a server-initiated disconnect (§3.1.2.5)", ctx do
       {:ok, state} =
         Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
@@ -1226,20 +1111,47 @@ defmodule MqttX.Transport.HandlerTest do
 
       assert state.will_message != nil
 
-      # Server disconnect (graceful)
-      {:stop, :normal, new_state} = Proto.handle_info({:server_disconnect, 0x8E, %{}}, state)
-      assert new_state.graceful_disconnect == true
+      # "The Server closes the Network Connection without first receiving a
+      # DISCONNECT packet with a Reason Code 0x00" is a Will case
+      {:stop, :normal, new_state} = Proto.handle_info({:server_disconnect, 0x98, %{}}, state)
+      refute new_state.graceful_disconnect
 
-      # Handle close after server disconnect
       {:shutdown, _} = Proto.handle_close(new_state)
 
-      # Will message should NOT have been published (graceful disconnect)
       events = Agent.get(ctx.agent, & &1)
+      assert {:publish, "will/topic", "will-msg"} in events
+    end
 
-      refute Enum.any?(events, fn
-               {:publish, "will/topic", _} -> true
-               _ -> false
-             end)
+    test "will message is NOT published when the client sent DISCONNECT 0x00", ctx do
+      {:ok, state} =
+        Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+
+      will = %{topic: "will/topic", payload: "will-msg", qos: 0, retain: false, properties: %{}}
+
+      connect = %{
+        type: :connect,
+        protocol_version: 5,
+        client_id: "disc-will-normal",
+        username: nil,
+        password: nil,
+        will: will,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
+      }
+
+      {:ok, data} = Codec.encode(5, connect)
+      {:ok, state} = Proto.handle_data(data, state)
+      drain_mailbox()
+
+      {:ok, data} = Codec.encode(5, %{type: :disconnect, reason_code: 0x00, properties: %{}})
+      {:close, :disconnect, new_state} = Proto.handle_data(data, state)
+      assert new_state.graceful_disconnect
+
+      {:shutdown, _} = Proto.handle_close(new_state)
+
+      events = Agent.get(ctx.agent, & &1)
+      refute Enum.any?(events, &match?({:publish, "will/topic", _}, &1))
     end
 
     test "handle_info {:trigger_disconnect, code} through DisconnectOnPublishHandler", ctx do
@@ -1269,7 +1181,7 @@ defmodule MqttX.Transport.HandlerTest do
       drain_mailbox()
 
       {:stop, :normal, new_state} = Proto.handle_info({:trigger_disconnect, 0x98}, state)
-      assert new_state.graceful_disconnect == true
+      refute new_state.graceful_disconnect
 
       assert_received {:sent, disc_data}
       {:ok, {disc, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disc_data))
@@ -1281,172 +1193,202 @@ defmodule MqttX.Transport.HandlerTest do
   # ===== AUTH Flow =====
 
   describe "AUTH flow" do
-    test "continue → correct response → CONNACK success", ctx do
+    test "CONNECT with an Authentication Method defers CONNACK until the exchange succeeds",
+         ctx do
       {:ok, state} =
         Proto.init(TestAuthHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
-      # First, connect the client (v5 required for AUTH)
-      connect = %{
-        type: :connect,
-        protocol_version: 5,
-        client_id: "auth-ok",
-        username: nil,
-        password: nil,
-        will: nil,
-        clean_session: true,
-        keep_alive: 0,
-        properties: %{}
-      }
+      # No Authentication Data in the CONNECT: the handler answers with a challenge
+      state = feed5(state, auth_connect("auth-ok", %{authentication_method: "PLAIN"}))
 
-      {:ok, data} = Codec.encode(5, connect)
-      {:ok, state} = Proto.handle_data(data, state)
-      drain_mailbox()
+      assert %{type: :auth, reason_code: 0x18, properties: props} = sent5()
+      assert props.authentication_method == "PLAIN"
+      assert props.authentication_data == "challenge-data"
+      refute_received {:sent, _}
+      refute state.connected
+      assert %{packet: %{client_id: "auth-ok"}} = state.pending_connect
 
-      # Send AUTH with nil data → should get {:continue, "challenge-data", state}
-      auth1 = %{type: :auth, reason_code: 0x18, properties: %{authentication_method: "PLAIN"}}
-      {:ok, data} = Codec.encode(5, auth1)
-      {:ok, state} = Proto.handle_data(data, state)
+      state =
+        feed5(state, %{
+          type: :auth,
+          reason_code: 0x18,
+          properties: %{authentication_method: "PLAIN", authentication_data: "correct-response"}
+        })
 
-      # Should receive AUTH continue with challenge data
-      assert_received {:sent, auth_resp_data}
-      {:ok, {auth_resp, <<>>}} = Codec.decode(5, IO.iodata_to_binary(auth_resp_data))
-      assert auth_resp.type == :auth
-      assert auth_resp.reason_code == 0x18
-      assert auth_resp.properties.authentication_data == "challenge-data"
-
-      # Send correct response
-      auth2 = %{
-        type: :auth,
-        reason_code: 0x18,
-        properties: %{authentication_method: "PLAIN", authentication_data: "correct-response"}
-      }
-
-      {:ok, data} = Codec.encode(5, auth2)
-      {:ok, state} = Proto.handle_data(data, state)
-
-      # Re-authentication success is signaled with AUTH 0x00 (§4.12.1) —
-      # a second CONNACK on a live connection would be a protocol violation.
-      assert_received {:sent, auth_ok_data}
-      {:ok, {auth_ok, <<>>}} = Codec.decode(5, IO.iodata_to_binary(auth_ok_data))
-      assert auth_ok.type == :auth
-      assert auth_ok.reason_code == 0x00
-      assert state.connected == true
+      # MQTT-4.12.0-5: the successful CONNACK repeats the method
+      assert %{type: :connack, reason_code: 0, properties: props} = sent5()
+      assert props.authentication_method == "PLAIN"
+      refute Map.has_key?(props, :authentication_data)
+      assert state.connected
+      assert state.pending_connect == nil
+      assert state.auth_method == "PLAIN"
     end
 
-    test "continue response sends AUTH with reason 0x18 and challenge data", ctx do
+    test "Authentication Data in the CONNECT itself can complete the exchange at once", ctx do
       {:ok, state} =
         Proto.init(TestAuthHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
-      connect = %{
-        type: :connect,
-        protocol_version: 5,
-        client_id: "auth-continue",
-        username: nil,
-        password: nil,
-        will: nil,
-        clean_session: true,
-        keep_alive: 0,
-        properties: %{}
-      }
+      state =
+        feed5(
+          state,
+          auth_connect("auth-onestep", %{
+            authentication_method: "PLAIN",
+            authentication_data: "correct-response"
+          })
+        )
 
-      {:ok, data} = Codec.encode(5, connect)
-      {:ok, state} = Proto.handle_data(data, state)
-      drain_mailbox()
+      assert %{type: :connack, reason_code: 0, properties: %{authentication_method: "PLAIN"}} =
+               sent5()
 
-      auth = %{type: :auth, reason_code: 0x18, properties: %{authentication_method: "PLAIN"}}
-      {:ok, data} = Codec.encode(5, auth)
-      {:ok, _state} = Proto.handle_data(data, state)
-
-      assert_received {:sent, auth_data}
-      {:ok, {auth_pkt, <<>>}} = Codec.decode(5, IO.iodata_to_binary(auth_data))
-      assert auth_pkt.type == :auth
-      assert auth_pkt.reason_code == 0x18
-      assert auth_pkt.properties.authentication_method == "PLAIN"
-      assert auth_pkt.properties.authentication_data == "challenge-data"
+      assert state.connected
     end
 
-    test "wrong response → CONNACK 0x87, connection closed", ctx do
+    test "a wrong answer gets CONNACK 0x87 and the connection closes", ctx do
       {:ok, state} =
         Proto.init(TestAuthHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
-      connect = %{
-        type: :connect,
-        protocol_version: 5,
-        client_id: "auth-fail",
-        username: nil,
-        password: nil,
-        will: nil,
-        clean_session: true,
-        keep_alive: 0,
-        properties: %{}
-      }
-
-      {:ok, data} = Codec.encode(5, connect)
-      {:ok, state} = Proto.handle_data(data, state)
+      state = feed5(state, auth_connect("auth-fail", %{authentication_method: "PLAIN"}))
       drain_mailbox()
 
-      # First get to the continue state
-      auth1 = %{type: :auth, reason_code: 0x18, properties: %{authentication_method: "PLAIN"}}
-      {:ok, data} = Codec.encode(5, auth1)
-      {:ok, state} = Proto.handle_data(data, state)
-      drain_mailbox()
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :auth,
+          reason_code: 0x18,
+          properties: %{authentication_method: "PLAIN", authentication_data: "wrong-response"}
+        })
 
-      # Send wrong response
-      auth2 = %{
-        type: :auth,
-        reason_code: 0x18,
-        properties: %{authentication_method: "PLAIN", authentication_data: "wrong-response"}
-      }
+      assert {:close, :auth_failed, closed} = Proto.handle_data(data, state)
 
-      {:ok, data} = Codec.encode(5, auth2)
-      {:close, :auth_failed, _state} = Proto.handle_data(data, state)
-
-      # Failed re-authentication ends with DISCONNECT, not a second CONNACK
-      assert_received {:sent, disconnect_data}
-      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
-      assert disconnect.type == :disconnect
-      assert disconnect.reason_code == 0x87
+      # A CONNACK, not a DISCONNECT — none may precede a successful CONNACK
+      # (MQTT-3.14.0-1)
+      assert %{type: :connack, reason_code: 0x87} = sent5()
+      refute closed.connected
+      assert closed.pending_connect == nil
     end
 
-    test "default handle_auth (TestHandler) → DISCONNECT 0x8C, connection closed", ctx do
+    test "the default handle_auth/3 refuses enhanced authentication with CONNACK 0x8C", ctx do
       {:ok, state} =
         Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
-      connect = %{
-        type: :connect,
-        protocol_version: 5,
-        client_id: "auth-default",
-        username: nil,
-        password: nil,
-        will: nil,
-        clean_session: true,
-        keep_alive: 0,
-        properties: %{}
-      }
+      {:ok, data} =
+        Codec.encode(5, auth_connect("auth-default", %{authentication_method: "PLAIN"}))
 
-      {:ok, data} = Codec.encode(5, connect)
-      {:ok, state} = Proto.handle_data(data, state)
-      drain_mailbox()
-
-      auth = %{type: :auth, reason_code: 0x18, properties: %{authentication_method: "PLAIN"}}
-      {:ok, data} = Codec.encode(5, auth)
-      result = Proto.handle_data(data, state)
-
-      # Default handle_auth returns {:error, 0x8C, state} — on a live
-      # connection the rejection is a DISCONNECT, not a second CONNACK
-      assert {:close, _, _} = result
-
-      assert_received {:sent, disconnect_data}
-      {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
-      assert disconnect.type == :disconnect
-      assert disconnect.reason_code == 0x8C
+      assert {:close, :auth_failed, _} = Proto.handle_data(data, state)
+      assert %{type: :connack, reason_code: 0x8C} = sent5()
     end
+
+    test "re-authentication on a live connection succeeds with AUTH 0x00 and fails with DISCONNECT",
+         ctx do
+      {:ok, state} =
+        Proto.init(TestAuthHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+
+      state =
+        feed5(
+          state,
+          auth_connect("auth-reauth", %{
+            authentication_method: "PLAIN",
+            authentication_data: "correct-response"
+          })
+        )
+
+      assert %{type: :connack, reason_code: 0} = sent5()
+
+      # §4.12.1: the client starts over with 0x19 Re-authenticate
+      state =
+        feed5(state, %{
+          type: :auth,
+          reason_code: 0x19,
+          properties: %{authentication_method: "PLAIN"}
+        })
+
+      assert %{
+               type: :auth,
+               reason_code: 0x18,
+               properties: %{authentication_data: "challenge-data"}
+             } =
+               sent5()
+
+      state =
+        feed5(state, %{
+          type: :auth,
+          reason_code: 0x18,
+          properties: %{authentication_method: "PLAIN", authentication_data: "correct-response"}
+        })
+
+      # Success is AUTH 0x00 — a second CONNACK on a live connection would be a
+      # protocol violation
+      assert %{type: :auth, reason_code: 0x00, properties: %{authentication_method: "PLAIN"}} =
+               sent5()
+
+      assert state.connected
+
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :auth,
+          reason_code: 0x19,
+          properties: %{authentication_method: "PLAIN", authentication_data: "wrong-response"}
+        })
+
+      assert {:close, :auth_failed, closed} = Proto.handle_data(data, state)
+      # MQTT-4.12.1-2: DISCONNECT. Server-initiated, so the Will still publishes
+      assert %{type: :disconnect, reason_code: 0x87} = sent5()
+      refute closed.graceful_disconnect
+    end
+
+    test "AUTH on a connection that did not use enhanced authentication is refused with 0x8C",
+         ctx do
+      {:ok, state} =
+        Proto.init(TestAuthHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
+
+      state = feed5(state, auth_connect("auth-none", %{}))
+      assert %{type: :connack, reason_code: 0, properties: props} = sent5()
+      # MQTT-4.12.0-6: no Authentication Method in that CONNACK either
+      refute Map.has_key?(props, :authentication_method)
+
+      # Even a handler that could run PLAIN is not asked: the method "does not
+      # match the authentication method currently in use" (none) — 0x8C
+      {:ok, data} =
+        Codec.encode(5, %{
+          type: :auth,
+          reason_code: 0x19,
+          properties: %{authentication_method: "PLAIN"}
+        })
+
+      assert {:close, :auth_failed, _} = Proto.handle_data(data, state)
+      assert %{type: :disconnect, reason_code: 0x8C} = sent5()
+    end
+  end
+
+  defp auth_connect(client_id, properties) do
+    %{
+      type: :connect,
+      protocol_version: 5,
+      client_id: client_id,
+      username: nil,
+      password: nil,
+      will: nil,
+      clean_session: true,
+      keep_alive: 0,
+      properties: properties
+    }
+  end
+
+  defp feed5(state, packet) do
+    {:ok, data} = Codec.encode(5, packet)
+    {:ok, state} = Proto.handle_data(data, state)
+    state
+  end
+
+  defp sent5 do
+    assert_received {:sent, data}
+    {:ok, {packet, <<>>}} = Codec.decode(5, IO.iodata_to_binary(data))
+    packet
   end
 
   # ===== MQTT Compliance Tests =====
 
   describe "pre-CONNECT packet rejection" do
-    test "rejects PUBLISH before CONNECT with protocol error", ctx do
+    test "closes on a PUBLISH before CONNECT without answering (MQTT-3.14.0-1)", ctx do
       {:ok, state} =
         Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, ctx.send_fn)
 
@@ -1463,6 +1405,8 @@ defmodule MqttX.Transport.HandlerTest do
 
       {:ok, data} = Codec.encode(4, publish)
       {:close, :protocol_error, _state} = Proto.handle_data(data, state)
+      # No DISCONNECT may be sent before a successful CONNACK
+      refute_received {:sent, _}
     end
   end
 
@@ -1485,7 +1429,7 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, data} = Codec.encode(5, publish)
       {:close, {:server_disconnect, 0x94}, new_state} = Proto.handle_data(data, state)
 
-      assert new_state.graceful_disconnect == true
+      refute new_state.graceful_disconnect
 
       assert_received {:sent, disc_data}
       {:ok, {disc, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disc_data))

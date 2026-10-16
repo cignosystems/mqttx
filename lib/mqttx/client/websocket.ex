@@ -2,7 +2,10 @@ defmodule MqttX.Client.WebSocket do
   @moduledoc false
   # Minimal WebSocket client for MQTT over WebSocket.
   # Handles HTTP upgrade handshake and WebSocket binary framing (RFC 6455).
-  # Supports binary, text, ping/pong, close, and continuation frames.
+  # Supports binary, ping/pong, close, and continuation frames. Text frames
+  # and reserved opcodes are rejected: MQTT-6.0.0-1 requires every MQTT
+  # Control Packet to travel in a binary data frame, and any other kind of
+  # data frame must close the Network Connection.
 
   require Logger
 
@@ -15,7 +18,7 @@ defmodule MqttX.Client.WebSocket do
   ends); since one TCP read can land mid-message, we keep the partial buffer
   here. `{<<>>, nil}` means no message in progress.
   """
-  @type frag_state :: {binary(), :binary | :text | nil}
+  @type frag_state :: {binary(), :binary | nil}
 
   @initial_frag {<<>>, nil}
 
@@ -93,9 +96,12 @@ defmodule MqttX.Client.WebSocket do
   frames — `pings` are the payloads of any Ping frames seen, which RFC 6455
   §5.5.2 requires answering with a matching Pong — `{:close, payloads}` if a
   Close frame was seen, `{:error, :frame_too_large}` if a frame declares a
-  payload above the internal ceiling, or `{:error, :message_too_large}` if the
-  fragments of one message add up to more than it. Callers that don't need to
-  distinguish fragmented messages can use `decode_frames/1` (initial state).
+  payload above the internal ceiling, `{:error, :message_too_large}` if the
+  fragments of one message add up to more than it, or
+  `{:error, :non_binary_frame}` for a text frame or a reserved opcode: MQTT
+  travels in binary frames only, and anything else must close the connection
+  (MQTT-6.0.0-1). Callers that don't need to distinguish fragmented messages
+  can use `decode_frames/1` (initial state).
   """
   def decode_frames(buffer), do: decode_frames(buffer, @initial_frag)
 
@@ -137,9 +143,16 @@ defmodule MqttX.Client.WebSocket do
       {:ok, :close, _payload, _rest} ->
         {:close, Enum.reverse(acc)}
 
-      # First fragment (FIN=0, opcode=binary|text)
+      # First fragment (FIN=0, opcode=binary)
       {:ok, {:fragment_start, type}, payload, rest} ->
         decode_frames(rest, acc, pings, {payload, type})
+
+      # MQTT-6.0.0-1: a text frame, or a frame with a reserved opcode, is not
+      # a carrier for MQTT bytes — close the connection rather than feed its
+      # payload to the packet decoder. Reported ahead of anything decoded in
+      # the same read; the connection is going away regardless.
+      {:ok, :non_binary, _payload, _rest} ->
+        {:error, :non_binary_frame}
 
       # Middle fragment (FIN=0, opcode=continuation 0x00)
       {:ok, :fragment_middle, payload, rest} ->
@@ -155,8 +168,8 @@ defmodule MqttX.Client.WebSocket do
           :too_large -> {:error, :message_too_large}
         end
 
-      # Standalone complete data frame (FIN=1, opcode=binary|text)
-      {:ok, type, payload, rest} when type in [:binary, :text] ->
+      # Standalone complete data frame (FIN=1, opcode=binary)
+      {:ok, :binary, payload, rest} ->
         decode_frames(rest, [payload | acc], pings, frag)
 
       :too_large ->
@@ -208,15 +221,14 @@ defmodule MqttX.Client.WebSocket do
 
   defp classify_frame(1, 0x00), do: :fragment_end
   defp classify_frame(0, 0x00), do: :fragment_middle
-  defp classify_frame(0, 0x01), do: {:fragment_start, :text}
   defp classify_frame(0, 0x02), do: {:fragment_start, :binary}
-  defp classify_frame(1, 0x01), do: :text
   defp classify_frame(1, 0x02), do: :binary
   defp classify_frame(_, 0x08), do: :close
   defp classify_frame(_, 0x09), do: :ping
   defp classify_frame(_, 0x0A), do: :pong
-  # Unknown opcode — treat as binary so it surfaces upstream rather than hanging
-  defp classify_frame(_, _), do: :binary
+  # Text (0x01) and the reserved opcodes (0x03-0x07, 0x0B-0x0F): not a frame
+  # MQTT may arrive in (MQTT-6.0.0-1, RFC 6455 §5.2) — rejected by the caller
+  defp classify_frame(_, _), do: :non_binary
 
   defp decode_length(len, 0, rest) when len < 126 do
     {:ok, len, nil, rest}

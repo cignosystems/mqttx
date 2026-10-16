@@ -348,5 +348,41 @@ defmodule MqttX.Transport.WebSocketTest do
 
       :gen_tcp.close(socket)
     end
+
+    test "a text frame closes the connection — MQTT travels in binary frames only (MQTT-6.0.0-1)" do
+      {:ok, agent} = Agent.start_link(fn -> [] end)
+      {_server_pid, port} = start_ws_server(TestHandler, agent: agent)
+
+      socket = ws_connect(port)
+
+      connect_packet = %{
+        type: :connect,
+        protocol_version: 4,
+        client_id: "ws-text-client",
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: true,
+        keep_alive: 0,
+        properties: %{}
+      }
+
+      # A valid CONNECT, but in a masked TEXT frame (opcode 1)
+      {:ok, connect_data} = Codec.encode(4, connect_packet)
+      mask_key = :crypto.strong_rand_bytes(4)
+
+      frame =
+        <<0x81, Bitwise.bor(0x80, byte_size(connect_data)), mask_key::binary,
+          mask_payload(connect_data, mask_key)::binary>>
+
+      :ok = :gen_tcp.send(socket, frame)
+
+      # Close frame (opcode 8) with 1003 "unsupported data"; the CONNECT was
+      # never processed as MQTT
+      assert {:ok, <<0x88, _len, 1003::16, _rest::binary>>} = :gen_tcp.recv(socket, 0, 5000)
+      refute {:connect, "ws-text-client"} in Agent.get(agent, & &1)
+
+      :gen_tcp.close(socket)
+    end
   end
 end

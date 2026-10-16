@@ -544,12 +544,17 @@ defmodule MqttX.Packet.Properties do
 
   # §1.5.4/§1.5.6: the 2-byte length prefix caps strings and binaries at
   # 65,535 bytes; larger values would silently wrap modulo 65536 and corrupt
-  # the framing. The throw is caught at the Codec.encode boundary.
+  # the framing. MQTT-1.5.4-1/-2 (and MQTT-1.5.7-1 for User Property pairs):
+  # a UTF-8 String property must be well-formed, with no U+0000 and no
+  # surrogates — the same rule decode_utf8/1 applies, so we never emit a
+  # property our own decoder (or a strict peer) rejects. Throws are caught at
+  # the Codec.encode boundary.
   defp encode_utf8(str) when byte_size(str) > 0xFFFF do
     throw(:mqttx_string_too_long)
   end
 
   defp encode_utf8(str) when is_binary(str) do
+    unless valid_mqtt_utf8?(str), do: throw(:mqttx_invalid_utf8)
     <<byte_size(str)::16-big, str::binary>>
   end
 

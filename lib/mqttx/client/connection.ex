@@ -46,9 +46,7 @@ defmodule MqttX.Client.Connection do
   @default_ws_port 8083
   @default_wss_port 8084
   @default_keepalive 60
-  @default_retry_interval 5000
   @default_max_inflight 100
-  @max_retries 3
   @connect_timeout 5000
 
   # Ceiling on a single inbound MQTT packet (1 MiB). Mirrors the server-side
@@ -77,7 +75,6 @@ defmodule MqttX.Client.Connection do
     :buffer,
     :pending_acks,
     :ssl_opts,
-    :retry_timer,
     :session_store,
     :session_store_state,
     :subscriptions,
@@ -101,7 +98,6 @@ defmodule MqttX.Client.Connection do
     # HTTP CONNECT proxy: [host:, port:, auth: {user, pass}] or nil (direct)
     proxy: nil,
     transport: :tcp,
-    retry_interval: @default_retry_interval,
     connected: false,
     clean_session: true,
     # Incoming topic aliases (alias -> topic, MQTT 5.0)
@@ -111,6 +107,12 @@ defmodule MqttX.Client.Connection do
     next_alias: 1,
     # Server's topic_alias_maximum (from CONNACK, for outgoing aliases)
     server_topic_alias_maximum: 0,
+    # Highest QoS the server accepts on our PUBLISHes (§3.2.2.3.4, from
+    # CONNACK; absent = 2). MQTT-3.2.2-11: we MUST NOT send above it.
+    server_maximum_qos: 2,
+    # Whether the server accepts retained PUBLISHes (§3.2.2.3.5, from CONNACK;
+    # absent = true). MQTT-3.2.2-14: we MUST NOT set RETAIN when it is false.
+    server_retain_available: true,
     # WebSocket path (for :ws/:wss transport)
     ws_path: "/mqtt",
     # WebSocket frame buffer (for :ws/:wss transport)
@@ -176,7 +178,8 @@ defmodule MqttX.Client.Connection do
     defaults to 3128, `:auth` is optional Basic auth). TLS is negotiated with
     the *target* host through the tunnel, so certificate verification and SNI
     are unaffected by the proxy.
-  - `:retry_interval` - Retry interval for unacknowledged QoS 1/2 messages in ms (default: 5000)
+  - `:retry_interval` - Deprecated and ignored since 0.12.0: unacknowledged QoS 1/2
+    publishes are re-sent only when a session is resumed, never on a live connection (§4.4)
   - `:max_inflight` - Maximum pending QoS 1/2 messages before backpressure (default: 100)
   - `:will_topic` - Will message topic (enables Last Will & Testament)
   - `:will_payload` - Will message payload (default: `""`)
@@ -185,14 +188,32 @@ defmodule MqttX.Client.Connection do
   - `:will_properties` - Will message properties map (MQTT 5.0, default: `%{}`)
   - `:connect_properties` - CONNECT packet properties (MQTT 5.0), e.g. `%{session_expiry_interval: 3600}`
   - `:session_store` - Session store module or `{module, opts}` for session persistence
+
+  Raises `ArgumentError` if `:will_qos` is not 0, 1 or 2 (§3.1.2.6): a bad
+  Will QoS would make every CONNECT a Malformed Packet.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
+    validate_will_opts!(opts)
+
     # Validate required options up front so callers get {:error, _} per the
     # documented contract instead of a GenServer init crash (KeyError).
     case Enum.find([:host, :client_id], &(not Keyword.has_key?(opts, &1))) do
       nil -> GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
       missing -> {:error, {:missing_option, missing}}
+    end
+  end
+
+  # Checked in the caller's process: raising from init/1 would exit the
+  # linked caller instead of surfacing as an ArgumentError.
+  defp validate_will_opts!(opts) do
+    case Keyword.fetch(opts, :will_qos) do
+      {:ok, qos} when qos not in [0, 1, 2] ->
+        raise ArgumentError,
+              "invalid :will_qos #{inspect(qos)} — the Will QoS must be 0, 1 or 2 (MQTT §3.1.2.6)"
+
+      _ ->
+        :ok
     end
   end
 
@@ -222,6 +243,21 @@ defmodule MqttX.Client.Connection do
     (Payload Format Indicator, Content Type) is merged into `:properties`
     underneath any given explicitly. An encoding failure returns
     `{:error, {:codec, reason}}` without touching the connection.
+
+  ## Returns
+
+  `:ok` once the packet is written to the socket, or `{:error, reason}`:
+
+  - `:not_connected` - no live session (the call does not queue)
+  - `:invalid_qos` - `:qos` is not 0, 1 or 2
+  - `:qos_not_supported` - `:qos` is above the Maximum QoS the broker
+    advertised in CONNACK (MQTT 5.0 §3.2.2.3.4, MQTT-3.2.2-11). The QoS is
+    not lowered silently; publish again at the supported level.
+  - `:retain_not_supported` - `retain: true` but the broker advertised
+    Retain Available = 0 in CONNACK (§3.2.2.3.5, MQTT-3.2.2-14)
+  - `:flow_control` - the in-flight QoS 1/2 window is full
+  - `:packet_too_large` - larger than the broker's Maximum Packet Size
+  - `{:codec, reason}` - the `:codec` could not encode `payload`
   """
   @spec publish(GenServer.server(), binary(), term(), keyword()) :: :ok | {:error, term()}
   def publish(pid, topic, payload, opts \\ []) do
@@ -253,12 +289,55 @@ defmodule MqttX.Client.Connection do
   - `:retain_as_published` - Keep original retain flag (MQTT 5.0, default: false)
   - `:retain_handling` - Retained message behavior: 0=send on subscribe, 1=send if new, 2=don't send (MQTT 5.0, default: 0)
   - `:properties` - SUBSCRIBE packet properties map (MQTT 5.0), e.g. `%{subscription_identifier: 1}`
+
+  ## Returns
+
+  `{:ok, granted_qos_list}` once the SUBACK arrives, or `{:error, reason}`:
+
+  - `:not_connected` - no live session
+  - `:invalid_qos` - `:qos` is not 0, 1 or 2 (§3.8.3.1). Requesting a QoS
+    above the broker's Maximum QoS is allowed; the broker grants a lower one.
+  - `:invalid_retain_handling` - `:retain_handling` is not 0, 1 or 2 (§3.8.3.1)
+  - `:no_local_on_shared_subscription` - `no_local: true` on a `$share/...`
+    filter, a Protocol Error (MQTT-3.8.3-4)
+  - `{:subscription_refused, acks}` - the broker rejected at least one filter
+
+  Option errors are detected before anything is sent, so an invalid option
+  never puts a malformed SUBSCRIBE on the wire.
   """
   @spec subscribe(GenServer.server(), binary() | [binary()], keyword()) ::
           {:ok, [integer()]} | {:error, term()}
   def subscribe(pid, topics, opts \\ []) do
     topics = if is_binary(topics), do: [topics], else: topics
-    GenServer.call(pid, {:subscribe, topics, opts})
+
+    case validate_subscribe_opts(topics, opts) do
+      :ok -> GenServer.call(pid, {:subscribe, topics, opts})
+      {:error, _} = err -> err
+    end
+  end
+
+  # §3.8.3.1: the Subscription Options byte allows QoS 0..2 and Retain
+  # Handling 0..2 (other values are Malformed Packets), and MQTT-3.8.3-4 makes
+  # No Local on a Shared Subscription a Protocol Error. Caught here, at the
+  # API edge, so the caller gets an error instead of the broker a bad packet.
+  defp validate_subscribe_opts(topics, opts) do
+    qos = Keyword.get(opts, :qos, 0)
+    retain_handling = Keyword.get(opts, :retain_handling, 0)
+    no_local = Keyword.get(opts, :no_local, false)
+
+    cond do
+      qos not in 0..2 ->
+        {:error, :invalid_qos}
+
+      retain_handling not in 0..2 ->
+        {:error, :invalid_retain_handling}
+
+      no_local == true and Enum.any?(topics, &MqttX.Topic.shared?/1) ->
+        {:error, :no_local_on_shared_subscription}
+
+      true ->
+        :ok
+    end
   end
 
   @doc """
@@ -325,6 +404,14 @@ defmodule MqttX.Client.Connection do
     client_id = Keyword.fetch!(opts, :client_id)
     clean_session = Keyword.get(opts, :clean_session, true)
 
+    if Keyword.has_key?(opts, :retry_interval) do
+      Logger.warning(
+        "[MqttX.Client] :retry_interval is deprecated and ignored since 0.12.0: " <>
+          "unacknowledged QoS 1/2 publishes are re-sent only when a session is " <>
+          "resumed, never on a live connection (MQTT §4.4). Remove the option."
+      )
+    end
+
     # Initialize session store if configured
     {session_store, session_store_state} = init_session_store(Keyword.get(opts, :session_store))
 
@@ -366,7 +453,6 @@ defmodule MqttX.Client.Connection do
           size when is_integer(size) and size > 0 -> size
           _ -> @default_max_packet_size
         end,
-      retry_interval: Keyword.get(opts, :retry_interval, @default_retry_interval),
       session_store: session_store,
       session_store_state: session_store_state,
       subscriptions: subscriptions,
@@ -374,6 +460,7 @@ defmodule MqttX.Client.Connection do
       packet_id: packet_id,
       buffer: <<>>,
       pending_acks: pending_acks,
+      pending_seq: next_pending_seq(pending_acks),
       max_inflight: Keyword.get(opts, :max_inflight, @default_max_inflight),
       will: build_will(opts),
       connect_properties: connect_properties,
@@ -427,6 +514,18 @@ defmodule MqttX.Client.Connection do
         # the whole connection with a CaseClauseError.
         qos not in 0..2 ->
           {:reply, {:error, :invalid_qos}, state}
+
+        # MQTT-3.2.2-11: never exceed the Maximum QoS from CONNACK. Sending
+        # anyway gets the connection DISCONNECTed with 0x9B (QoS not
+        # supported) and the client into a reconnect loop; lowering the QoS
+        # silently would hide a delivery guarantee the caller asked for.
+        qos > state.server_maximum_qos ->
+          {:reply, {:error, :qos_not_supported}, state}
+
+        # MQTT-3.2.2-14: no RETAIN when the server said Retain Available = 0
+        # (the server would answer DISCONNECT 0x9A).
+        retain == true and not state.server_retain_available ->
+          {:reply, {:error, :retain_not_supported}, state}
 
         # Check flow control for QoS 1/2 (MQTT 5.0 receive_maximum)
         qos > 0 and not can_send_qos_message?(state) ->
@@ -485,15 +584,14 @@ defmodule MqttX.Client.Connection do
                 else
                   phase = if qos == 1, do: :puback_pending, else: :pubrec_pending
 
-                  retry_packet = %{packet | topic: topic, properties: properties}
+                  stored_packet = %{packet | topic: topic, properties: properties}
 
                   pending =
                     Map.put(state.pending_acks, {:tx, packet_id}, %{
                       phase: phase,
-                      packet: retry_packet,
+                      packet: stored_packet,
                       timestamp: System.monotonic_time(:millisecond),
                       telemetry_meta: telemetry_meta,
-                      retries: 0,
                       seq: state.pending_seq
                     })
 
@@ -749,16 +847,6 @@ defmodule MqttX.Client.Connection do
     state = notify_handler(state, :disconnected, :pingresp_timeout)
     state = schedule_reconnect(state)
     {:noreply, state}
-  end
-
-  def handle_info(:check_inflight, state) do
-    if state.connected do
-      state = retry_expired_messages(state)
-      timer = Process.send_after(self(), :check_inflight, state.retry_interval)
-      {:noreply, %{state | retry_timer: timer}}
-    else
-      {:noreply, state}
-    end
   end
 
   # Handle incoming data from both TCP and SSL sockets
@@ -1038,9 +1126,33 @@ defmodule MqttX.Client.Connection do
 
         connect_failed(state, {:connack_error, code, %{server_reference: server_ref}})
 
+      {:ok, {%{type: :auth} = auth_packet, rest}} ->
+        handle_connect_auth(auth_packet, rest, state)
+
+      {:ok, {_other, _rest}} ->
+        # §3.2.0-1: the first packet from the server MUST be CONNACK (or AUTH)
+        connect_failed(state, :protocol_error)
+
+      {:error, :incomplete} ->
+        park_inbound(state)
+
+      {:error, reason} ->
+        connect_failed(state, reason)
+    end
+  end
+
+  # AUTH received before CONNACK.
+  defp handle_connect_auth(auth_packet, rest, state) do
+    cond do
+      # §4.12: a server MUST NOT send AUTH to a client whose CONNECT carried
+      # no Authentication Method (MQTT-4.12.0-7) — receiving one is a
+      # Protocol Error, not a challenge to answer.
+      not enhanced_auth_requested?(state) ->
+        connect_failed(state, {:protocol_error, :unexpected_auth})
+
       # Enhanced AUTH continuation during connect (MQTT 5.0 §4.12). Note the
       # connack deadline keeps running — AUTH rounds don't extend it.
-      {:ok, {%{type: :auth, reason_code: 0x18} = auth_packet, rest}} ->
+      Map.get(auth_packet, :reason_code) == 0x18 ->
         props = Map.get(auth_packet, :properties, %{})
 
         case notify_handler_auth(state, 0x18, props) do
@@ -1060,15 +1172,9 @@ defmodule MqttX.Client.Connection do
             process_connack_buffer(%{state | buffer: rest})
         end
 
-      {:ok, {_other, _rest}} ->
-        # §3.2.0-1: the first packet from the server MUST be CONNACK (or AUTH)
+      # Only Continue authentication (0x18) is valid before CONNACK
+      true ->
         connect_failed(state, :protocol_error)
-
-      {:error, :incomplete} ->
-        park_inbound(state)
-
-      {:error, reason} ->
-        connect_failed(state, reason)
     end
   end
 
@@ -1129,7 +1235,6 @@ defmodule MqttX.Client.Connection do
         connect_telemetry: nil,
         backoff: Backoff.reset(state.backoff),
         keepalive_timer: keepalive_timer,
-        retry_timer: Process.send_after(self(), :check_inflight, state.retry_interval),
         pingresp_timer: nil,
         keepalive: keepalive,
         client_id: client_id,
@@ -1137,6 +1242,9 @@ defmodule MqttX.Client.Connection do
         receive_maximum: Map.get(props, :receive_maximum, 65535),
         server_maximum_packet_size: Map.get(props, :maximum_packet_size),
         server_topic_alias_maximum: Map.get(props, :topic_alias_maximum, 0),
+        # §3.2.2.3.4 / §3.2.2.3.5: absent means QoS 2 and retain are allowed
+        server_maximum_qos: Map.get(props, :maximum_qos, 2),
+        server_retain_available: Map.get(props, :retain_available, true) not in [false, 0],
         # §3.2.2.3.2: a Session Expiry Interval in CONNACK replaces ours
         session_expiry_interval:
           Map.get(props, :session_expiry_interval, state.session_expiry_interval),
@@ -1241,6 +1349,9 @@ defmodule MqttX.Client.Connection do
   defp fatal_connack?(_state, _reason), do: false
 
   # Resynchronize in-flight QoS 1/2 state with the (possibly resumed) session.
+  # Resumption is the one time the spec has a client re-send unacknowledged
+  # PUBLISH/PUBREL packets (§4.4, MQTT-4.4.0-1); nothing re-sends them while a
+  # connection is up.
   defp sync_inflight_after_connect(state, true = _session_present) do
     now = System.monotonic_time(:millisecond)
 
@@ -1254,8 +1365,8 @@ defmodule MqttX.Client.Connection do
       resend_packet(state, packet_id, entry.packet, entry.phase)
     end)
 
-    # Refresh timestamps so the periodic retry loop measures from this
-    # resend (also repairs monotonic timestamps loaded from a previous VM)
+    # Refresh timestamps so ack-latency telemetry measures from this resend
+    # (also repairs monotonic timestamps loaded from a previous VM)
     pending =
       Map.new(state.pending_acks, fn
         {{:tx, _} = key, entry} -> {key, %{entry | timestamp: now}}
@@ -1395,8 +1506,7 @@ defmodule MqttX.Client.Connection do
           state
       end
 
-    pending = Map.delete(state.pending_acks, {:tx, packet.packet_id})
-    %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
+    release_tx(state, packet.packet_id)
   end
 
   # QoS 2 - received PUBREC for our outgoing PUBLISH
@@ -1424,8 +1534,22 @@ defmodule MqttX.Client.Connection do
 
         %{state | pending_acks: pending}
 
+      nil when state.protocol_version >= 5 ->
+        # PUBREC for an id we are not tracking: §3.6.2.1 lets the sender
+        # answer PUBREL 0x92 (Packet Identifier not found) so the receiver can
+        # release its half of the QoS 2 state instead of holding it forever.
+        # The PUBCOMP that comes back finds no entry and changes nothing.
+        send_packet(state, %{
+          type: :pubrel,
+          packet_id: packet.packet_id,
+          reason_code: 0x92,
+          properties: %{}
+        })
+
+        state
+
       _ ->
-        # Unexpected PUBREC, ignore
+        # Unexpected PUBREC (pre-5, or an id in another phase), ignore
         state
     end
   end
@@ -1484,8 +1608,7 @@ defmodule MqttX.Client.Connection do
         :ok
     end
 
-    pending = Map.delete(state.pending_acks, {:tx, packet.packet_id})
-    %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
+    release_tx(state, packet.packet_id)
   end
 
   defp handle_packet(%{type: :suback} = packet, state) do
@@ -1550,24 +1673,13 @@ defmodule MqttX.Client.Connection do
 
   # Enhanced authentication (MQTT 5.0 §4.12)
   defp handle_packet(%{type: :auth} = packet, state) do
-    reason_code = Map.get(packet, :reason_code, 0)
-    props = Map.get(packet, :properties, %{})
-
-    case notify_handler_auth(state, reason_code, props) do
-      {:continue, auth_data, state} ->
-        send_packet(state, %{
-          type: :auth,
-          reason_code: 0x18,
-          properties: %{
-            authentication_method: Map.get(props, :authentication_method),
-            authentication_data: auth_data
-          }
-        })
-
-        state
-
-      {:ok, state} ->
-        state
+    if enhanced_auth_requested?(state) do
+      handle_auth_packet(packet, state)
+    else
+      # MQTT-4.12.0-7: AUTH is only valid once our CONNECT named an
+      # Authentication Method. Anything else is a Protocol Error (§4.13).
+      send_packet(state, %{type: :disconnect, reason_code: 0x82, properties: %{}})
+      protocol_error_teardown(state, :unexpected_auth)
     end
   end
 
@@ -1598,6 +1710,44 @@ defmodule MqttX.Client.Connection do
 
   defp handle_packet(_packet, state) do
     state
+  end
+
+  # Drop a completed outgoing QoS 1/2 entry and free its in-flight slot. An ack
+  # for an id we are not tracking (a PUBCOMP answering our PUBREL 0x92, or a
+  # stray ack from the broker) must leave the count alone, or the flow-control
+  # window drifts open by one for every such packet.
+  defp release_tx(state, packet_id) do
+    case Map.pop(state.pending_acks, {:tx, packet_id}) do
+      {nil, _pending} ->
+        state
+
+      {_entry, pending} ->
+        %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
+    end
+  end
+
+  # AUTH on a live connection (re-authentication, §4.12.1) or a further round
+  # of the handshake — hand the challenge to the handler.
+  defp handle_auth_packet(packet, state) do
+    reason_code = Map.get(packet, :reason_code, 0)
+    props = Map.get(packet, :properties, %{})
+
+    case notify_handler_auth(state, reason_code, props) do
+      {:continue, auth_data, state} ->
+        send_packet(state, %{
+          type: :auth,
+          reason_code: 0x18,
+          properties: %{
+            authentication_method: Map.get(props, :authentication_method),
+            authentication_data: auth_data
+          }
+        })
+
+        state
+
+      {:ok, state} ->
+        state
+    end
   end
 
   defp handle_publish_packet(packet, topic, state) do
@@ -1754,11 +1904,6 @@ defmodule MqttX.Client.Connection do
     %{state | keepalive_timer: nil}
   end
 
-  defp cancel_retry_timer(state) do
-    if state.retry_timer, do: Process.cancel_timer(state.retry_timer)
-    %{state | retry_timer: nil}
-  end
-
   # Cancel every per-connection timer and fail in-flight subscribe callers.
   # Must run on ALL teardown paths — a pingresp deadline that survives into
   # the next connection generation would tear down a healthy socket, and a
@@ -1767,7 +1912,6 @@ defmodule MqttX.Client.Connection do
   defp cancel_conn_timers(state) do
     state
     |> cancel_keepalive()
-    |> cancel_retry_timer()
     |> cancel_pingresp_timer()
     |> fail_pending_subs()
   end
@@ -1786,70 +1930,23 @@ defmodule MqttX.Client.Connection do
     %{state | pending_subs: %{}}
   end
 
-  defp retry_expired_messages(state) do
-    now = System.monotonic_time(:millisecond)
-
-    {to_retry, dropped_count, pending} =
-      Enum.reduce(state.pending_acks, {[], 0, state.pending_acks}, fn
-        {{:tx, packet_id} = key, %{packet: packet, timestamp: ts, retries: retries} = entry},
-        {retry, dropped, acc} ->
-          age = now - ts
-
-          cond do
-            # Message expired and exceeded max retries - remove it
-            age > state.retry_interval and retries >= @max_retries ->
-              Logger.warning(
-                "[MqttX.Client] Dropping packet #{packet_id} after #{retries} retries"
-              )
-
-              {retry, dropped + 1, Map.delete(acc, key)}
-
-            # Message expired - retry it
-            age > state.retry_interval ->
-              updated_entry = %{entry | timestamp: now, retries: retries + 1}
-
-              {[{packet_id, packet, entry.phase} | retry], dropped,
-               Map.put(acc, key, updated_entry)}
-
-            # Message not expired yet
-            true ->
-              {retry, dropped, acc}
-          end
-
-        # Skip received messages (rx) - they don't need retry. Reducer accumulator
-        # is a 3-tuple, so we must return the full shape (previously returned `acc`
-        # — which crashed with MatchError once both rx and tx entries coexisted).
-        _other, {retry, dropped, acc} ->
-          {retry, dropped, acc}
-      end)
-
-    # Resend expired messages with dup flag
-    Enum.each(to_retry, fn {packet_id, packet, phase} ->
-      resend_packet(state, packet_id, packet, phase)
-    end)
-
-    %{
-      state
-      | pending_acks: pending,
-        inflight_tx_count: max(0, state.inflight_tx_count - dropped_count)
-    }
-  end
-
+  # Re-send one in-flight packet because the session was resumed (§4.4). A
+  # re-delivered PUBLISH carries DUP (MQTT-3.3.1-1); PUBREL has no DUP flag.
   defp resend_packet(state, packet_id, packet, phase) do
     case phase do
       :puback_pending ->
         # QoS 1: resend PUBLISH with dup=true
-        Logger.debug("[MqttX.Client] Retrying PUBLISH packet #{packet_id}")
+        Logger.debug("[MqttX.Client] Resending PUBLISH packet #{packet_id}")
         send_packet(state, %{packet | dup: true})
 
       :pubrec_pending ->
         # QoS 2 phase 1: resend PUBLISH with dup=true
-        Logger.debug("[MqttX.Client] Retrying PUBLISH packet #{packet_id}")
+        Logger.debug("[MqttX.Client] Resending PUBLISH packet #{packet_id}")
         send_packet(state, %{packet | dup: true})
 
       :pubcomp_pending ->
         # QoS 2 phase 2: resend PUBREL
-        Logger.debug("[MqttX.Client] Retrying PUBREL packet #{packet_id}")
+        Logger.debug("[MqttX.Client] Resending PUBREL packet #{packet_id}")
         send_packet(state, %{type: :pubrel, packet_id: packet_id})
 
       _ ->
@@ -1947,6 +2044,13 @@ defmodule MqttX.Client.Connection do
 
   defp notify_handler_auth(state, _reason_code, _props), do: {:ok, state}
 
+  # Did our CONNECT carry an Authentication Method (§3.1.2.11.9)? Only then may
+  # the server send AUTH at all (MQTT-4.12.0-7).
+  defp enhanced_auth_requested?(%{connect_properties: props}) when is_map(props),
+    do: Map.has_key?(props, :authentication_method)
+
+  defp enhanced_auth_requested?(_state), do: false
+
   # Session store helpers
   defp init_session_store(nil), do: {nil, nil}
 
@@ -1996,6 +2100,17 @@ defmodule MqttX.Client.Connection do
           "[MqttX.Client] Failed to delete persisted session for #{inspect(client_id)}: #{inspect(reason)}"
         )
     end
+  end
+
+  # Continue the submission counter above anything restored from the store:
+  # §4.6 orders the resend on resumption by `seq`, so a counter restarting at
+  # 0 would make publishes from this VM incarnation sort ahead of older
+  # in-flight messages the next time the session is resumed.
+  defp next_pending_seq(pending_acks) when map_size(pending_acks) == 0, do: 0
+
+  defp next_pending_seq(pending_acks) do
+    seqs = for {{:tx, _id}, %{seq: seq}} when is_integer(seq) <- pending_acks, do: seq
+    if seqs == [], do: 0, else: Enum.max(seqs) + 1
   end
 
   defp load_session(client_id, store, store_state) do

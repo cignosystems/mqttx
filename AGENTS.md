@@ -32,7 +32,7 @@ The codec is dep-free; transports are optional packages:
 | Any client transport behind an HTTP `CONNECT` proxy | nothing extra — pass `proxy: [host:, port:, auth:]` |
 | WebSocket client (`ws` / `wss`) | nothing extra (RFC 6455 client is built-in) |
 | TCP server | `{:thousand_island, "~> 1.4"}` (preferred) or `{:ranch, "~> 2.2"}` |
-| WebSocket server | `{:bandit, "~> 1.6"} + {:websock_adapter, "~> 0.5 or ~> 0.6"}` |
+| WebSocket server (`ws`, or `wss` with `scheme: :https`) | `{:bandit, "~> 1.6"} + {:websock_adapter, "~> 0.5 or ~> 0.6"}` |
 
 If `MqttX.Transport.ThousandIsland` (or `Ranch`, or `Bandit`) fails at server
 startup with an undefined-module / undefined-function error, the
@@ -110,6 +110,10 @@ subscriptions, subscription identifiers are attached, and passing
 `publisher: client_id` in `opts` honors `no_local`. A publish matching no
 subscription is still sent as-is. `handle_subscribe` may reject individual
 topics by granting a reason code `>= 0x80` (e.g. `0x87`) instead of a QoS.
+`handle_publish` may refuse a message with `{:error, reason, state}`; it is
+still acknowledged (a QoS 1 PUBACK carries a refusal code, `0x87` for
+`:unauthorized`), because an unacknowledged QoS 1/2 message would stay in
+flight at the publisher forever.
 
 ## Idiomatic patterns
 
@@ -239,6 +243,8 @@ end
 
 Reason codes worth knowing: `0x80` Unspecified, `0x86` Bad credentials,
 `0x87` Not authorized, `0x95` Packet too large, `0x97` Quota exceeded.
+Always return the MQTT 5.0 code: for an MQTT 3.1.1 client the broker maps it
+to the nearest CONNACK return code itself (`0x86` → 4, `0x87` → 5).
 Full list in MQTT 5.0 §2.4.
 
 ## Common mistakes (do not do these)

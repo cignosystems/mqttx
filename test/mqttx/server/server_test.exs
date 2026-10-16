@@ -1,6 +1,8 @@
 defmodule MqttX.Server.ServerTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   describe "behaviour callbacks" do
     test "defines required callbacks" do
       callbacks = MqttX.Server.behaviour_info(:callbacks)
@@ -141,6 +143,30 @@ defmodule MqttX.Server.ServerTest do
     test "handle_info can return publish tuple" do
       result = CustomHandler.handle_info({:publish, "topic", "payload"}, %{})
       assert {:publish, "topic", "payload", %{}} = result
+    end
+  end
+
+  describe "deprecated transport_opts" do
+    test "the pre-0.12 retry knobs are accepted, warned about and ignored" do
+      {:ok, socket} = :gen_tcp.listen(0, [])
+      {:ok, port} = :inet.port(socket)
+      :gen_tcp.close(socket)
+
+      log =
+        capture_log(fn ->
+          {:ok, server} =
+            MqttX.Server.start_link(
+              TestHandler,
+              [transport_opts: %{qos2_retry_interval: 1000, qos2_max_retries: 1}],
+              port: port,
+              transport: MqttX.Transport.ThousandIsland
+            )
+
+          ThousandIsland.stop(server)
+        end)
+
+      assert log =~
+               "deprecated transport_opts ignored since 0.12.0: :qos2_retry_interval and :qos2_max_retries"
     end
   end
 

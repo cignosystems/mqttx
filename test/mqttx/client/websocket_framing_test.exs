@@ -156,6 +156,42 @@ defmodule MqttX.Client.WebSocketFramingTest do
     end
   end
 
+  describe "frame types (MQTT-6.0.0-1)" do
+    @pingreq <<0xC0, 0>>
+
+    test "a binary frame yields its payload" do
+      assert {:ok, [@pingreq], [], <<>>, _frag} = WebSocket.decode_frames(frame(@pingreq, 1, 2))
+    end
+
+    test "a text frame is a protocol error, not MQTT bytes" do
+      # The probe from the audit: a PINGREQ inside a text frame used to decode
+      assert WebSocket.decode_frames(<<0x81, 2, 0xC0, 0>>) == {:error, :non_binary_frame}
+    end
+
+    test "a fragmented text message is rejected on its first frame" do
+      assert WebSocket.decode_frames(frame("ab", 0, 1)) == {:error, :non_binary_frame}
+    end
+
+    test "reserved data and control opcodes are rejected" do
+      for opcode <- Enum.concat(0x3..0x7, 0xB..0xF) do
+        assert WebSocket.decode_frames(frame(@pingreq, 1, opcode)) ==
+                 {:error, :non_binary_frame},
+               "opcode #{opcode} should be rejected"
+      end
+    end
+
+    test "the error wins over frames decoded earlier in the same read" do
+      stream = frame(@pingreq, 1, 2) <> frame(@pingreq, 1, 1)
+      assert WebSocket.decode_frames(stream) == {:error, :non_binary_frame}
+    end
+
+    test "control frames keep their handling" do
+      assert {:ok, [], ["hi"], <<>>, _} = WebSocket.decode_frames(frame("hi", 1, 9))
+      assert {:ok, [], [], <<>>, _} = WebSocket.decode_frames(frame("hi", 1, 10))
+      assert {:close, []} = WebSocket.decode_frames(frame(<<>>, 1, 8))
+    end
+  end
+
   # Drive the frame buffer the way the client does
   defp feed(chunks) do
     {payloads, buffer, _frag} =

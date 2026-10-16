@@ -51,15 +51,15 @@ end
 | Callback | Return |
 |----------|--------|
 | `init(opts)` | `state` |
-| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as the 3-arity form plus `%{protocol_version:, keep_alive:}`; takes precedence when defined |
+| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as the 3-arity form plus `%{protocol_version:, keep_alive:, authentication_method:}`; takes precedence when defined |
 | `handle_connect(client_id, credentials, state)` | `{:ok, state}` or `{:error, reason_code, state}` |
-| `handle_publish(topic, payload, opts, state)` | `{:ok, state}`, `{:disconnect, reason_code, state}` |
+| `handle_publish(topic, payload, opts, state)` | `{:ok, state}`, `{:error, reason, state}` (refused but still acknowledged — QoS 1 gets a PUBACK with a refusal code, e.g. `0x87` for `:unauthorized`), `{:disconnect, reason_code, state}` |
 | `handle_subscribe(topics, state)` | `{:ok, granted_qos_list, state}`, `{:disconnect, reason_code, state}` |
 | `handle_unsubscribe(topics, state)` | `{:ok, state}`, `{:disconnect, reason_code, state}` |
 | `handle_disconnect(reason, state)` | `:ok` |
 | `handle_info(message, state)` | `{:ok, state}`, `{:publish, ...}`, `{:disconnect, reason_code, state}`, or `{:stop, reason, state}` |
 | `handle_puback(packet_id, state)` | `{:ok, state}` *(optional)* — a QoS 1 PUBLISH you sent was acknowledged |
-| `handle_auth(method, data, state)` | `{:ok, state}`, `{:continue, data, state}`, or `{:error, reason_code, state}` *(optional, MQTT 5.0 enhanced auth)* |
+| `handle_auth(method, data, state)` | `{:ok, state}`, `{:ok, data, state}`, `{:continue, data, state}`, or `{:error, reason_code, state}` *(optional, MQTT 5.0 enhanced auth — see [Enhanced Authentication](#enhanced-authentication))* |
 | `handle_session_expired(client_id, state)` | `:ok` (optional) |
 
 Use `handle_info/2` with `{:publish, topic, payload, state}` to push messages to connected clients from external events (e.g., PubSub). When the topic matches one of the client's subscriptions, the delivery honors the subscription's options: QoS is capped at the granted QoS, `retain` is forwarded only if the subscription set Retain As Published, and subscription identifiers are attached. Pass `publisher: originating_client_id` in the opts to honor `no_local` subscriptions. A publish matching no subscription is sent exactly as given.
@@ -108,9 +108,19 @@ Any callback that returns `{:disconnect, reason_code, state}` or `{:disconnect, 
   transport: MqttX.Transport.WebSocket,
   port: 8083
 )
+
+# wss:// — the same TLS options ThousandIsland's SSL transport takes
+{:ok, _pid} = MqttX.Server.start_link(
+  MyApp.MqttHandler,
+  [],
+  transport: MqttX.Transport.WebSocket,
+  port: 8084,
+  scheme: :https,
+  transport_options: [certfile: "/etc/mqttx/cert.pem", keyfile: "/etc/mqttx/key.pem"]
+)
 ```
 
-All transports support TCP and TLS. See `MqttX.Transport` for implementing custom adapters.
+All transports support plain TCP and TLS. See `MqttX.Transport` for implementing custom adapters.
 
 ## Topic Routing
 
@@ -162,8 +172,10 @@ MqttX.Server.start_link(MyApp.MqttHandler, [],
 | `:interval` | Counter reset interval in ms | `1000` |
 
 When a client exceeds the message rate limit:
-- **QoS 0**: Messages are silently dropped (per MQTT spec)
-- **QoS 1+**: PUBACK is sent with reason code `0x96` (message_rate_too_high)
+- **QoS 0**: Messages are silently dropped
+- **QoS 1 / 2**: PUBACK / PUBREC is sent with reason code `0x97` (Quota
+  exceeded) and the message is not delivered; the session stays up. (`0x96`
+  Message rate too high exists only for DISCONNECT, §2.4.)
 
 When the connection rate limit is exceeded, new connections are immediately closed.
 
@@ -199,7 +211,14 @@ complete CONNECT.
 
 ## Will Messages
 
-Will messages from the CONNECT packet are published automatically when a client disconnects without sending DISCONNECT.
+Will messages from the CONNECT packet are published automatically whenever
+the connection ends without the client having sent `DISCONNECT 0x00`
+(§3.1.2.5): a socket drop, a keep-alive or idle timeout, a protocol error,
+a handler's `{:disconnect, ...}` return, `MqttX.Server.disconnect/3`, and a
+session takeover by a new connection with the same client id. Only the
+client's own normal DISCONNECT discards the Will (a `DISCONNECT 0x04` asks
+for it to be published). The Will's topic and payload are offered to
+`handle_publish/4` like any other message, so your authorization applies.
 
 ### Will Delay Interval (MQTT 5.0)
 
@@ -208,7 +227,11 @@ MQTT 5.0 clients can set `will_delay_interval` in the will properties to delay p
 - `will_delay_interval: 0` (or MQTT 3.1.1) — will published immediately (default)
 - `will_delay_interval: N` — will published N seconds after ungraceful disconnect
 
-This allows a grace period for clients to reconnect before their "last will" is broadcast.
+This allows a grace period for clients to reconnect before their "last will"
+is broadcast: a new connection for the same client id within the delay
+cancels the pending Will (§3.1.3.2.2), as does a session takeover. The delay
+needs a non-zero Session Expiry Interval — with the default of 0 the session
+ends at disconnect and the Will is published at once.
 
 ## Session State
 
@@ -288,7 +311,18 @@ The server enforces `receive_maximum` for incoming QoS 1 and QoS 2 messages:
 
 - Advertises `receive_maximum` in CONNACK (default: 65535, configurable via `transport_opts`)
 - Tracks in-flight QoS 2 messages (between PUBREC and PUBCOMP)
-- Rejects excess QoS 2 publishes with PUBREC reason code `0x93` (Receive Maximum exceeded)
+- A client that sends more QoS > 0 publishes than that is disconnected with
+  `0x93` (Receive Maximum exceeded) — the Protocol Error §4.9 prescribes;
+  there is no per-message refusal code for it
+
+In the other direction the broker honours the client's Receive Maximum:
+outbound QoS > 0 publishes beyond the window wait in a per-connection queue
+bounded by `:max_outbound_queue` (default 10 000, `:infinity` disables) and
+are sent as acknowledgements free capacity, with any Message Expiry Interval
+reduced by the time spent waiting and expired messages dropped. Outbound
+Packet Identifiers are never reused while still in flight. A client that
+connects with a zero-length client id is assigned one, which `handle_connect`
+receives and a v5 client reads from the CONNACK's Assigned Client Identifier.
 
 ### Maximum Packet Size
 
@@ -314,15 +348,54 @@ MqttX.Server.start_link(
 - Outgoing publishes exceeding the client's advertised `maximum_packet_size` are silently dropped
 - Server advertises its `maximum_packet_size` in CONNACK when configured
 
-### QoS 2 Retransmission
+### Message Delivery Retry
 
-The server automatically retries stale QoS 2 handshake messages:
+MQTT §4.4 allows an unacknowledged QoS 1/2 PUBLISH or PUBREL to be re-sent
+only when a session is resumed — never on a live connection, where TCP
+already guarantees delivery and a missing acknowledgement means the peer is
+slow or gone, which the keep-alive timeout detects. The broker therefore:
 
-- Re-sends PUBREC if no PUBREL received within the retry interval (default: 5 seconds)
-- Re-sends PUBLISH with `dup: true` for outgoing QoS 2 awaiting PUBREC
-- Re-sends PUBREL for outgoing QoS 2 awaiting PUBCOMP
-- Drops entries after max retries (default: 3)
-- Handles DUP incoming PUBLISH by re-sending PUBREC without re-storing
+- Holds outgoing QoS 1/2 messages until the client acknowledges them, bounded
+  by the client's Receive Maximum
+- Holds an incoming QoS 2 message until PUBREL releases it, bounded by
+  `:receive_maximum`
+- Re-sends PUBREC only in reply to a duplicate PUBLISH (`dup: true`), without
+  re-storing the message
+- Runs no retransmission timer — `qos2_retry_interval` and `qos2_max_retries`
+  are deprecated and ignored since 0.12.0
+
+`MqttX.Server` does not persist sessions, so in-flight state ends with the
+connection.
+
+### Enhanced Authentication
+
+A client that sends an Authentication Method in its CONNECT asks for an
+MQTT 5.0 enhanced authentication exchange (§4.12). After `handle_connect`
+accepts, the broker calls `handle_auth(method, data, state)` with the
+CONNECT's Authentication Data (`nil` if none) and holds the CONNACK until the
+exchange ends:
+
+- `{:continue, challenge, state}` sends `AUTH 0x18` carrying `challenge`; the
+  client's `AUTH 0x18` reply comes back through `handle_auth/3`
+- `{:ok, state}` or `{:ok, server_final, state}` sends `CONNACK 0x00`, which
+  repeats the Authentication Method (MQTT-4.12.0-5) and carries `server_final`
+  as Authentication Data when given
+- `{:error, reason_code, state}` sends a CONNACK with that code and closes the
+  connection — `0x87` Not authorized for a failed proof, `0x8C` Bad
+  authentication method for a mechanism you do not support
+
+The same callback handles re-authentication (`AUTH 0x19`) on a live
+connection, where success is `AUTH 0x00` and failure a DISCONNECT. During the
+exchange any packet other than AUTH, an AUTH naming a different method, or an
+AUTH with a reason code other than `0x18`, fails the CONNECT (`0x82` / `0x8C`);
+a stalled exchange is ended by the CONNECT deadline, and a connection dropped
+before CONNACK fires neither the Will nor `handle_disconnect/2`. An AUTH on a
+connection whose CONNECT named no method is refused with `0x8C`.
+
+The default `handle_auth/3` returns `{:error, 0x8C, state}`, so clients
+asking for enhanced authentication are refused unless you implement it. The
+mechanism itself — SCRAM, a token exchange — is yours to implement; see the
+`handle_auth/3` docs on `MqttX.Server` for a SCRAM-shaped example.
 
 ### Shared Subscription Availability
 

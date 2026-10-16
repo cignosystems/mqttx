@@ -374,11 +374,12 @@ defmodule MqttX.IntegrationTest do
           protocol_version: 4
         )
 
-      Process.sleep(300)
+      # The handler's 0x86 reaches a 3.1.1 client as return code 4 (Bad user
+      # name or password), which is non-retryable: the client gives up and
+      # stops instead of reconnecting forever
+      ref = Process.monitor(client)
+      assert_receive {:DOWN, ^ref, :process, ^client, _reason}, 3_000
 
-      refute MqttX.Client.connected?(client)
-
-      GenServer.stop(client, :normal, 1000)
       ThousandIsland.stop(server_pid)
     end
   end

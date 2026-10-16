@@ -44,25 +44,59 @@ defmodule MqttX.Topic do
   @type normalized_topic :: [binary() | wildcard()]
 
   @doc """
-  Validate and normalize a topic.
+  Validate and normalize a topic filter.
 
   Returns `{:ok, normalized_topic}` or `{:error, :invalid_topic}`.
+
+  A filter starting with `$share/` is a Shared Subscription (MQTT 5.0
+  §4.8.2) and must have the shape `$share/{ShareName}/{filter}`: the
+  ShareName is at least one character and contains none of `/`, `+`, `#`,
+  and the Topic Filter after it is non-empty. Anything else that starts with
+  `$share/` (`"$share//t"`, `"$share/g"`, `"$share/g/"`, `"$share/+/t"`) is
+  rejected rather than installed as a literal subscription.
   """
   # MQTT §1.5.4: 16-bit length-prefixed UTF-8 strings cap at 65535 bytes
   @max_topic_bytes 65_535
 
   @spec validate(binary() | list()) :: {:ok, normalized_topic()} | {:error, :invalid_topic}
-  def validate(topic) when is_binary(topic) and byte_size(topic) > @max_topic_bytes do
+  def validate(topic), do: do_validate(topic, :filter)
+
+  @doc """
+  Validate a topic for publishing (no wildcards allowed).
+
+  Returns `{:ok, normalized_topic}` or `{:error, :invalid_topic}`.
+
+  This validates a Topic *Name*: the `$share/` structure rules of
+  `validate/1` apply to filters only, so a PUBLISH to a topic literally
+  named `$share/g/t` is just a topic name.
+  """
+  @spec validate_publish(binary() | list()) ::
+          {:ok, normalized_topic()} | {:error, :invalid_topic}
+  def validate_publish(topic) do
+    case do_validate(topic, :name) do
+      {:ok, normalized} ->
+        if wildcard?(normalized) do
+          {:error, :invalid_topic}
+        else
+          {:ok, normalized}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp do_validate(topic, _kind) when is_binary(topic) and byte_size(topic) > @max_topic_bytes do
     {:error, :invalid_topic}
   end
 
-  def validate(topic) when is_binary(topic) do
+  defp do_validate(topic, kind) when is_binary(topic) do
     topic
     |> normalize()
-    |> validate_normalized()
+    |> validate_normalized(kind)
   end
 
-  def validate(topic) when is_list(topic) do
+  defp do_validate(topic, kind) when is_list(topic) do
     # Same §1.5.4 byte cap as the binary form: segment bytes + separators
     byte_total =
       Enum.reduce(topic, max(length(topic) - 1, 0), fn
@@ -76,28 +110,7 @@ defmodule MqttX.Topic do
     else
       topic
       |> normalize()
-      |> validate_normalized()
-    end
-  end
-
-  @doc """
-  Validate a topic for publishing (no wildcards allowed).
-
-  Returns `{:ok, normalized_topic}` or `{:error, :invalid_topic}`.
-  """
-  @spec validate_publish(binary() | list()) ::
-          {:ok, normalized_topic()} | {:error, :invalid_topic}
-  def validate_publish(topic) do
-    case validate(topic) do
-      {:ok, normalized} ->
-        if wildcard?(normalized) do
-          {:error, :invalid_topic}
-        else
-          {:ok, normalized}
-        end
-
-      error ->
-        error
+      |> validate_normalized(kind)
     end
   end
 
@@ -248,17 +261,30 @@ defmodule MqttX.Topic do
 
   # Validation helpers
 
-  defp validate_normalized([]) do
+  defp validate_normalized([], _kind) do
     {:error, :invalid_topic}
   end
 
-  defp validate_normalized(normalized) do
-    if valid_normalized?(normalized) do
+  defp validate_normalized(normalized, kind) do
+    if valid_normalized?(normalized) and (kind == :name or valid_share_structure?(normalized)) do
       {:ok, normalized}
     else
       {:error, :invalid_topic}
     end
   end
+
+  # §4.8.2 (MQTT-4.8.2-1, MQTT-4.8.2-2): a filter beginning with "$share/"
+  # MUST be "$share/{ShareName}/{filter}" where ShareName is at least one
+  # character with no '/', '+' or '#' (so never a wildcard atom here) and the
+  # filter that follows is non-empty. `[""]` is "$share/g/" — empty filter.
+  defp valid_share_structure?(["$share", group | filter])
+       when is_binary(group) and group != "" and filter != [] do
+    filter != [""]
+  end
+
+  defp valid_share_structure?(["$share", _group | _filter]), do: false
+  # A bare "$share" (no slash) is not a shared subscription — just a $-topic.
+  defp valid_share_structure?(_), do: true
 
   defp valid_normalized?([]) do
     true
@@ -338,6 +364,10 @@ defmodule MqttX.Topic do
 
   Returns `{:shared, group_name, topic_filter}` for shared subscriptions,
   or `{:normal, topic_filter}` for regular subscriptions.
+
+  Only a well-formed `$share/{ShareName}/{filter}` (§4.8.2) is reported as
+  `:shared`; malformed `$share/...` forms come back as `:normal` and are the
+  same forms `validate/1` rejects, so they never reach a subscription table.
 
   ## Examples
 

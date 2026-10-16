@@ -90,11 +90,12 @@ ordered roughly by ratio of impact to effort.
 
 ### Smaller polish (low risk, do whenever)
 
-- `connection.ex` (~2050 lines): the proxy tunnel and topic-alias logic are
-  extracted (`MqttX.Client.Proxy`, `MqttX.Client.TopicAlias`); the QoS
-  retry/resend logic is still inline because it is entangled with
-  `send_packet/2` socket I/O — extracting it means threading a send callback
-  through, so do it only as part of a deliberate connect/handshake split.
+- `connection.ex` (~2000 lines): the proxy tunnel and topic-alias logic are
+  extracted (`MqttX.Client.Proxy`, `MqttX.Client.TopicAlias`); the in-flight
+  tracking and the session-resume re-send are still inline because they are
+  entangled with `send_packet/2` socket I/O — extracting them means threading
+  a send callback through, so do it only as part of a deliberate
+  connect/handshake split.
 
 Done in this section: reason-code literals in `handler.ex` are named via
 `MqttX.Packet.ReasonCodes`; packet-type/property-id constants have one source

@@ -19,7 +19,11 @@ defmodule MqttX.MixProject do
       # Payload.Protobuf) gain tests. test/support is tooling, not the library.
       test_coverage: [
         summary: [threshold: 80],
-        ignore_modules: [MqttX.Test.FakeBroker, MqttX.Test.ForwardingHandler]
+        ignore_modules: [
+          MqttX.Test.FakeBroker,
+          MqttX.Test.ForwardingHandler,
+          MqttX.Test.TLSFixtures
+        ]
       ],
       # Include the optional transport deps in the PLT so dialyzer actually
       # checks the adapter call sites

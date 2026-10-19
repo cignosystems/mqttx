@@ -13,6 +13,9 @@
 # Temporary files, for example, from tests.
 /tmp/
 
+# TLS test fixtures are generated when the suite starts (MqttX.Test.TLSFixtures)
+/test/fixtures/tls/
+
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
 

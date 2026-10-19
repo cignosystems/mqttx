@@ -20,8 +20,10 @@ Notes for humans and AI assistants modifying this library itself. If you are
 - `test/support/` — compiled test helpers: `MqttX.Test.FakeBroker`, a scriptable
   TCP "broker" that relays what the client sends to the test process (use it to
   put the client in a state a real broker would not), and
-  `MqttX.Test.ForwardingHandler`; `test/fixtures/tls/` — a private CA and a
-  `localhost` certificate for the TLS tests (`gen.sh` regenerates them)
+  `MqttX.Test.ForwardingHandler`, and `MqttX.Test.TLSFixtures`, which writes
+  the TLS tests' private CA and `localhost` certificate into
+  `test/fixtures/tls/` when the suite starts — the directory is gitignored,
+  so no private key is ever committed
 - `bench/` — Benchee suites (`codec.exs`, `server.exs`, `e2e.exs`);
   `test/mqttx/load_test.exs` — end-to-end load validation (`--include load`)
 

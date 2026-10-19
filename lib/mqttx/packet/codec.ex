@@ -156,11 +156,11 @@ defmodule MqttX.Packet.Codec do
     with :ok <- validate_connect_flags(reserved, will_flag, will_qos, will_retain),
          {:ok, protocol_version} <- validate_protocol(proto, protocol_level),
          :ok <- validate_user_pass_flags(protocol_version, user_flag, pass_flag),
-         {:ok, props, rest2} <- Properties.decode(protocol_version, rest),
+         {:ok, props, rest2} <- Properties.decode(protocol_version, rest, :connect),
          {:ok, client_id, rest3} <- decode_utf8_safe(rest2),
          {:ok, will_props, rest4} <-
            if(will_flag == 1,
-             do: Properties.decode(protocol_version, rest3),
+             do: Properties.decode(protocol_version, rest3, :will),
              else: {:ok, %{}, rest3}
            ),
          {:ok, will_topic, rest5} <- decode_utf8_optional_safe(rest4, will_flag),
@@ -212,7 +212,7 @@ defmodule MqttX.Packet.Codec do
          0,
          <<0::7, session_present::1, reason_code::8, rest::binary>>
        ) do
-    with {:ok, props, <<>>} <- Properties.decode(version, rest) do
+    with {:ok, props, <<>>} <- Properties.decode(version, rest, :connack) do
       {:ok,
        %{
          type: :connack,
@@ -246,7 +246,7 @@ defmodule MqttX.Packet.Codec do
     retain = (flags &&& 0b0001) == 0b0001
 
     with {:ok, packet_id, rest2} <- decode_publish_packet_id(qos, rest),
-         {:ok, props, payload} <- Properties.decode(version, rest2),
+         {:ok, props, payload} <- Properties.decode(version, rest2, :publish),
          {:ok, normalized_topic} <- validate_publish_topic(topic, props) do
       {:ok,
        %{
@@ -299,7 +299,7 @@ defmodule MqttX.Packet.Codec do
 
   # SUBSCRIBE — payload MUST contain at least one topic filter (§3.8.3)
   defp decode_packet(version, @subscribe, 2, <<packet_id::16-big, rest::binary>>) do
-    with {:ok, props, topics_bin} <- Properties.decode(version, rest),
+    with {:ok, props, topics_bin} <- Properties.decode(version, rest, :subscribe),
          :ok <- ensure_single_subscription_identifier(props),
          {:ok, topics} <- decode_subscribe_topics(version, topics_bin, []),
          :ok <- ensure_nonempty_topics(topics) do
@@ -315,7 +315,7 @@ defmodule MqttX.Packet.Codec do
 
   # SUBACK
   defp decode_packet(version, @suback, 0, <<packet_id::16-big, rest::binary>>) do
-    with {:ok, props, acks_bin} <- Properties.decode(version, rest),
+    with {:ok, props, acks_bin} <- Properties.decode(version, rest, :suback),
          {:ok, acks} <- decode_suback_acks(acks_bin, []) do
       {:ok,
        %{
@@ -329,7 +329,7 @@ defmodule MqttX.Packet.Codec do
 
   # UNSUBSCRIBE — payload MUST contain at least one topic filter (§3.10.3)
   defp decode_packet(version, @unsubscribe, 2, <<packet_id::16-big, rest::binary>>) do
-    with {:ok, props, topics_bin} <- Properties.decode(version, rest),
+    with {:ok, props, topics_bin} <- Properties.decode(version, rest, :unsubscribe),
          {:ok, topics} <- decode_unsubscribe_topics(topics_bin, []),
          :ok <- ensure_nonempty_topics(topics) do
       {:ok,
@@ -344,7 +344,7 @@ defmodule MqttX.Packet.Codec do
 
   # UNSUBACK
   defp decode_packet(version, @unsuback, 0, <<packet_id::16-big, rest::binary>>) do
-    with {:ok, props, acks_bin} <- Properties.decode(version, rest),
+    with {:ok, props, acks_bin} <- Properties.decode(version, rest, :unsuback),
          {:ok, acks} <- decode_unsuback_acks(acks_bin, []),
          # §3.11.3: a v5 UNSUBACK must carry ≥1 reason code (v3.1.1 has none)
          :ok <- if(version == 5 and acks == [], do: {:error, :malformed_packet}, else: :ok) do
@@ -378,7 +378,7 @@ defmodule MqttX.Packet.Codec do
   end
 
   defp decode_packet(version, @disconnect, 0, <<reason_code::8, rest::binary>>) do
-    with {:ok, props, <<>>} <- Properties.decode(version, rest) do
+    with {:ok, props, <<>>} <- Properties.decode(version, rest, :disconnect) do
       {:ok,
        %{
          type: :disconnect,
@@ -398,7 +398,7 @@ defmodule MqttX.Packet.Codec do
   end
 
   defp decode_packet(5, @auth, 0, <<reason_code::8, rest::binary>>) do
-    with {:ok, props, <<>>} <- Properties.decode(5, rest) do
+    with {:ok, props, <<>>} <- Properties.decode(5, rest, :auth) do
       {:ok,
        %{
          type: :auth,
@@ -482,6 +482,9 @@ defmodule MqttX.Packet.Codec do
   defp encode_throw_to_error({:mqttx_invalid_property, name}),
     do: {:error, {:invalid_property, name}}
 
+  defp encode_throw_to_error({:mqttx_property_not_allowed, name, packet_type}),
+    do: {:error, {:property_not_allowed, name, packet_type}}
+
   defp encode_throw_to_error(other), do: throw(other)
 
   # CONNECT
@@ -514,7 +517,7 @@ defmodule MqttX.Packet.Codec do
       encode_utf8(proto_name),
       <<version::8, username_flag::1, password_flag::1, will_retain::1, will_qos::2, will_flag::1,
         clean::1, 0::1, keepalive::16-big>>,
-      Properties.encode(version, Map.get(msg, :properties, %{})),
+      Properties.encode(version, Map.get(msg, :properties, %{}), :connect),
       encode_utf8(Map.get(msg, :client_id, "")),
       encode_will(version, msg[:will]),
       encode_optional_utf8(msg[:username]),
@@ -529,7 +532,7 @@ defmodule MqttX.Packet.Codec do
   defp encode_packet(version, %{type: :connack} = msg) do
     session_present = if Map.get(msg, :session_present, false), do: 1, else: 0
     reason_code = Map.get(msg, :reason_code, 0)
-    props = Properties.encode(version, Map.get(msg, :properties, %{}))
+    props = Properties.encode(version, Map.get(msg, :properties, %{}), :connack)
 
     variable = [<<0::7, session_present::1, reason_code::8>>, props]
     {:ok, {<<@connack::4, 0::4>>, variable}}
@@ -571,7 +574,7 @@ defmodule MqttX.Packet.Codec do
         _ -> <<require_packet_id(msg)::16-big>>
       end
 
-    props = Properties.encode(version, Map.get(msg, :properties, %{}))
+    props = Properties.encode(version, Map.get(msg, :properties, %{}), :publish)
     payload = Map.get(msg, :payload, <<>>)
 
     variable = [encode_utf8(topic), packet_id_bin, props, payload]
@@ -602,7 +605,7 @@ defmodule MqttX.Packet.Codec do
   # SUBSCRIBE
   defp encode_packet(version, %{type: :subscribe} = msg) do
     packet_id = require_packet_id(msg)
-    props = Properties.encode(version, Map.get(msg, :properties, %{}))
+    props = Properties.encode(version, Map.get(msg, :properties, %{}), :subscribe)
     topic_list = Map.get(msg, :topics, [])
     if topic_list == [], do: throw(:mqttx_empty_topic_list)
     topics = encode_subscribe_topics(version, topic_list)
@@ -614,7 +617,7 @@ defmodule MqttX.Packet.Codec do
   # SUBACK
   defp encode_packet(version, %{type: :suback} = msg) do
     packet_id = require_packet_id(msg)
-    props = Properties.encode(version, Map.get(msg, :properties, %{}))
+    props = Properties.encode(version, Map.get(msg, :properties, %{}), :suback)
     acks = encode_suback_acks(Map.get(msg, :acks, []))
 
     variable = [<<packet_id::16-big>>, props, acks]
@@ -624,7 +627,7 @@ defmodule MqttX.Packet.Codec do
   # UNSUBSCRIBE
   defp encode_packet(version, %{type: :unsubscribe} = msg) do
     packet_id = require_packet_id(msg)
-    props = Properties.encode(version, Map.get(msg, :properties, %{}))
+    props = Properties.encode(version, Map.get(msg, :properties, %{}), :unsubscribe)
     topic_list = Map.get(msg, :topics, [])
     if topic_list == [], do: throw(:mqttx_empty_topic_list)
     topics = encode_unsubscribe_topics(topic_list)
@@ -636,7 +639,7 @@ defmodule MqttX.Packet.Codec do
   # UNSUBACK
   defp encode_packet(5, %{type: :unsuback} = msg) do
     packet_id = require_packet_id(msg)
-    props = Properties.encode(5, Map.get(msg, :properties, %{}))
+    props = Properties.encode(5, Map.get(msg, :properties, %{}), :unsuback)
     acks = encode_unsuback_acks(Map.get(msg, :acks, []))
 
     variable = [<<packet_id::16-big>>, props, acks]
@@ -669,7 +672,7 @@ defmodule MqttX.Packet.Codec do
       if reason_code == 0 and map_size(props) == 0 do
         <<>>
       else
-        [<<reason_code::8>>, Properties.encode(version, props)]
+        [<<reason_code::8>>, Properties.encode(version, props, :disconnect)]
       end
 
     {:ok, {<<@disconnect::4, 0::4>>, variable}}
@@ -684,7 +687,7 @@ defmodule MqttX.Packet.Codec do
       if reason_code == 0 and map_size(props) == 0 do
         <<>>
       else
-        [<<reason_code::8>>, Properties.encode(5, props)]
+        [<<reason_code::8>>, Properties.encode(5, props, :auth)]
       end
 
     {:ok, {<<@auth::4, 0::4>>, variable}}
@@ -848,7 +851,7 @@ defmodule MqttX.Packet.Codec do
     end
 
     [
-      Properties.encode(version, Map.get(will, :properties, %{})),
+      Properties.encode(version, Map.get(will, :properties, %{}), :will),
       encode_utf8(topic),
       # §3.1.3.4: the Will Payload is BINARY data — length-prefixed but not
       # UTF-8 validated (decode already treats it as binary)
@@ -876,7 +879,7 @@ defmodule MqttX.Packet.Codec do
   end
 
   defp decode_ack_payload(5, <<reason_code::8, rest::binary>>) do
-    case Properties.decode(5, rest) do
+    case Properties.decode(5, rest, :ack) do
       {:ok, props, <<>>} -> {:ok, reason_code, props}
       {:ok, _props, _trailing} -> {:error, :malformed_packet}
       {:error, _} = err -> err
@@ -898,7 +901,7 @@ defmodule MqttX.Packet.Codec do
   end
 
   defp encode_ack_response(5, packet_id, reason_code, props) do
-    [<<packet_id::16-big, reason_code::8>>, Properties.encode(5, props)]
+    [<<packet_id::16-big, reason_code::8>>, Properties.encode(5, props, :ack)]
   end
 
   defp encode_ack_response(_version, packet_id, _reason_code, _props) do

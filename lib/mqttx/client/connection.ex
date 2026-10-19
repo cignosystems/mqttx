@@ -1113,7 +1113,14 @@ defmodule MqttX.Client.Connection do
   defp process_connack_buffer(state) do
     case decode_inbound(state) do
       {:ok, {%{type: :connack, reason_code: 0} = connack, rest}} ->
-        finalize_connection(connack, %{state | buffer: rest})
+        # MQTT-4.12.0-5: a successful CONNACK repeats the CONNECT's
+        # Authentication Method. One naming another method is a Protocol
+        # Error; one that leaves it out is tolerated, as lax brokers do.
+        if auth_method_mismatch?(state, connack, :connack) do
+          connect_failed(state, {:protocol_error, :authentication_method_mismatch})
+        else
+          finalize_connection(connack, %{state | buffer: rest})
+        end
 
       {:ok, {%{type: :connack, reason_code: code} = connack, _rest}} ->
         props = Map.get(connack, :properties, %{})
@@ -1149,6 +1156,11 @@ defmodule MqttX.Client.Connection do
       # Protocol Error, not a challenge to answer.
       not enhanced_auth_requested?(state) ->
         connect_failed(state, {:protocol_error, :unexpected_auth})
+
+      # §3.15.2.2.2 / MQTT-4.12.0-5: every AUTH names the method the CONNECT
+      # asked for; another method, or none, is a Protocol Error
+      auth_method_mismatch?(state, auth_packet, :auth) ->
+        connect_failed(state, {:protocol_error, :authentication_method_mismatch})
 
       # Enhanced AUTH continuation during connect (MQTT 5.0 §4.12). Note the
       # connack deadline keeps running — AUTH rounds don't extend it.
@@ -1673,13 +1685,20 @@ defmodule MqttX.Client.Connection do
 
   # Enhanced authentication (MQTT 5.0 §4.12)
   defp handle_packet(%{type: :auth} = packet, state) do
-    if enhanced_auth_requested?(state) do
-      handle_auth_packet(packet, state)
-    else
+    cond do
       # MQTT-4.12.0-7: AUTH is only valid once our CONNECT named an
       # Authentication Method. Anything else is a Protocol Error (§4.13).
-      send_packet(state, %{type: :disconnect, reason_code: 0x82, properties: %{}})
-      protocol_error_teardown(state, :unexpected_auth)
+      not enhanced_auth_requested?(state) ->
+        send_packet(state, %{type: :disconnect, reason_code: 0x82, properties: %{}})
+        protocol_error_teardown(state, :unexpected_auth)
+
+      # §3.15.2.2.2 / MQTT-4.12.0-5: and it names that method, every time
+      auth_method_mismatch?(state, packet, :auth) ->
+        send_packet(state, %{type: :disconnect, reason_code: 0x82, properties: %{}})
+        protocol_error_teardown(state, :authentication_method_mismatch)
+
+      true ->
+        handle_auth_packet(packet, state)
     end
   end
 
@@ -2050,6 +2069,23 @@ defmodule MqttX.Client.Connection do
     do: Map.has_key?(props, :authentication_method)
 
   defp enhanced_auth_requested?(_state), do: false
+
+  # Does the packet's Authentication Method differ from the CONNECT's? An
+  # AUTH must carry it (§3.15.2.2.2); a CONNACK that omits it is let through.
+  defp auth_method_mismatch?(state, packet, kind) do
+    requested = requested_auth_method(state)
+
+    case Map.get(Map.get(packet, :properties) || %{}, :authentication_method) do
+      ^requested -> false
+      nil when kind == :connack -> false
+      _other -> true
+    end
+  end
+
+  defp requested_auth_method(%{connect_properties: props}) when is_map(props),
+    do: Map.get(props, :authentication_method)
+
+  defp requested_auth_method(_state), do: nil
 
   # Session store helpers
   defp init_session_store(nil), do: {nil, nil}

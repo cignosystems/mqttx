@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Properties are checked against the packet that carries them
+  (§2.2.2.2).** A packet carrying a property its type does not define — a
+  Session Expiry Interval on a PUBLISH, a Will Delay Interval on a CONNACK —
+  is now a Malformed Packet on decode, as the spec requires, and
+  `MqttX.Packet.Codec.encode/2` refuses to build one, returning
+  `{:error, {:property_not_allowed, name, packet_type}}` instead of putting
+  it on the wire for the peer to reject. User Properties remain valid
+  everywhere. `MqttX.Packet.Properties.encode/3` and `decode/3` take the
+  packet type; the two-argument forms stay unrestricted.
+- **The client checks the Authentication Method it is answering.** An AUTH
+  packet naming a method other than the one the CONNECT asked for, or none,
+  is a Protocol Error (§3.15.2.2.2, MQTT-4.12.0-5): during the handshake the
+  connect fails with `{:protocol_error, :authentication_method_mismatch}`,
+  on a live connection the client sends DISCONNECT 0x82 and tears the
+  connection down. A successful CONNACK naming a different method is
+  refused the same way; one that leaves the method out is still accepted.
+  Previously the client handed any method to `handle_auth/3`.
+
 ## [0.12.0] - 2026-10-19
 
 ### Added

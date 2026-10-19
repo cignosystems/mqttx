@@ -36,6 +36,53 @@ defmodule MqttX.Packet.Properties do
   @prop_subscription_identifier_available 0x29
   @prop_shared_subscription_available 0x2A
 
+  # §2.2.2.2 (Table 2-4): the packets each property may appear in. User
+  # Property is valid in every packet. A packet carrying a property its type
+  # does not define is a Malformed Packet. `:ack` covers PUBACK, PUBREC,
+  # PUBREL and PUBCOMP, which share one set; `:will` is the Will Properties
+  # inside CONNECT.
+  @allowed_in %{
+    payload_format_indicator: [:publish, :will],
+    message_expiry_interval: [:publish, :will],
+    content_type: [:publish, :will],
+    response_topic: [:publish, :will],
+    correlation_data: [:publish, :will],
+    subscription_identifier: [:publish, :subscribe],
+    session_expiry_interval: [:connect, :connack, :disconnect],
+    assigned_client_identifier: [:connack],
+    server_keep_alive: [:connack],
+    authentication_method: [:connect, :connack, :auth],
+    authentication_data: [:connect, :connack, :auth],
+    request_problem_information: [:connect],
+    will_delay_interval: [:will],
+    request_response_information: [:connect],
+    response_information: [:connack],
+    server_reference: [:connack, :disconnect],
+    reason_string: [:connack, :ack, :suback, :unsuback, :disconnect, :auth],
+    receive_maximum: [:connect, :connack],
+    topic_alias_maximum: [:connect, :connack],
+    topic_alias: [:publish],
+    maximum_qos: [:connack],
+    retain_available: [:connack],
+    maximum_packet_size: [:connect, :connack],
+    wildcard_subscription_available: [:connack],
+    subscription_identifier_available: [:connack],
+    shared_subscription_available: [:connack]
+  }
+
+  @type packet_type ::
+          :connect
+          | :connack
+          | :publish
+          | :will
+          | :ack
+          | :subscribe
+          | :suback
+          | :unsubscribe
+          | :unsuback
+          | :disconnect
+          | :auth
+
   @doc """
   Encode properties map to binary with length prefix.
 
@@ -88,6 +135,57 @@ defmodule MqttX.Packet.Properties do
 
   def decode(_version, data) do
     {:ok, %{}, data}
+  end
+
+  @doc """
+  `encode/2` for a known packet type: a property the type does not define
+  (§2.2.2.2) is refused. The throw is caught at the `Codec.encode` boundary
+  and becomes `{:error, {:property_not_allowed, name, packet_type}}`.
+  """
+  @spec encode(integer(), map(), packet_type()) :: iodata()
+  def encode(5, properties, packet_type) when is_map(properties) do
+    case disallowed(properties, packet_type) do
+      nil -> encode(5, properties)
+      name -> throw({:mqttx_property_not_allowed, name, packet_type})
+    end
+  end
+
+  def encode(version, properties, _packet_type), do: encode(version, properties)
+
+  @doc """
+  `decode/2` for a known packet type: a property the type does not define
+  makes the packet malformed (§2.2.2.2).
+  """
+  @spec decode(integer(), binary(), packet_type()) :: {:ok, map(), binary()} | {:error, atom()}
+  def decode(5, data, packet_type) do
+    with {:ok, props, rest} <- decode(5, data) do
+      case disallowed(props, packet_type) do
+        nil -> {:ok, props, rest}
+        _name -> {:error, :malformed_packet}
+      end
+    end
+  end
+
+  def decode(version, data, _packet_type), do: decode(version, data)
+
+  @doc "The first property in `properties` that `packet_type` does not define, or `nil`."
+  @spec disallowed(map(), packet_type()) :: atom() | nil
+  def disallowed(properties, packet_type) when is_map(properties) do
+    Enum.find_value(properties, fn
+      # A user property, in either of its forms
+      {key, _value} when is_binary(key) ->
+        nil
+
+      {:user_properties, _pairs} ->
+        nil
+
+      {key, _value} ->
+        case Map.fetch(@allowed_in, key) do
+          {:ok, types} -> if packet_type in types, do: nil, else: key
+          # Unknown keys are encode_property/1's problem ({:invalid_property, _})
+          :error -> nil
+        end
+    end)
   end
 
   # Reverse the multi-occurrence accumulators that we built via prepend

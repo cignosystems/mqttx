@@ -87,6 +87,11 @@ ordered roughly by ratio of impact to effort.
 - **Will Delay cancel-on-reconnect across nodes.** `MqttX.Server.WillDelay`
   cancels by client_id within a single BEAM. For a clustered setup, the cancel
   must be broadcast (Phoenix.PubSub or `:pg`).
+- **Sessions beyond one node.** `MqttX.Server.SessionStore` is ETS on the
+  node that holds the connection: a client reconnecting to another node
+  starts fresh, and a BEAM restart loses every session. A pluggable store
+  behind the same API (Mnesia, Redis, Ecto) and `MqttX.Server.deliver/3`
+  fanning out across nodes via `pg` are the clustering roadmap item.
 
 ### Smaller polish (low risk, do whenever)
 
@@ -117,9 +122,12 @@ subscription identifier, and CONNACK now advertises
 expired record is discarded on load, `MqttX.Session.ETSOwner` sweeps every
 table it owns, and a clean start calls `delete/2` as the store contract
 always said (QoS 2 inbound ids were already persisted as `{:rx, id}`
-entries; Will message + delay are server-side session state, which this
-broker does not keep — see the README roadmap row for server-side session
-persistence); receive-side reassembly is linear — `MqttX.Packet.Buffer` waits
+entries); the broker keeps Session State (§4.1) in `MqttX.Server.SessionStore`
+— ETS per listener: a subscription index walked by key order, in-flight state
+mirrored for sessions that outlive their connection, a per-session queue —
+with `MqttX.Server.Delivery` as the fan-out behind `MqttX.Server.deliver/3`
+(queue first, then poke the connection, so a closing connection cannot lose
+a message); receive-side reassembly is linear — `MqttX.Packet.Buffer` waits
 for a packet's declared length and flattens once instead of `buf <> data` plus
 a decode attempt per read (which re-copied the whole buffer every time), used
 by `handler.ex`, the client's TCP/TLS path and its WebSocket frame buffer;

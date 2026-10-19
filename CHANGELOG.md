@@ -81,6 +81,36 @@ All notable changes to this project will be documented in this file.
   takes `scheme: :https` plus `transport_options: [certfile:, keyfile:, …]`
   (the same shape as ThousandIsland's SSL transport) and serves MQTT over TLS
   WebSockets through Bandit. Previously it was HTTP-only.
+- **Server-side sessions.** The broker now keeps Session State (MQTT §4.1)
+  per listener, in ETS. A client that connects with Clean Start 0 and a
+  non-zero Session Expiry Interval — or, for MQTT 3.1.1, CleanSession 0 —
+  gets `session_present: true` on reconnect and its subscriptions back
+  without re-subscribing; unacknowledged QoS 1/2 PUBLISHes are re-sent with
+  DUP set, a PUBREL awaiting PUBCOMP is re-sent, and an inbound QoS 2 message
+  awaiting PUBREL is completed. Clean Start 1 discards the stored session;
+  the expiry timer discards it when the interval elapses (and still calls
+  `handle_session_expired/2`). A connection taking over a client id (§3.1.4)
+  inherits the session. The new `:max_session_expiry_interval` transport
+  option (default 86 400 s) caps how long a session is kept: a v5 client
+  asking for more is told the cap in CONNACK (§3.2.2.3.2), and it is the
+  lifetime of a 3.1.1 CleanSession 0 session, which would otherwise never
+  end. `handle_connect/4`'s `connect_info` gains `session_present` and
+  `subscriptions`. State is in memory on one node and does not survive a
+  BEAM restart. Previously the broker answered `session_present: false` to
+  every CONNECT and kept nothing across connections.
+- **`MqttX.Server.deliver/3`, the broker's own fan-out.** Call it from
+  `handle_publish/4` — or from anywhere by listener name with `deliver/4` —
+  and the broker matches the topic against every session's subscriptions on
+  the listener, applies each subscription's options (granted QoS cap, Retain
+  As Published, Subscription Identifiers, `no_local` via `:publisher`, one
+  member per shared subscription, preferring a connected one) and sends. A
+  session that is not connected gets QoS 1/2 messages queued, bounded by
+  `:max_outbound_queue`, with Message Expiry counting down (MQTT-3.3.2-6),
+  and receives them in order on reconnect. The handler keeps deciding
+  *whether* a message is delivered; `{:publish, ...}` returns from
+  `handle_info/2` keep working for brokers that route through their own
+  PubSub. `MqttX.Server.start_link/3` now honors `:name` as the handle
+  `deliver/4` finds the listener by (it used to be dropped).
 
 ### Changed
 

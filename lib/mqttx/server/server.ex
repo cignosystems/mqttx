@@ -65,14 +65,22 @@ defmodule MqttX.Server do
   - `handle_auth/3` - Enhanced authentication exchange (MQTT 5.0 AUTH)
   - `handle_session_expired/2` - Session expiry notification (MQTT 5.0)
 
-  ## Session state limitation
+  ## Sessions and delivery
 
-  Session state (subscriptions, in-flight QoS 1/2 messages) currently lives
-  in the connection process and dies with it: the broker does not queue
-  messages for disconnected persistent sessions, and reconnecting clients
-  always receive `session_present: false`. Model durable state in your
-  handler (e.g. via `Phoenix.PubSub` or your database) if you need
-  persistence across connections.
+  The broker keeps Session State (MQTT §4.1) per listener, in ETS. A client
+  that connects with Clean Start 0 and a non-zero Session Expiry Interval —
+  or, for MQTT 3.1.1, CleanSession 0 — gets its subscriptions and in-flight
+  QoS 1/2 messages back when it reconnects, with `session_present: true`,
+  along with anything `deliver/3` sent it while it was away. A session lives
+  for the interval the client asked for, capped by the listener's
+  `:max_session_expiry_interval` (default one day); `handle_session_expired/2`
+  fires when it ends. The state is in memory on the node that holds the
+  connection and does not survive a restart of the BEAM.
+
+  Routing stays the handler's decision — `handle_publish/4` decides what a
+  publish may do — and `deliver/3` does the fan-out: it matches every
+  session's subscriptions, applies their options, and queues for sessions
+  that are not connected.
   """
 
   require Logger
@@ -116,10 +124,20 @@ defmodule MqttX.Server do
   @callback handle_connect(client_id(), credentials(), state()) ::
               {:ok, state()} | {:error, reason_code(), state()}
 
+  @type resumed_subscription :: %{
+          topic: binary(),
+          qos: 0 | 1 | 2,
+          no_local: boolean(),
+          retain_as_published: boolean(),
+          subscription_identifier: non_neg_integer() | nil
+        }
+
   @type connect_info :: %{
           protocol_version: 3 | 4 | 5,
           keep_alive: non_neg_integer(),
-          authentication_method: binary() | nil
+          authentication_method: binary() | nil,
+          session_present: boolean(),
+          subscriptions: [resumed_subscription()]
         }
 
   @doc """
@@ -133,6 +151,13 @@ defmodule MqttX.Server do
     - `authentication_method` — the MQTT 5.0 Authentication Method the client
       asked for, or `nil`. When set, `handle_auth/3` runs after this callback
       accepts, and the CONNACK waits for that exchange (§4.12)
+    - `session_present` — `true` when Clean Start is 0 and the broker holds a
+      session for this client id, which is resumed once the CONNECT is
+      accepted (§3.1.2.4); it is what the CONNACK will say
+    - `subscriptions` — the subscriptions that session brings back, as
+      `%{topic:, qos:, no_local:, retain_as_published:, subscription_identifier:}`
+      maps, `[]` when `session_present` is false. A handler that routes through
+      its own PubSub rather than `deliver/3` re-establishes them here
 
   If both `handle_connect/4` and `handle_connect/3` are defined,
   `handle_connect/4` takes precedence.
@@ -296,10 +321,15 @@ defmodule MqttX.Server do
               | {:stop, term(), state()}
 
   @doc """
-  Handle session expiry (MQTT 5.0).
+  Handle session expiry.
 
-  Called when a client's session expires after `session_expiry_interval` seconds
-  post-disconnect. Use this to clean up session state (subscriptions, queued messages, etc.).
+  Called when a session ends after its connection did: `session_expiry_interval`
+  seconds after a v5 client disconnected, the listener's
+  `:max_session_expiry_interval` after a 3.1.1 client with CleanSession 0 did,
+  and at once when a v5 client disconnects with Session Expiry Interval 0. The
+  broker has already discarded the session's own state (subscriptions,
+  in-flight messages, queue); use this to drop whatever your application keeps
+  per client.
   """
   @callback handle_session_expired(client_id(), state()) :: :ok
 
@@ -376,6 +406,76 @@ defmodule MqttX.Server do
   end
 
   @doc """
+  Deliver a message to every session on this listener whose subscriptions
+  match `topic` — connected or not.
+
+  This is the broker's own fan-out, for use from inside a callback (it finds
+  the listener from the calling connection process; use `deliver/4` from
+  anywhere else). The handler stays in charge of *whether* a message is
+  delivered — call it from `handle_publish/4` after authorizing the publish,
+  or from `handle_info/2` for messages your application originates — and the
+  broker does the rest: it matches the topic against every session's
+  subscriptions, applies each subscription's options (QoS capped at the
+  granted QoS, `retain` kept only for Retain As Published subscriptions,
+  Subscription Identifiers attached, `no_local` honored when `opts` names the
+  `:publisher`), picks one member per shared subscription, and sends. A
+  session that is not connected but has not expired gets the message queued
+  (QoS 1 and 2 only) and receives it when it reconnects, in order, with its
+  Message Expiry Interval still counting down. The queue is bounded by the
+  `:max_outbound_queue` transport option.
+
+  `opts` takes the keys a `{:publish, ...}` return from `handle_info/2` does:
+  `:qos`, `:retain`, `:properties`, `:codec`, `:publisher`. Unlike an inbound
+  PUBLISH, `retain: true` here does not write the retained store; it only
+  marks the delivery for Retain As Published subscribers.
+
+  Returns `{:ok, n}` with the number of sessions the message went to, or
+  `{:error, reason}` for an invalid topic or a codec failure.
+
+  ## Example
+
+      def handle_publish(topic, payload, opts, state) do
+        if authorized?(state, topic) do
+          MqttX.Server.deliver(topic, payload, Map.put(opts, :publisher, state.client_id))
+          {:ok, state}
+        else
+          {:error, :unauthorized, state}
+        end
+      end
+  """
+  @spec deliver(binary() | [binary()], term(), map()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def deliver(topic, payload, opts \\ %{}) do
+    case Process.get(:mqttx_listener) do
+      nil -> {:error, :no_listener}
+      ctx -> MqttX.Server.Delivery.deliver(ctx, topic, payload, opts)
+    end
+  end
+
+  @doc """
+  `deliver/3` for a named listener, from any process.
+
+  `listener` is the `:name` the listener was started with, or its port
+  number when it has no name.
+
+      MqttX.Server.deliver(MyApp.Broker, "devices/1/cmd", "reboot", %{qos: 1})
+  """
+  @spec deliver(term(), binary() | [binary()], term(), map()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def deliver(listener, topic, payload, opts) do
+    case :persistent_term.get({MqttX.Server.Listener, listener}, nil) do
+      nil -> {:error, :no_listener}
+      ctx -> MqttX.Server.Delivery.deliver(ctx, topic, payload, opts)
+    end
+  end
+
+  @doc false
+  # Transports call this on start so deliver/4 can find the listener by name
+  def register_listener(listener, ctx) do
+    :persistent_term.put({MqttX.Server.Listener, listener}, ctx)
+  end
+
+  @doc """
   Start an MQTT server.
 
   ## Options
@@ -389,9 +489,10 @@ defmodule MqttX.Server do
   def start_link(handler, handler_opts, opts \\ []) do
     warn_deprecated_transport_opts(handler_opts)
     transport = Keyword.get(opts, :transport, MqttX.Transport.ThousandIsland)
-    transport_opts = Keyword.drop(opts, [:name])
 
-    transport.start_link(handler, handler_opts, transport_opts)
+    # :name is the handle deliver/4 finds the listener by; the transports
+    # read it and register the listener under it (or under the port)
+    transport.start_link(handler, handler_opts, opts)
   end
 
   # Retransmission knobs from before 0.12.0. Still accepted so existing

@@ -96,12 +96,27 @@ device  ──PUBLISH──▶  handle_publish(topic, payload, opts, state)
 device  ──DISCONNECT▶  handle_disconnect(reason, state)
 
 your app ──send(broker_pid, msg)─▶ handle_info(msg, state)
-                                       └─▶ {:publish, topic, payload, state}  (fan out to device)
+                                       └─▶ {:publish, topic, payload, state}  (push to THIS device)
+
+any callback / any process ──MqttX.Server.deliver(topic, payload, opts)──▶ every subscribed session
 ```
 
 Servers are *per-connection* state machines — `state` is one device's state.
-For app-wide state (subscriber registry, message bus), use Phoenix.PubSub or
-`:pg` from inside the callbacks.
+Routing between devices is the broker's job once you ask for it:
+`MqttX.Server.deliver/3` (from a callback) or `deliver/4` (from anywhere, by
+the listener's `:name`) matches every session's subscriptions, applies their
+options, sends to connected clients and queues QoS 1/2 for persistent
+sessions that are away. The handler decides *whether* a publish is delivered
+(authorization lives in `handle_publish/4`); it does not need its own
+subscriber registry. For app-wide state unrelated to routing, use
+Phoenix.PubSub or `:pg` from inside the callbacks.
+
+The broker keeps Session State (MQTT §4.1) per listener, in ETS: a client
+connecting with Clean Start 0 and a Session Expiry Interval (or CleanSession 0
+on 3.1.1) gets `session_present: true` on reconnect, its subscriptions back,
+and what was queued for it. Sessions are capped at
+`:max_session_expiry_interval` (default one day) and live in memory on one
+node.
 
 A `{:publish, topic, payload, opts, state}` return from `handle_info` is
 matched against the device's subscriptions (since 0.12): QoS is capped at the
@@ -186,7 +201,36 @@ defaulted, each returning `{:ok, state}` or `{:stop, reason, state}`. Note
 these are **not** the same as `handle_mqtt_event/3`; a module using
 `use MqttX` implements these instead.
 
-### Bridge MQTT broker ↔ Phoenix.PubSub (fan-out)
+### Route between devices (the broker does the fan-out)
+
+```elixir
+defmodule MyBroker do
+  use MqttX.Server
+
+  def init(_), do: %{client_id: nil}
+  def handle_connect(client_id, _creds, _info, state), do: {:ok, %{state | client_id: client_id}}
+
+  def handle_publish(topic, payload, opts, state) do
+    if MyApp.ACL.may_publish?(state.client_id, topic) do
+      # Matches every session's subscriptions on this listener; queues QoS 1/2
+      # for persistent sessions that are not connected right now
+      MqttX.Server.deliver(topic, payload, Map.put(opts, :publisher, state.client_id))
+      {:ok, state}
+    else
+      {:error, :unauthorized, state}
+    end
+  end
+
+  def handle_subscribe(topics, s), do: {:ok, Enum.map(topics, & &1.qos), s}
+  def handle_disconnect(_r, _s), do: :ok
+end
+
+# From anywhere in your app (a controller, a job), by the listener's :name:
+MqttX.Server.start_link(MyBroker, [], name: MyApp.Broker, port: 1883)
+MqttX.Server.deliver(MyApp.Broker, "device-123/cmd", "reboot", %{qos: 1})
+```
+
+### Bridge MQTT broker ↔ Phoenix.PubSub (uplink to your app, push to one device)
 
 ```elixir
 defmodule MyBroker do
@@ -274,14 +318,20 @@ Full list in MQTT 5.0 §2.4.
 - **Expecting `#` to match `$SYS/...`.** Per MQTT §4.7.2, `$`-prefixed topics
   require explicit subscription. `subscribe(c, "#")` does **not** receive
   `$SYS/broker/uptime`.
-- **Assuming MqttX's own broker keeps sessions.** `MqttX.Server` does not
-  queue messages for disconnected clients and always answers
-  `session_present: false` — `clean_session: false` buys you nothing against
-  *this* broker (it works as expected against EMQX, Mosquitto, etc.). Model
-  durable state in your handler with Phoenix.PubSub or a database.
+- **Expecting broker sessions to outlive the node.** `MqttX.Server` keeps
+  sessions (since 0.12) — subscriptions, in-flight QoS 1/2, messages queued
+  by `deliver/3` — in ETS on the node holding the connection, for at most
+  `:max_session_expiry_interval` (default one day). They do not survive a
+  BEAM restart and are not shared between nodes; a client that must never
+  lose a message across a deploy needs durable state in your application.
+- **Hand-rolling device-to-device routing through PubSub.** Subscribing every
+  connection to a PubSub topic and matching filters yourself loses
+  subscription options, shared subscriptions and offline queueing. Call
+  `MqttX.Server.deliver/3` from `handle_publish/4` instead; keep PubSub for
+  getting messages into and out of your application.
 - **Treating `MqttX.Server.Router` as a public pubsub.** It is the broker's
-  internal subscription index. To send messages between processes, use
-  Phoenix.PubSub or `:pg`, then bridge via the broker callback.
+  internal per-connection subscription index. Fan-out is `deliver/3`;
+  inter-process messaging is Phoenix.PubSub or `:pg`.
 - **Setting `keepalive` higher than the cloud-proxy idle timeout.** Fly.io,
   AWS NLB, Azure Front Door all idle TCP at ~60s. Use ≤ 30s for cellular IoT
   or set `server_keep_alive: 30` in `transport_opts` to enforce it server-side

@@ -2332,19 +2332,46 @@ defmodule MqttX.Transport.HandlerTest do
           end
         end)
 
-      assert_receive {:usurper_connected, true}, 2_000
+      # The incumbent's connection process receives the takeover notice, and
+      # the usurper waits for it to let go of the session before connecting
+      assert_receive {:session_takeover, ^usurper}, 2_000
+      refute_received {:usurper_connected, _}
 
-      # The incumbent's connection process receives the takeover notice
-      assert_receive {:server_disconnect, 0x8E, _props}, 2_000
-
-      # ...and acting on it sends DISCONNECT 0x8E and stops
-      assert {:stop, :normal, _} = Proto.handle_info({:server_disconnect, 0x8E, %{}}, incumbent)
+      # ...and acting on it sends DISCONNECT 0x8E, releases the session to the
+      # usurper and stops
+      assert {:stop, :normal, _} = Proto.handle_info({:session_takeover, usurper}, incumbent)
       assert_received {:sent, disconnect_data}
       {:ok, {disconnect, <<>>}} = Codec.decode(5, IO.iodata_to_binary(disconnect_data))
       assert disconnect.type == :disconnect
       assert disconnect.reason_code == 0x8E
 
+      assert_receive {:usurper_connected, true}, 2_000
+
       send(usurper, :stop)
+    end
+
+    test "a takeover does not wait forever for an incumbent that never answers", ctx do
+      _incumbent = connect_client_v5(ctx, "mute-incumbent")
+      drain_mailbox()
+      parent = self()
+
+      spawn_link(fn ->
+        send_fn = fn data -> send(parent, {:usurper_sent, data}) end
+        {:ok, s} = Proto.init(TestHandler, [agent: ctx.agent], ctx.retained_table, nil, send_fn)
+        started = System.monotonic_time(:millisecond)
+        {:ok, s} = Proto.handle_data(connect_packet_v5("mute-incumbent"), s)
+
+        send(
+          parent,
+          {:usurper_connected, s.connected, System.monotonic_time(:millisecond) - started}
+        )
+      end)
+
+      # The test process is the incumbent and ignores the notice: the usurper
+      # connects anyway once the handover deadline passes
+      assert_receive {:session_takeover, _}, 2_000
+      assert_receive {:usurper_connected, true, waited}, 7_000
+      assert waited >= 4_000
     end
 
     test "takeover is scoped per listener — a different retained table does not evict", ctx do
@@ -2360,7 +2387,7 @@ defmodule MqttX.Transport.HandlerTest do
       end)
 
       assert_receive :other_connected, 2_000
-      refute_receive {:server_disconnect, 0x8E, _}, 300
+      refute_receive {:session_takeover, _}, 300
     end
 
     test "an UNAUTHORIZED CONNECT does not evict the incumbent or touch its timers", ctx do
@@ -2379,7 +2406,8 @@ defmodule MqttX.Transport.HandlerTest do
 
       assert_receive :rejected_done, 2_000
       # The incumbent must NOT be evicted by a connection that failed auth
-      refute_receive {:server_disconnect, _, _}, 300
+      refute_receive {:session_takeover, _}, 300
+      refute_received {:server_disconnect, _, _}
     end
   end
 

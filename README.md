@@ -66,7 +66,8 @@ defmodule MyApp.MqttHandler do
   @impl true
   def handle_connect(client_id, credentials, connect_info, state) do
     # credentials:  %{username: String.t(), password: String.t()}
-    # connect_info: %{protocol_version: 3 | 4 | 5, keep_alive: non_neg_integer()}
+    # connect_info: %{protocol_version: 3 | 4 | 5, keep_alive: non_neg_integer(),
+    #                 session_present: boolean(), subscriptions: [map()], ...}
     IO.puts("[MQTT] CONNECT #{client_id} v#{connect_info.protocol_version} keepalive=#{connect_info.keep_alive}")
     {:ok, state}
   end
@@ -269,10 +270,44 @@ callback list and the injected helpers are documented in
 **`MqttX.SimpleClient`** and the
 **[Client Guide](https://hexdocs.pm/mqttx/client.html#module-based-clients-use-mqttx)**.
 
-### Publishing from a server callback (broadcast / fan-out)
+### Fan-out between clients (`MqttX.Server.deliver/3`)
+
+The broker does its own routing when you ask it to. Authorize the publish in
+`handle_publish/4`, then hand it to `deliver/3`: it matches every session's
+subscriptions on the listener, applies each subscription's options, sends to
+connected clients and queues QoS 1/2 for persistent sessions that are away:
+
+```elixir
+defmodule MyApp.MqttHandler do
+  use MqttX.Server
+
+  def init(_), do: %{client_id: nil}
+
+  def handle_connect(client_id, _creds, _info, state),
+    do: {:ok, %{state | client_id: client_id}}
+
+  def handle_publish(topic, payload, opts, state) do
+    if MyApp.ACL.may_publish?(state.client_id, topic) do
+      MqttX.Server.deliver(topic, payload, Map.put(opts, :publisher, state.client_id))
+      {:ok, state}
+    else
+      {:error, :unauthorized, state}
+    end
+  end
+
+  def handle_subscribe(topics, state), do: {:ok, Enum.map(topics, & &1.qos), state}
+  def handle_disconnect(_reason, _state), do: :ok
+end
+
+# From anywhere in your app, by the listener's :name (or port):
+MqttX.Server.start_link(MyApp.MqttHandler, [], name: MyApp.Broker, port: 1883)
+MqttX.Server.deliver(MyApp.Broker, "device-123/cmd", "reboot", %{qos: 1})
+```
+
+### Pushing to one connection from your app
 
 To bridge from your application (Phoenix.PubSub, a GenServer, an Oban worker,
-…) to a connected MQTT client, send a message to the connection process and
+…) to one connected MQTT client, send a message to its connection process and
 return a `{:publish, ...}` tuple from `handle_info/2`:
 
 ```elixir
@@ -500,6 +535,7 @@ Validated against Mosquitto (104 automated protocol tests across TCP and WebSock
 | `subscription_identifier_available` | `1` | No |
 | `server_keep_alive` | Not sent | Yes (`transport_opts`) |
 | `maximum_packet_size` | Not sent | Yes (`transport_opts`) |
+| `session_expiry_interval` | Not sent | Sent when the client asked for more than `max_session_expiry_interval` (`transport_opts`) |
 
 **`transport_opts` configuration:**
 
@@ -511,7 +547,8 @@ MqttX.Server.start_link(
     topic_alias_maximum: 100,        # max topic aliases
     receive_maximum: 65535,          # max inflight QoS>0
     max_packet_size: 256_000,        # reject oversized packets
-    max_outbound_queue: 10_000       # QoS>0 publishes queued per client behind its window
+    max_outbound_queue: 10_000,      # publishes queued per session (window + offline)
+    max_session_expiry_interval: 86_400  # longest a session outlives its connection
   }],
   transport: MqttX.Transport.ThousandIsland,
   port: 1883
@@ -527,10 +564,21 @@ The optional 4-arity `handle_connect/4` receives connection metadata separately 
 %{username: "device_imei", password: "secret"}
 
 # connect_info (4-arity only):
-%{protocol_version: 5, keep_alive: 50}
+%{protocol_version: 5, keep_alive: 50, authentication_method: nil,
+  session_present: true, subscriptions: [%{topic: "sensors/#", qos: 1, ...}]}
 ```
 
-Use `handle_connect/4` to log protocol version or make version-specific decisions. Existing `handle_connect/3` handlers continue to work unchanged.
+Use `handle_connect/4` to log the protocol version, make version-specific
+decisions, or see which session the client is resuming (`session_present`
+and the `subscriptions` coming back with it). Existing `handle_connect/3`
+handlers continue to work unchanged.
+
+**Sessions:** the broker keeps Session State per listener, in ETS. A client
+connecting with Clean Start 0 and a Session Expiry Interval (or CleanSession 0
+on 3.1.1) gets `session_present: true` on reconnect, its subscriptions back,
+unacknowledged QoS 1/2 messages re-sent, and whatever `deliver/3` queued while
+it was away. Sessions are kept for at most `max_session_expiry_interval`
+(default one day) and live in memory on one node.
 
 ## Performance
 
@@ -654,7 +702,10 @@ since 0.12.0.
 
 | Function | Description |
 |----------|-------------|
-| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:rate_limit`, `:ip`. Protocol options go in `handler_opts` under `:transport_opts` |
+| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:name`, `:rate_limit`, `:ip`. Protocol options go in `handler_opts` under `:transport_opts` |
+| `deliver(topic, payload, opts)` | From a callback: fan a message out to every session subscribed to `topic` on this listener, queueing QoS 1/2 for sessions that are away. Returns `{:ok, n}` |
+| `deliver(listener, topic, payload, opts)` | The same from any process, by the listener's `:name` or port |
+| `disconnect(pid, reason_code, properties)` | Send DISCONNECT to a connection and close it |
 
 **Callbacks:**
 
@@ -662,12 +713,12 @@ since 0.12.0.
 |----------|-------------|
 | `init(opts)` | Initialize handler state |
 | `handle_connect(client_id, credentials, state)` | Handle client connection. Return `{:ok, state}` or `{:error, reason_code, state}` |
-| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as above with connection metadata (`protocol_version`, `keep_alive`). Takes precedence over 3-arity when defined |
+| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as above with connection metadata (`protocol_version`, `keep_alive`, `authentication_method`, `session_present`, `subscriptions`). Takes precedence over 3-arity when defined |
 | `handle_publish(topic, payload, opts, state)` | Handle incoming PUBLISH. Return `{:ok, state}` |
 | `handle_subscribe(topics, state)` | Handle SUBSCRIBE. Return `{:ok, granted_qos_list, state}` |
 | `handle_unsubscribe(topics, state)` | Handle UNSUBSCRIBE. Return `{:ok, state}` |
 | `handle_disconnect(reason, state)` | Handle client disconnection. Return `:ok` |
-| `handle_session_expired(client_id, state)` | *(optional)* MQTT 5.0 session expiry elapsed after disconnect. Return `:ok` |
+| `handle_session_expired(client_id, state)` | *(optional)* The client's session ended after its connection did; the broker has dropped its own state for it. Return `:ok` |
 | `handle_info(message, state)` | Handle custom messages. Return `{:ok, state}`, `{:publish, topic, payload, state}`, `{:publish, topic, payload, opts, state}`, `{:disconnect, reason_code, state}`, `{:disconnect, reason_code, properties, state}`, or `{:stop, reason, state}` |
 
 ### MqttX.Packet.Codec
@@ -707,7 +758,7 @@ since 0.12.0.
 | **WebSocket Transport** | Done | MQTT over WebSocket via Bandit (`ws://` and `wss://`) |
 | **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
 | **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
-| **Session Persistence (Server)** | Planned | Server-side session persistence (currently client-only) |
+| **Session Persistence (Server)** | Done | Session State per listener in ETS: `session_present`, subscriptions and in-flight QoS 1/2 resume on reconnect, `MqttX.Server.deliver/3` queues for sessions that are away. In memory on one node; a durable/shared store is part of Clustering |
 | **MQTT 5.0 Enhanced Auth** | Done | Challenge–response exchange before CONNACK and re-authentication, on both client and broker, via `handle_auth/3`; the mechanism itself (SCRAM, tokens, …) is the handler's — no built-in providers |
 | **Telemetry Docs** | Done | See the [Telemetry guide](https://hexdocs.pm/mqttx/telemetry.html) |
 | **Property-based Tests** | Done | StreamData round-trips + decode/encode fuzzing of the codec |

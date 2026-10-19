@@ -15,13 +15,20 @@ defmodule MqttX.Server.SessionExpiry do
 
   use GenServer
 
+  require Logger
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec schedule(term(), non_neg_integer(), module(), term()) :: :ok
-  def schedule(key, interval_ms, handler, handler_state) do
-    GenServer.cast(__MODULE__, {:schedule, key, interval_ms, handler, handler_state})
+  # `handler` may be nil (no handle_session_expired/2 to call); `on_expire`,
+  # when given, runs first and discards the stored session itself.
+  @spec schedule(term(), non_neg_integer(), module() | nil, term(), (-> any()) | nil) :: :ok
+  def schedule(key, interval_ms, handler, handler_state, on_expire \\ nil) do
+    GenServer.cast(
+      __MODULE__,
+      {:schedule, key, interval_ms, {handler, handler_state, on_expire}}
+    )
   end
 
   @spec cancel(term()) :: :ok
@@ -33,13 +40,10 @@ defmodule MqttX.Server.SessionExpiry do
   def init(_opts), do: {:ok, %{}}
 
   @impl true
-  def handle_cast({:schedule, client_id, interval_ms, handler, handler_state}, pending) do
+  def handle_cast({:schedule, client_id, interval_ms, callbacks}, pending) do
     pending = drop_existing(pending, client_id)
     ref = make_ref()
-
-    timer =
-      Process.send_after(self(), {:expire, client_id, ref, handler, handler_state}, interval_ms)
-
+    timer = Process.send_after(self(), {:expire, client_id, ref, callbacks}, interval_ms)
     {:noreply, Map.put(pending, client_id, {timer, ref})}
   end
 
@@ -48,14 +52,26 @@ defmodule MqttX.Server.SessionExpiry do
   end
 
   @impl true
-  def handle_info({:expire, client_id, ref, handler, handler_state}, pending) do
+  def handle_info({:expire, client_id, ref, {handler, handler_state, on_expire}}, pending) do
     # Only fire if the entry's ref still matches — guards against the race
     # where cancel/1 runs after the timer message is already in our mailbox.
     case Map.get(pending, client_id) do
       {_timer, ^ref} ->
+        # Session cleanup must never take the timer owner down with it
+        if is_function(on_expire, 0) do
+          try do
+            on_expire.()
+          rescue
+            e ->
+              Logger.debug("[MqttX.Server.SessionExpiry] cleanup failed: #{Exception.message(e)}")
+          end
+        end
+
         # The map is keyed by the scoped {retained_table, client_id} tuple,
         # but the callback contract is the bare client_id.
-        handler.handle_session_expired(callback_client_id(client_id), handler_state)
+        if handler,
+          do: handler.handle_session_expired(callback_client_id(client_id), handler_state)
+
         {:noreply, Map.delete(pending, client_id)}
 
       _ ->

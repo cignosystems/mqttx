@@ -76,12 +76,22 @@ defmodule MqttX.Transport.Ranch do
 
     ref = make_ref()
 
+    # Session State (§4.1) for every client of this listener, outliving their
+    # connections; MqttX.Server.deliver/4 reaches the listener by :name or port
+    sessions = MqttX.Server.SessionStore.create(:"mqttx_ranch_#{port}")
+
+    MqttX.Server.register_listener(
+      Keyword.get(transport_opts, :name, port),
+      MqttX.Server.Delivery.listener_context(handler_opts, sessions, retained_table)
+    )
+
     protocol_opts = %{
       handler: handler,
       handler_opts: handler_opts,
       transport_opts: transport_opts,
       retained_table: retained_table,
-      rate_limiter: rate_limiter
+      rate_limiter: rate_limiter,
+      sessions: sessions
     }
 
     transport_opts_full = [{:port, port} | ranch_opts]
@@ -161,7 +171,8 @@ defmodule MqttX.Transport.Ranch do
              opts.handler_opts,
              opts.retained_table,
              opts.rate_limiter,
-             send_fn
+             send_fn,
+             opts.sessions
            ) do
         {:ok, proto} ->
           state = %{proto: proto, socket: socket, transport: transport}

@@ -24,6 +24,8 @@ defmodule MqttX.Transport.ThousandIsland do
     `:infinity`). MQTT liveness is enforced by the protocol keepalive and
     `:max_idle_timeout` below; TI's own 60 s default would disconnect
     spec-compliant clients whose Keep Alive exceeds it.
+  - `:name` - The handle `MqttX.Server.deliver/4` finds this listener by
+    (default: the port number)
 
   Everything below is passed through `transport_opts` to the protocol handler
   and applies to all adapters:
@@ -40,9 +42,15 @@ defmodule MqttX.Transport.ThousandIsland do
   - `:rate_limit` - Options for `MqttX.Server.RateLimiter` (default: none)
   - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 65535).
     A client that exceeds it is disconnected with 0x93 (§4.9)
-  - `:max_outbound_queue` - Cap on QoS > 0 publishes queued per connection
-    while the client's Receive Maximum window is full; beyond it they are
-    dropped with a warning (default: 10_000, `:infinity` disables)
+  - `:max_outbound_queue` - Cap on publishes queued per session: QoS > 0
+    publishes waiting for the client's Receive Maximum window, and what
+    `MqttX.Server.deliver/3` holds for a session that is not connected;
+    beyond it they are dropped with a warning (default: 10_000, `:infinity`
+    disables)
+  - `:max_session_expiry_interval` - Longest a session is kept after its
+    connection ends, in seconds. A v5 client asking for more is told this
+    value in CONNACK (§3.2.2.3.2); a 3.1.1 client with CleanSession 0 is
+    kept exactly this long (default: 86_400, `:infinity` lifts the cap)
   - `:topic_alias_maximum` - Topic aliases the server accepts (default: 100)
   - `:server_keep_alive` - Override the client's Keep Alive (MQTT 5.0 only)
   - `:supported_versions` - Accepted protocol levels (default: `[3, 4, 5]`)
@@ -96,12 +104,22 @@ defmodule MqttX.Transport.ThousandIsland do
 
     handler_module = __MODULE__.Handler
 
+    # Session State (§4.1) for every client of this listener, outliving their
+    # connections; MqttX.Server.deliver/4 reaches the listener by :name or port
+    sessions = MqttX.Server.SessionStore.create(:"mqttx_#{port}")
+
+    MqttX.Server.register_listener(
+      Keyword.get(transport_opts, :name, port),
+      MqttX.Server.Delivery.listener_context(handler_opts, sessions, retained_table)
+    )
+
     handler_opts_full = %{
       handler: handler,
       handler_opts: handler_opts,
       transport_opts: transport_opts,
       retained_table: retained_table,
-      rate_limiter: rate_limiter
+      rate_limiter: rate_limiter,
+      sessions: sessions
     }
 
     thousand_island_opts = [
@@ -168,7 +186,8 @@ defmodule MqttX.Transport.ThousandIsland do
              state.handler_opts,
              state.retained_table,
              state.rate_limiter,
-             send_fn
+             send_fn,
+             state.sessions
            ) do
         {:ok, proto} -> {:continue, proto}
         {:error, :rate_limited} -> {:close, state}

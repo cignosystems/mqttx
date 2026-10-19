@@ -8,6 +8,8 @@ defmodule MqttX.Transport.Handler do
   alias MqttX.Packet.Buffer
   alias MqttX.Packet.Codec
   alias MqttX.Server.Router
+  alias MqttX.Server.SessionExpiry
+  alias MqttX.Server.SessionStore
   alias MqttX.Telemetry
   alias MqttX.Packet.ReasonCodes, as: RC
   import MqttX.Packet.ReasonCodes, only: [is_error_code: 1]
@@ -23,9 +25,22 @@ defmodule MqttX.Transport.Handler do
   # publisher from exhausting memory with unique retained topics.
   @default_max_retained 100_000
 
-  # Default cap on publishes queued behind a client's Receive Maximum window
-  # (transport_opts :max_outbound_queue).
-  @max_outbound_queue 10_000
+  # The cap on publishes queued behind a client's Receive Maximum window, and
+  # on what MqttX.Server.deliver/3 queues for a session while it is away, is
+  # transport_opts :max_outbound_queue — normalized by MqttX.Server.Delivery.
+
+  # Default ceiling, in seconds, on how long a session outlives its connection
+  # (transport_opts :max_session_expiry_interval). A v5 client asking for more
+  # is told the shorter interval in CONNACK (§3.2.2.3.2); a 3.1.1 client with
+  # CleanSession 0, whose session would otherwise never end, gets this long.
+  @default_max_session_expiry 86_400
+
+  # How long a CONNECT waits for the connection it is taking over (§3.1.4) to
+  # stop writing session state before resuming from the store.
+  @takeover_timeout 5_000
+
+  # Process.send_after/3 cannot schedule further out than this (ms)
+  @max_timer_ms 4_294_967_295
 
   # Reason Codes a SUBACK (§3.9.3), a PUBACK (§3.4.2.1) and a CONNACK
   # (§3.2.2.2) may carry. Handler-supplied codes outside these sets collapse
@@ -47,6 +62,10 @@ defmodule MqttX.Transport.Handler do
   Build initial protocol state. Returns `{:error, :rate_limited}` if rate limited.
   """
   def init(handler, handler_opts, retained_table, rate_limiter, send_fn) do
+    init(handler, handler_opts, retained_table, rate_limiter, send_fn, SessionStore.new())
+  end
+
+  def init(handler, handler_opts, retained_table, rate_limiter, send_fn, sessions) do
     if rate_limiter do
       case MqttX.Server.RateLimiter.allow_connection?(rate_limiter) do
         :ok -> :ok
@@ -66,6 +85,26 @@ defmodule MqttX.Transport.Handler do
       handler_state: handler.init(handler_opts),
       retained_table: retained_table,
       rate_limiter: rate_limiter,
+      # The listener's Session State (§4.1) — see MqttX.Server.SessionStore.
+      #   session_lifetime: seconds the session outlives this connection, from
+      #     the Session Expiry Interval or CleanSession and the listener's
+      #     :max_session_expiry_interval (0 = ends with it, 0xFFFFFFFF = never)
+      #   persistent: session_lifetime > 0, so in-flight state is mirrored
+      #   session_present: what the CONNACK said (§3.2.2.1.1)
+      #   session_handed_over: a newer connection took the session (§3.1.4)
+      #   session_finished: the end-of-connection bookkeeping has run
+      sessions: sessions,
+      session_lifetime: 0,
+      persistent: false,
+      session_present: false,
+      session_handed_over: false,
+      session_finished: false,
+      max_session_expiry_interval:
+        case Map.get(transport_opts, :max_session_expiry_interval, @default_max_session_expiry) do
+          :infinity -> nil
+          n when is_integer(n) and n >= 0 -> n
+          _ -> @default_max_session_expiry
+        end,
       will_message: nil,
       # True only once the client has ended the session itself with DISCONNECT
       # 0x00 — the one close that discards the Will (§3.1.2.5). Every close the
@@ -160,12 +199,7 @@ defmodule MqttX.Transport.Handler do
       assigned_client_id: nil,
       # QoS > 0 publishes waiting for Receive Maximum capacity are bounded;
       # past the bound they are dropped with a warning (:infinity disables).
-      max_outbound_queue:
-        case Map.get(transport_opts, :max_outbound_queue, @max_outbound_queue) do
-          :infinity -> nil
-          n when is_integer(n) and n > 0 -> n
-          _ -> @max_outbound_queue
-        end
+      max_outbound_queue: MqttX.Server.Delivery.max_outbound_queue(transport_opts)
     }
 
     # A peer must complete CONNECT within a bounded window — otherwise an
@@ -176,6 +210,14 @@ defmodule MqttX.Transport.Handler do
       :infinity -> :ok
       timeout_ms -> Process.send_after(self(), :mqtt_connect_timeout, timeout_ms)
     end
+
+    # MqttX.Server.deliver/3, called from a handler callback, finds its
+    # listener here
+    Process.put(:mqttx_listener, %{
+      sessions: sessions,
+      retained_table: retained_table,
+      max_outbound_queue: state.max_outbound_queue
+    })
 
     {:ok, reset_idle_timer(state)}
   catch
@@ -237,9 +279,7 @@ defmodule MqttX.Transport.Handler do
       state.handler.handle_disconnect(:closed, state.handler_state)
     end
 
-    if connected and not graceful do
-      maybe_start_session_expiry(state)
-    end
+    state = if connected, do: end_connection_session(state), else: state
 
     {:shutdown, state}
   end
@@ -262,9 +302,7 @@ defmodule MqttX.Transport.Handler do
       state.handler.handle_disconnect({:error, reason}, state.handler_state)
     end
 
-    if state.connected do
-      maybe_start_session_expiry(state)
-    end
+    state = if state.connected, do: end_connection_session(state), else: state
 
     {:shutdown, state}
   end
@@ -289,9 +327,7 @@ defmodule MqttX.Transport.Handler do
       state.handler.handle_disconnect(:timeout, state.handler_state)
     end
 
-    if state.connected and not state.graceful_disconnect do
-      maybe_start_session_expiry(state)
-    end
+    state = if state.connected, do: end_connection_session(state), else: state
 
     {:close, state}
   end
@@ -322,6 +358,8 @@ defmodule MqttX.Transport.Handler do
         state
       end
 
+    state = if state.connected, do: end_connection_session(state), else: state
+
     {:stop, :normal, state}
   end
 
@@ -346,10 +384,12 @@ defmodule MqttX.Transport.Handler do
     state =
       if reason_code == RC.session_taken_over() do
         will = if will_delayed?(state), do: nil, else: state.will_message
-        %{state | will_message: will, session_expiry_interval: nil}
+        %{state | will_message: will, session_expiry_interval: nil, session_handed_over: true}
       else
         state
       end
+
+    state = if state.connected, do: end_connection_session(state), else: state
 
     {:stop, :normal, state}
   end
@@ -392,6 +432,27 @@ defmodule MqttX.Transport.Handler do
 
     abnormal_close(state, {:linked_process_exit, reason})
   end
+
+  # MqttX.Server.deliver/3 queued something for this session
+  def handle_info(:mqttx_drain, %{connected: true} = state),
+    do: {:noreply, drain_outbound_queue(state)}
+
+  def handle_info(:mqttx_drain, state), do: {:noreply, state}
+
+  # §3.1.4-3: a new connection for this client_id is taking the session over.
+  # Same as {:server_disconnect, 0x8E, _} — DISCONNECT, only an immediate
+  # Will — plus a reply once this process has stopped touching the session
+  # state the new connection is about to read from the store.
+  def handle_info({:session_takeover, new_pid}, state) do
+    {:stop, :normal, state} =
+      handle_info({:server_disconnect, RC.session_taken_over(), %{}}, state)
+
+    send(new_pid, {:session_released, self()})
+    {:stop, :normal, state}
+  end
+
+  # A reply from a connection we took over, arriving after the wait ended
+  def handle_info({:session_released, _pid}, state), do: {:noreply, state}
 
   def handle_info(message, state) do
     if state.connected and state.handler_has_handle_info do
@@ -476,7 +537,7 @@ defmodule MqttX.Transport.Handler do
         state
       end
 
-    if state.connected, do: maybe_start_session_expiry(state)
+    state = if state.connected, do: end_connection_session(state), else: state
 
     {:stop, :normal, state}
   end
@@ -751,7 +812,12 @@ defmodule MqttX.Transport.Handler do
             # The flattened binary form (not the decoded segment list) so
             # Router.subscribe parses $share/... into a shared-group entry —
             # and so it matches the binary the UNSUBSCRIBE path removes
-            Router.subscribe(router, filter_key(sub), state.client_id, opts)
+            filter = filter_key(sub)
+
+            # The listener-wide index MqttX.Server.deliver/3 routes through,
+            # and what a resumed session is rebuilt from (§4.1)
+            SessionStore.subscribe(state.sessions, state.client_id, filter, Map.new(opts))
+            Router.subscribe(router, filter, state.client_id, opts)
           end)
 
         state = deliver_retained_messages(%{state | router: router}, enriched_topics)
@@ -818,7 +884,9 @@ defmodule MqttX.Transport.Handler do
 
         router =
           Enum.reduce(packet.topics, state.router, fn topic, router ->
-            Router.unsubscribe(router, filter_key(topic), state.client_id)
+            filter = filter_key(topic)
+            SessionStore.unsubscribe(state.sessions, state.client_id, filter)
+            Router.unsubscribe(router, filter, state.client_id)
           end)
 
         {:ok,
@@ -879,7 +947,13 @@ defmodule MqttX.Transport.Handler do
         {:close, :protocol_error, state}
 
       true ->
-        state = if new_sei, do: %{state | session_expiry_interval: new_sei}, else: state
+        state =
+          if new_sei do
+            lifetime = session_lifetime(state, state.protocol_version, new_sei, false)
+            %{state | session_expiry_interval: new_sei, session_lifetime: lifetime}
+          else
+            state
+          end
 
         Telemetry.server_client_disconnect(%{client_id: state.client_id, reason: :normal})
 
@@ -899,7 +973,7 @@ defmodule MqttX.Transport.Handler do
             state
           end
 
-        maybe_start_session_expiry(state)
+        state = end_connection_session(state)
 
         {:close, :disconnect, %{state | graceful_disconnect: true}}
     end
@@ -908,7 +982,11 @@ defmodule MqttX.Transport.Handler do
   # Handle PUBACK (for QoS 1 outgoing messages)
   defp handle_packet(%{type: :puback} = packet, state) do
     pending_qos1_tx = Map.delete(state.pending_qos1_tx, packet.packet_id)
-    state = drain_outbound_queue(%{state | pending_qos1_tx: pending_qos1_tx})
+
+    state =
+      untrack_inflight(%{state | pending_qos1_tx: pending_qos1_tx}, {:tx1, packet.packet_id})
+
+    state = drain_outbound_queue(state)
 
     if state.handler_has_handle_puback do
       case state.handler.handle_puback(packet.packet_id, state.handler_state) do
@@ -954,17 +1032,19 @@ defmodule MqttX.Transport.Handler do
         )
 
         pending = Map.delete(state.pending_qos2_tx, packet.packet_id)
-        {:ok, drain_outbound_queue(%{state | pending_qos2_tx: pending})}
+        state = untrack_inflight(%{state | pending_qos2_tx: pending}, {:tx2, packet.packet_id})
+        {:ok, drain_outbound_queue(state)}
 
       _entry ->
         # Send PUBREL to complete the QoS 2 handshake
         pubrel = %{type: :pubrel, packet_id: packet.packet_id}
         send_packet(state, pubrel, state.protocol_version)
 
-        pending =
-          Map.put(state.pending_qos2_tx, packet.packet_id, %{phase: :pubrel_sent, packet: nil})
+        entry = %{phase: :pubrel_sent, packet: nil}
+        pending = Map.put(state.pending_qos2_tx, packet.packet_id, entry)
 
-        {:ok, %{state | pending_qos2_tx: pending}}
+        {:ok,
+         track_inflight(%{state | pending_qos2_tx: pending}, {:tx2, packet.packet_id}, entry)}
     end
   end
 
@@ -1004,24 +1084,30 @@ defmodule MqttX.Transport.Handler do
             send_packet(state, pubcomp, state.protocol_version)
 
             {:ok,
-             %{
-               state
-               | handler_state: new_handler_state,
-                 pending_qos2_rx: remaining,
-                 inflight_count: max(state.inflight_count - 1, 0)
-             }}
+             untrack_inflight(
+               %{
+                 state
+                 | handler_state: new_handler_state,
+                   pending_qos2_rx: remaining,
+                   inflight_count: max(state.inflight_count - 1, 0)
+               },
+               {:rx2, packet.packet_id}
+             )}
 
           {:error, _reason, new_handler_state} ->
             pubcomp = %{type: :pubcomp, packet_id: packet.packet_id}
             send_packet(state, pubcomp, state.protocol_version)
 
             {:ok,
-             %{
-               state
-               | handler_state: new_handler_state,
-                 pending_qos2_rx: remaining,
-                 inflight_count: max(state.inflight_count - 1, 0)
-             }}
+             untrack_inflight(
+               %{
+                 state
+                 | handler_state: new_handler_state,
+                   pending_qos2_rx: remaining,
+                   inflight_count: max(state.inflight_count - 1, 0)
+               },
+               {:rx2, packet.packet_id}
+             )}
 
           {:disconnect, reason_code, new_handler_state} ->
             send_disconnect(state, reason_code, %{})
@@ -1051,7 +1137,8 @@ defmodule MqttX.Transport.Handler do
   # Handle PUBCOMP (client confirms QoS 2 outgoing flow complete)
   defp handle_packet(%{type: :pubcomp} = packet, state) do
     pending = Map.delete(state.pending_qos2_tx, packet.packet_id)
-    state = drain_outbound_queue(%{state | pending_qos2_tx: pending})
+    state = untrack_inflight(%{state | pending_qos2_tx: pending}, {:tx2, packet.packet_id})
+    state = drain_outbound_queue(state)
 
     if state.handler_has_handle_puback do
       case state.handler.handle_puback(packet.packet_id, state.handler_state) do
@@ -1172,10 +1259,18 @@ defmodule MqttX.Transport.Handler do
     # MQTT 5.0 only — earlier versions decode with empty properties
     auth_method = Map.get(connect_props, :authentication_method)
 
+    # §3.1.2.4: with Clean Start 0 an existing session is resumed. The handler
+    # learns up front what that would bring back; the restore itself happens
+    # in complete_connect/5, once the CONNECT is authorized.
+    resuming? =
+      not packet.clean_session and SessionStore.exists?(state.sessions, packet.client_id)
+
     connect_info = %{
       protocol_version: protocol_version,
       keep_alive: Map.get(packet, :keep_alive, 0),
-      authentication_method: auth_method
+      authentication_method: auth_method,
+      session_present: resuming?,
+      subscriptions: if(resuming?, do: stored_subscriptions(state, packet.client_id), else: [])
     }
 
     connect_result =
@@ -1237,8 +1332,16 @@ defmodule MqttX.Transport.Handler do
     end
 
     # §3.1.4-3: a CONNECT with a client_id already in use takes over the
-    # session — the existing connection is disconnected (0x8E).
+    # session — the existing connection is disconnected (0x8E), and this one
+    # waits for it to let go before reading what it left in the store.
     take_over_existing_sessions(packet.client_id, state)
+
+    # §3.1.2.4 Clean Start and §3.1.2.11 Session Expiry Interval: whether an
+    # existing session is resumed, and how long this one outlives the
+    # connection. The store knows the session from here on.
+    requested_sei = Map.get(connect_props, :session_expiry_interval)
+    lifetime = session_lifetime(state, protocol_version, requested_sei, packet.clean_session)
+    resumed = begin_session(state, packet, protocol_version)
 
     # MQTT-4.12.0-5: a successful CONNACK repeats the Authentication Method
     # (and may carry the mechanism's final data); MQTT-4.12.0-6: never
@@ -1255,9 +1358,17 @@ defmodule MqttX.Transport.Handler do
         do: Map.put(connack_props, :assigned_client_identifier, state.assigned_client_id),
         else: connack_props
 
+    # §3.2.2.3.2: a server keeping the session for less than the client asked
+    # says so, and the client must use that value
+    connack_props =
+      if protocol_version >= 5 and lifetime != (requested_sei || 0),
+        do: Map.put(connack_props, :session_expiry_interval, lifetime),
+        else: connack_props
+
     connack = %{
       type: :connack,
-      session_present: false,
+      # MQTT-3.2.2-2/-3: set only when Clean Start was 0 and a session existed
+      session_present: resumed != nil,
       reason_code: 0,
       properties: connack_props
     }
@@ -1282,7 +1393,10 @@ defmodule MqttX.Transport.Handler do
         connected: true,
         pending_connect: nil,
         keep_alive: keep_alive,
-        session_expiry_interval: Map.get(connect_props, :session_expiry_interval),
+        session_expiry_interval: requested_sei,
+        session_lifetime: lifetime,
+        persistent: lifetime > 0,
+        session_present: resumed != nil,
         client_topic_alias_maximum: Map.get(connect_props, :topic_alias_maximum, 0),
         client_receive_maximum: Map.get(connect_props, :receive_maximum, 65535),
         client_max_packet_size: Map.get(connect_props, :maximum_packet_size)
@@ -1290,7 +1404,16 @@ defmodule MqttX.Transport.Handler do
 
     register_session(packet.client_id, state)
 
-    {:ok, start_keepalive_timer(new_state)}
+    # After CONNACK (MQTT-3.2.0-1): re-send what the resumed session had in
+    # flight — the one case re-sending is allowed (MQTT-4.4.0-1) — then what
+    # was delivered to it while it was away
+    new_state =
+      new_state
+      |> start_keepalive_timer()
+      |> restore_session(resumed)
+      |> drain_outbound_queue()
+
+    {:ok, new_state}
   end
 
   # CONNACK with an error Reason Code; the connection then closes
@@ -1461,7 +1584,8 @@ defmodule MqttX.Transport.Handler do
           send_packet(state, pubrec, state.protocol_version)
 
           pending = Map.put(state.pending_qos2_rx, packet.packet_id, {packet, opts})
-          {:ok, %{state | pending_qos2_rx: pending, inflight_count: state.inflight_count + 1}}
+          state = %{state | pending_qos2_rx: pending, inflight_count: state.inflight_count + 1}
+          {:ok, track_inflight(state, {:rx2, packet.packet_id}, {packet, opts})}
         end
 
       true ->
@@ -1533,7 +1657,18 @@ defmodule MqttX.Transport.Handler do
 
     for {pid, _} <- Registry.lookup(MqttX.Server.ConnectionRegistry, key), pid != self() do
       Logger.info("[MqttX.Transport] Session takeover for #{inspect(client_id)}")
-      send(pid, {:server_disconnect, RC.session_taken_over(), %{}})
+      ref = Process.monitor(pid)
+      send(pid, {:session_takeover, self()})
+
+      # The session is resumed from the store, so the old connection must have
+      # stopped writing to it first: wait for its word or its exit, but no
+      # longer than the handover deadline
+      receive do
+        {:session_released, ^pid} -> Process.demonitor(ref, [:flush])
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      after
+        @takeover_timeout -> Process.demonitor(ref, [:flush])
+      end
     end
 
     :ok
@@ -1781,6 +1916,29 @@ defmodule MqttX.Transport.Handler do
           drain_outbound_queue(state)
 
         {:empty, _} ->
+          drain_session_queue(state)
+      end
+    else
+      state
+    end
+  end
+
+  # What MqttX.Server.deliver/3 queued for this session — while it was away,
+  # or a moment ago with a :mqttx_drain poke — in arrival order, for as long
+  # as the Receive Maximum window has room.
+  defp drain_session_queue(state) do
+    if inflight_tx_total(state) < state.client_receive_maximum do
+      case SessionStore.dequeue(state.sessions, state.client_id) do
+        {:ok, {topic, payload, opts, queued_at}} ->
+          state =
+            case age_message_expiry(opts, queued_at) do
+              {:ok, opts} -> do_send_publish(state, topic, payload, opts)
+              :expired -> state
+            end
+
+          drain_session_queue(state)
+
+        :empty ->
           state
       end
     else
@@ -1836,15 +1994,12 @@ defmodule MqttX.Transport.Handler do
           case qos do
             1 ->
               %{state | pending_qos1_tx: Map.put(state.pending_qos1_tx, packet_id, packet)}
+              |> track_inflight({:tx1, packet_id}, packet)
 
             2 ->
-              pending =
-                Map.put(state.pending_qos2_tx, packet_id, %{
-                  phase: :pubrec_pending,
-                  packet: packet
-                })
-
-              %{state | pending_qos2_tx: pending}
+              entry = %{phase: :pubrec_pending, packet: packet}
+              pending = Map.put(state.pending_qos2_tx, packet_id, entry)
+              track_inflight(%{state | pending_qos2_tx: pending}, {:tx2, packet_id}, entry)
 
             _ ->
               state
@@ -1953,36 +2108,202 @@ defmodule MqttX.Transport.Handler do
     %{state | idle_timer: timer}
   end
 
-  # Session expiry helper
-  defp maybe_start_session_expiry(%{session_expiry_interval: nil}), do: :ok
-  defp maybe_start_session_expiry(%{session_expiry_interval: 0xFFFFFFFF}), do: :ok
+  # ---------- Session State (§4.1) ----------
 
-  defp maybe_start_session_expiry(%{session_expiry_interval: 0} = state) do
-    if state.handler_has_handle_session_expired do
-      state.handler.handle_session_expired(state.client_id, state.handler_state)
+  # Seconds the session outlives the connection. v5: the Session Expiry
+  # Interval (absent = 0), capped by the listener's :max_session_expiry_interval.
+  # 3.1.1: CleanSession 1 ends it with the connection; CleanSession 0 would
+  # keep it forever, so the cap applies (0xFFFFFFFF when there is none).
+  defp session_lifetime(state, protocol_version, sei, clean_session) do
+    cap = state.max_session_expiry_interval
+
+    cond do
+      protocol_version >= 5 ->
+        requested = sei || 0
+        if cap && requested > cap, do: cap, else: requested
+
+      clean_session ->
+        0
+
+      true ->
+        cap || 0xFFFFFFFF
     end
+  end
 
+  # Discard (Clean Start 1, §3.1.2.4) or pick up (Clean Start 0) the client's
+  # stored session, and record that one exists and is connected — a connected
+  # session never expires. Returns what there is to restore, or nil.
+  defp begin_session(state, packet, protocol_version) do
+    sessions = state.sessions
+    client_id = packet.client_id
+
+    resumed =
+      cond do
+        packet.clean_session ->
+          SessionStore.delete(sessions, client_id)
+          nil
+
+        SessionStore.get(sessions, client_id) == nil ->
+          nil
+
+        true ->
+          %{
+            subscriptions: SessionStore.subscriptions(sessions, client_id),
+            inflight: SessionStore.inflight(sessions, client_id)
+          }
+      end
+
+    SessionStore.put(sessions, client_id, %{
+      protocol_version: protocol_version,
+      expires_at: :infinity
+    })
+
+    resumed
+  end
+
+  defp restore_session(state, nil), do: state
+
+  defp restore_session(state, %{subscriptions: subscriptions, inflight: inflight}) do
+    # Subscriptions back into this connection's router
+    {router, filters} =
+      Enum.reduce(subscriptions, {state.router, state.subscribed_filters}, fn
+        %{filter: filter, opts: opts}, {router, filters} ->
+          {Router.subscribe(router, filter, state.client_id, Map.to_list(opts)),
+           MapSet.put(filters, filter)}
+      end)
+
+    state = %{state | router: router, subscribed_filters: filters}
+    version = state.protocol_version
+
+    # In-flight QoS 1/2 state, oldest first (§4.6). Outbound messages are
+    # re-sent as a resumption allows (MQTT-4.4.0-1): a PUBLISH not yet
+    # acknowledged with DUP set, a PUBREL whose PUBCOMP never came as is. An
+    # inbound QoS 2 message still waiting for its PUBREL is simply held again.
+    Enum.reduce(inflight, state, fn
+      {{:tx1, id}, packet}, st ->
+        send_packet(st, %{packet | dup: true}, version)
+        %{st | pending_qos1_tx: Map.put(st.pending_qos1_tx, id, packet)}
+
+      {{:tx2, id}, %{phase: :pubrec_pending, packet: packet} = entry}, st ->
+        send_packet(st, %{packet | dup: true}, version)
+        %{st | pending_qos2_tx: Map.put(st.pending_qos2_tx, id, entry)}
+
+      {{:tx2, id}, %{phase: :pubrel_sent} = entry}, st ->
+        send_packet(st, %{type: :pubrel, packet_id: id}, version)
+        %{st | pending_qos2_tx: Map.put(st.pending_qos2_tx, id, entry)}
+
+      {{:rx2, id}, {_packet, _opts} = held}, st ->
+        %{
+          st
+          | pending_qos2_rx: Map.put(st.pending_qos2_rx, id, held),
+            inflight_count: st.inflight_count + 1
+        }
+    end)
+  end
+
+  # The connection is over: decide what becomes of the session, once. Nothing
+  # to decide if a newer connection took it (§3.1.4) — it is theirs now.
+  defp end_connection_session(%{session_finished: true} = state), do: state
+
+  defp end_connection_session(%{session_handed_over: true} = state) do
+    leave_registry(state)
+    %{state | session_finished: true}
+  end
+
+  defp end_connection_session(state) do
+    leave_registry(state)
+    state = %{state | session_finished: true}
+    sessions = state.sessions
+    client_id = state.client_id
+    lifetime = state.session_lifetime
+
+    cond do
+      # Ends with the connection (Session Expiry Interval 0 / CleanSession 1)
+      lifetime == 0 ->
+        SessionStore.delete(sessions, client_id)
+
+        if state.session_expiry_interval == 0 and state.handler_has_handle_session_expired do
+          state.handler.handle_session_expired(client_id, state.handler_state)
+        end
+
+        state
+
+      # Outlives it: what was waiting for the Receive Maximum window joins the
+      # queue MqttX.Server.deliver/3 fills while the client is away, and the
+      # expiry clock starts — a reconnect cancels it (complete_connect/5)
+      true ->
+        state = flush_outbound_queue_to_store(state)
+
+        if lifetime == 0xFFFFFFFF do
+          SessionStore.set_expiry(sessions, client_id, :infinity)
+        else
+          SessionStore.set_expiry(sessions, client_id, System.system_time(:second) + lifetime)
+          handler = if state.handler_has_handle_session_expired, do: state.handler
+
+          # Beyond the timer's reach the store's own expiry check takes over
+          if lifetime * 1000 <= @max_timer_ms do
+            SessionExpiry.schedule(
+              timer_scope(state, client_id),
+              lifetime * 1000,
+              handler,
+              state.handler_state,
+              fn -> SessionStore.delete(sessions, client_id) end
+            )
+          end
+        end
+
+        state
+    end
+  end
+
+  # No longer a delivery target: from here on MqttX.Server.deliver/3 treats
+  # the session as not connected (the registry would also clear this entry
+  # when the process exits, a moment later)
+  defp leave_registry(%{client_id: client_id} = state) when is_binary(client_id) do
+    Registry.unregister(MqttX.Server.ConnectionRegistry, timer_scope(state, client_id))
     :ok
   end
 
-  defp maybe_start_session_expiry(%{session_expiry_interval: interval} = state)
-       when interval > 0 do
-    # Supervised + cancellable: a reconnect for the same client_id cancels
-    # this via SessionExpiry.cancel/1 in the CONNECT path, so expiry can no
-    # longer fire for a live, resumed session.
-    if state.handler_has_handle_session_expired and state.client_id do
-      MqttX.Server.SessionExpiry.schedule(
-        timer_scope(state, state.client_id),
-        interval * 1000,
-        state.handler,
-        state.handler_state
-      )
-    end
+  defp leave_registry(_state), do: :ok
 
-    :ok
+  defp flush_outbound_queue_to_store(state) do
+    state.outbound_queue
+    |> :queue.to_list()
+    |> Enum.each(fn entry ->
+      SessionStore.enqueue(state.sessions, state.client_id, entry, state.max_outbound_queue)
+    end)
+
+    %{state | outbound_queue: :queue.new()}
   end
 
-  defp maybe_start_session_expiry(_state), do: :ok
+  # In-flight state is mirrored to the store only when the session will
+  # outlive this connection — that is what a resumption restores from
+  defp track_inflight(%{persistent: true} = state, key, value) do
+    SessionStore.put_inflight(state.sessions, state.client_id, key, value)
+    state
+  end
+
+  defp track_inflight(state, _key, _value), do: state
+
+  defp untrack_inflight(%{persistent: true} = state, key) do
+    SessionStore.delete_inflight(state.sessions, state.client_id, key)
+    state
+  end
+
+  defp untrack_inflight(state, _key), do: state
+
+  # A stored session's subscriptions in the shape handle_connect/4 reports them
+  defp stored_subscriptions(state, client_id) do
+    for %{filter: filter, opts: opts} <- SessionStore.subscriptions(state.sessions, client_id) do
+      %{
+        topic: filter,
+        qos: Map.get(opts, :qos, 0),
+        no_local: Map.get(opts, :no_local, false),
+        retain_as_published: Map.get(opts, :retain_as_published, false),
+        subscription_identifier: Map.get(opts, :subscription_identifier)
+      }
+    end
+  end
 
   # Extract will message from CONNECT packet
   defp extract_will_message(%{will: nil}), do: nil
@@ -2010,7 +2331,7 @@ defmodule MqttX.Transport.Handler do
     # §3.1.2.5: the Will is published at the EARLIER of the delay expiring or
     # the session ending. With session expiry 0 (or unset, which means 0 in
     # v5) the session ends at disconnect — publish immediately.
-    session_expiry = state.session_expiry_interval || 0
+    session_expiry = state.session_lifetime
 
     if session_expiry == 0 do
       do_publish_will(state)

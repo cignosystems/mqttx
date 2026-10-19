@@ -62,11 +62,21 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
           rate_limit_opts -> MqttX.Server.RateLimiter.new(rate_limit_opts)
         end
 
+      # Session State (§4.1) for every client of this listener, outliving
+      # their connections; MqttX.Server.deliver/4 finds it by :name or port
+      sessions = MqttX.Server.SessionStore.create(:"mqttx_ws_#{port}")
+
+      MqttX.Server.register_listener(
+        Keyword.get(transport_opts, :name, port),
+        MqttX.Server.Delivery.listener_context(handler_opts, sessions, retained_table)
+      )
+
       plug_opts = %{
         handler: handler,
         handler_opts: handler_opts,
         retained_table: retained_table,
         rate_limiter: rate_limiter,
+        sessions: sessions,
         path: Keyword.get(transport_opts, :path, "/mqtt"),
         max_frame_size: Keyword.get(transport_opts, :max_frame_size)
       }
@@ -156,7 +166,8 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
               handler: opts.handler,
               handler_opts: opts.handler_opts,
               retained_table: opts.retained_table,
-              rate_limiter: opts.rate_limiter
+              rate_limiter: opts.rate_limiter,
+              sessions: opts.sessions
             },
             upgrade_opts(opts)
           )
@@ -187,7 +198,8 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
              opts.handler_opts,
              opts.retained_table,
              opts.rate_limiter,
-             send_fn
+             send_fn,
+             opts.sessions
            ) do
         {:ok, proto} ->
           {:ok, proto}

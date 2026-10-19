@@ -51,7 +51,7 @@ end
 | Callback | Return |
 |----------|--------|
 | `init(opts)` | `state` |
-| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as the 3-arity form plus `%{protocol_version:, keep_alive:, authentication_method:}`; takes precedence when defined |
+| `handle_connect(client_id, credentials, connect_info, state)` | *(optional)* Same as the 3-arity form plus `%{protocol_version:, keep_alive:, authentication_method:, session_present:, subscriptions:}`; takes precedence when defined |
 | `handle_connect(client_id, credentials, state)` | `{:ok, state}` or `{:error, reason_code, state}` |
 | `handle_publish(topic, payload, opts, state)` | `{:ok, state}`, `{:error, reason, state}` (refused but still acknowledged — QoS 1 gets a PUBACK with a refusal code, e.g. `0x87` for `:unauthorized`), `{:disconnect, reason_code, state}` |
 | `handle_subscribe(topics, state)` | `{:ok, granted_qos_list, state}`, `{:disconnect, reason_code, state}` |
@@ -62,9 +62,52 @@ end
 | `handle_auth(method, data, state)` | `{:ok, state}`, `{:ok, data, state}`, `{:continue, data, state}`, or `{:error, reason_code, state}` *(optional, MQTT 5.0 enhanced auth — see [Enhanced Authentication](#enhanced-authentication))* |
 | `handle_session_expired(client_id, state)` | `:ok` (optional) |
 
-Use `handle_info/2` with `{:publish, topic, payload, state}` to push messages to connected clients from external events (e.g., PubSub). When the topic matches one of the client's subscriptions, the delivery honors the subscription's options: QoS is capped at the granted QoS, `retain` is forwarded only if the subscription set Retain As Published, and subscription identifiers are attached. Pass `publisher: originating_client_id` in the opts to honor `no_local` subscriptions. A publish matching no subscription is sent exactly as given.
+Use `handle_info/2` with `{:publish, topic, payload, state}` to push messages to connected clients from external events (e.g., PubSub). When the topic matches one of the client's subscriptions, the delivery honors the subscription's options: QoS is capped at the granted QoS, `retain` is forwarded only if the subscription set Retain As Published, and subscription identifiers are attached. Pass `publisher: originating_client_id` in the opts to honor `no_local` subscriptions. A publish matching no subscription is sent exactly as given. To fan a message out to *every* subscribed session, connected or not, use `MqttX.Server.deliver/3` — see [Delivering Messages](#delivering-messages).
 
 Any callback that returns `{:disconnect, reason_code, state}` or `{:disconnect, reason_code, properties, state}` will send an MQTT 5.0 DISCONNECT packet to the client and close the connection.
+
+## Delivering Messages
+
+A publish arriving at `handle_publish/4` is yours to authorize; the fan-out
+is the broker's. `MqttX.Server.deliver/3` matches a topic against the
+subscriptions of every session on the listener — connected or not — and
+sends, with each subscription's options applied: QoS capped at the granted
+QoS, `retain` kept only for Retain As Published subscriptions, Subscription
+Identifiers attached, one member per shared subscription (a connected one
+when there is one), and `no_local` honored when you name the `:publisher`.
+
+```elixir
+@impl true
+def handle_publish(topic, payload, opts, state) do
+  if MyApp.ACL.may_publish?(state.client_id, topic) do
+    MqttX.Server.deliver(topic, payload, Map.put(opts, :publisher, state.client_id))
+    {:ok, state}
+  else
+    {:error, :unauthorized, state}
+  end
+end
+```
+
+From outside a callback — a controller, a job — address the listener by the
+`:name` it was started with (or its port number):
+
+```elixir
+MqttX.Server.start_link(MyApp.MqttHandler, [], name: MyApp.Broker, port: 1883)
+
+MqttX.Server.deliver(MyApp.Broker, "devices/42/cmd", "reboot", %{qos: 1})
+```
+
+A session that is not connected but has not expired gets QoS 1 and 2
+messages queued — bounded by the `:max_outbound_queue` transport option, with
+any Message Expiry Interval still counting down — and receives them in order
+when it reconnects. QoS 0 messages are not queued for an absent client.
+`deliver` returns `{:ok, n}`, the number of sessions the message went to.
+Unlike an inbound PUBLISH, `retain: true` here does not write the retained
+store; it only marks the delivery for Retain As Published subscribers.
+
+`{:publish, ...}` returns from `handle_info/2` remain the way to push to the
+one client a connection serves, for brokers that route through their own
+PubSub.
 
 ## Transport Adapters
 
@@ -235,17 +278,41 @@ ends at disconnect and the Will is published at once.
 
 ## Session State
 
-The server operates in clean-session mode **for every protocol version**:
-`session_present` is always `false` in CONNACK, and session state
-(subscriptions, queued messages, in-flight QoS 1/2) is not persisted across
-reconnections. A client that connects with `clean_session: false` therefore
-gains nothing against *this* broker, though it works as expected against EMQX,
-Mosquitto, and other brokers. If your application needs session resumption,
-implement it at the handler level using `handle_connect/3` and a session store.
+The broker keeps each client's Session State (MQTT §4.1) in ETS, per
+listener, so it outlives the connection:
 
-## Session Expiry (MQTT 5.0)
+- the subscriptions, with their options and Subscription Identifiers
+- QoS 1/2 messages in flight in either direction
+- messages `MqttX.Server.deliver/3` queued while the client was away
+- when the session ends
 
-MQTT 5.0 clients can set `session_expiry_interval` in the CONNECT properties. After the client disconnects, the server waits the specified interval then calls your `handle_session_expired/2` callback.
+A client that connects with Clean Start 0 and a non-zero Session Expiry
+Interval — or, for MQTT 3.1.1, CleanSession 0 — resumes its session on
+reconnect: the CONNACK says `session_present: true`, its subscriptions are
+live again without a new SUBSCRIBE, unacknowledged QoS 1/2 PUBLISHes are
+re-sent with DUP set (the one case §4.4 allows), a PUBREL whose PUBCOMP never
+came goes out again, an inbound QoS 2 message still waiting for its PUBREL
+is completed, and the queue drains in order. Clean Start 1 discards whatever
+was stored. `handle_connect/4`'s `connect_info` carries `session_present` and
+the `subscriptions` coming back, for handlers that re-establish their own
+routing on reconnect.
+
+A connection taking over a client id (§3.1.4) inherits the session: the old
+connection is told to let go and the new one resumes from the store.
+
+The state lives in memory on the node that holds the connection. It survives
+the connection process and a listener restart, not a restart of the BEAM; a
+client reconnecting to another node starts fresh.
+
+## Session Expiry
+
+MQTT 5.0 clients set `session_expiry_interval` in the CONNECT properties.
+After the client disconnects, the server keeps the session that long, then
+discards it and calls your `handle_session_expired/2` callback. The interval
+is capped by the `:max_session_expiry_interval` transport option (default
+86 400 s, one day; `:infinity` lifts the cap): a v5 client asking for more is
+told the cap in CONNACK (§3.2.2.3.2), and a 3.1.1 client with CleanSession 0,
+whose session would otherwise never end, is kept exactly that long.
 
 The timer is supervised and **cancelled if the same client reconnects within
 the window**, so expiry never fires for a session that resumed in time. A
@@ -255,18 +322,19 @@ commonly `session_expiry_interval: 0` meaning "drop my session now".
 ```elixir
 @impl true
 def handle_session_expired(client_id, state) do
-  # Clean up stored subscriptions, queued messages, etc.
-  MyApp.SessionStore.delete(client_id)
+  # The broker has dropped the session's own state; drop yours
+  MyApp.Devices.forget(client_id)
   :ok
 end
 ```
 
 | Value | Behavior |
 |-------|----------|
-| `nil` | No session expiry (MQTT 3.1.1 default) |
-| `0` | Session expires immediately on disconnect |
-| `1..0xFFFFFFFE` | Session expires after N seconds |
-| `0xFFFFFFFF` | Session never expires |
+| absent (v5) | Same as `0` |
+| absent (3.1.1) | CleanSession 1: ends at disconnect; CleanSession 0: kept for `:max_session_expiry_interval` |
+| `0` | Session ends at disconnect |
+| `1..0xFFFFFFFE` | Session ends after N seconds (capped) |
+| `0xFFFFFFFF` | Session never expires (capped) |
 
 ## Server-Initiated Disconnect
 

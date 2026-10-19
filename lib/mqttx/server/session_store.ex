@@ -44,7 +44,11 @@ defmodule MqttX.Server.SessionStore do
         }
 
   @type client_id :: binary()
-  @type meta :: %{protocol_version: 3 | 4 | 5, expires_at: :infinity | integer()}
+  @type meta :: %{
+          protocol_version: 3 | 4 | 5,
+          expires_at: :infinity | integer(),
+          persistent: boolean()
+        }
   @type inflight_key :: {:tx1 | :tx2 | :rx2, non_neg_integer()}
 
   # ---------- Creation ----------

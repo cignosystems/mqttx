@@ -106,7 +106,10 @@ All notable changes to this project will be documented in this file.
   member per shared subscription, preferring a connected one) and sends. A
   session that is not connected gets QoS 1/2 messages queued, bounded by
   `:max_outbound_queue`, with Message Expiry counting down (MQTT-3.3.2-6),
-  and receives them in order on reconnect. The handler keeps deciding
+  and receives them in order on reconnect; a persistent session is served
+  through that queue even while connected, so a dropped connection cannot
+  lose a message mid-delivery, and a session that ends with its connection
+  is sent to directly. The handler keeps deciding
   *whether* a message is delivered; `{:publish, ...}` returns from
   `handle_info/2` keep working for brokers that route through their own
   PubSub. `MqttX.Server.start_link/3` now honors `:name` as the handle

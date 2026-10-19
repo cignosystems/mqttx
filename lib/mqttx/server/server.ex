@@ -422,7 +422,10 @@ defmodule MqttX.Server do
   session that is not connected but has not expired gets the message queued
   (QoS 1 and 2 only) and receives it when it reconnects, in order, with its
   Message Expiry Interval still counting down. The queue is bounded by the
-  `:max_outbound_queue` transport option.
+  `:max_outbound_queue` transport option. A connected session that will
+  outlive its connection is served through the same queue, so nothing is
+  lost if the connection drops mid-delivery; a session that ends with its
+  connection is sent to directly.
 
   `opts` takes the keys a `{:publish, ...}` return from `handle_info/2` does:
   `:qos`, `:retain`, `:properties`, `:codec`, `:publisher`. Unlike an inbound

@@ -10,7 +10,9 @@
 # Scenarios, each over 100 B / 4 KiB / 64 KiB payloads:
 #   uplink QoS 0  — one publisher, the broker's handle_publish counts arrivals
 #   uplink QoS 1  — same, every message PUBACKed (client max_inflight: 100)
-#   fan-out QoS 0 — one PUBLISH is forwarded to N subscribed connections
+#   fan-out QoS 0 — one PUBLISH is forwarded to N subscribed connections by a
+#                   handle_info publish tuple each (the PubSub-bridge pattern)
+#   fan-out via deliver — the same N deliveries through MqttX.Server.deliver/3
 #
 # Benchee times one batch per iteration; the summary at the end converts that
 # to messages (or deliveries) per second and MB/s.
@@ -44,6 +46,15 @@ defmodule Bench.Broker do
       for {pid, _} <- entries, do: send(pid, {:fanout, topic, payload, opts.qos})
     end)
 
+    {:ok, state}
+  end
+
+  # The broker's own fan-out: MqttX.Server.deliver/3 matches every session's
+  # subscriptions in the listener's ETS index and queues for each connection
+  # before poking it, so this measures the full deliver path
+  def handle_publish(["bench", "deliver" | _] = topic, payload, opts, state) do
+    :counters.add(state.counter, 1, 1)
+    {:ok, _} = MqttX.Server.deliver(topic, payload, %{qos: opts.qos})
     {:ok, state}
   end
 
@@ -166,6 +177,7 @@ subscriber_clients =
   for i <- 1..subscribers do
     client = connect.("bench-subscriber-#{i}", %{counter: delivered})
     {:ok, [1]} = MqttX.Client.subscribe(client, "bench/fanout/#", qos: 1)
+    {:ok, [1]} = MqttX.Client.subscribe(client, "bench/deliver/#", qos: 1)
     client
   end
 
@@ -195,12 +207,19 @@ fanout = fn {payload, batch} ->
   Bench.E2E.await(delivered, start + batch * subscribers)
 end
 
+fanout_deliver = fn {payload, batch} ->
+  start = :counters.get(delivered, 1)
+  Bench.E2E.publish_batch(publisher, "bench/deliver/t", payload, 0, batch)
+  Bench.E2E.await(delivered, start + batch * subscribers)
+end
+
 suite =
   Benchee.run(
     %{
       "uplink QoS 0" => uplink.(0),
       "uplink QoS 1" => uplink.(1),
-      "fan-out QoS 0, 1 -> #{subscribers}" => fanout
+      "fan-out QoS 0, 1 -> #{subscribers}" => fanout,
+      "fan-out via deliver, 1 -> #{subscribers}" => fanout_deliver
     },
     inputs: inputs,
     warmup: 1,

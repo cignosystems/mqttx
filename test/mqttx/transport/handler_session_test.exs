@@ -150,8 +150,24 @@ defmodule MqttX.Transport.HandlerSessionTest do
     receive do
       {:sent, _} -> drain()
       :mqttx_drain -> drain()
+      {:mqttx_deliver, _, _, _, _, _} -> drain()
     after
       0 -> :ok
+    end
+  end
+
+  # Apply what MqttX.Server.deliver/3 sent straight to this connection (one
+  # whose session ends with it). Every connection here shares the test
+  # process's mailbox, so the messages are picked out by client id.
+  defp delivered(state) do
+    client_id = state.client_id
+
+    receive do
+      {:mqttx_deliver, ^client_id, _, _, _, _} = msg ->
+        {:noreply, state} = Proto.handle_info(msg, state)
+        delivered(state)
+    after
+      0 -> state
     end
   end
 
@@ -403,19 +419,38 @@ defmodule MqttX.Transport.HandlerSessionTest do
 
       assert_received {:delivered, {:ok, 2}}
 
-      c1 = drained(c1)
+      # These sessions end with their connections, so the message came
+      # straight to the connection, not through the store
+      assert SessionStore.queue_length(ctx.store, "c1") == 0
+      c1 = delivered(c1)
 
       assert [%{type: :publish, topic: ["s", "x"], payload: "hello", qos: 1, retain: false} = p1] =
                publishes(sent_all())
 
       assert p1.properties.subscription_identifier == 9
 
-      _c2 = drained(c2)
+      _c2 = delivered(c2)
       assert [%{type: :publish, topic: ["s", "x"], qos: 0, retain: true}] = publishes(sent_all())
 
-      _c3 = drained(c3)
+      _c3 = delivered(c3)
       assert sent_all() == []
       assert c1.pending_qos1_tx |> map_size() == 1
+    end
+
+    test "a connected persistent session is served through its queue", ctx do
+      {c, _} = connect(ctx, persistent_connect("durable"))
+      c = subscribe(c, "d/#", 1)
+
+      assert {:ok, 1} = MqttX.Server.deliver("d/1", "queued first", %{qos: 1})
+      assert SessionStore.queue_length(ctx.store, "durable") == 1
+      assert_received :mqttx_drain
+
+      _c = drained(c)
+
+      assert [%{type: :publish, topic: ["d", "1"], payload: "queued first", qos: 1}] =
+               publishes(sent_all())
+
+      assert SessionStore.queue_length(ctx.store, "durable") == 0
     end
 
     test "honors no_local through :publisher and rejects an invalid topic", ctx do
@@ -434,13 +469,13 @@ defmodule MqttX.Transport.HandlerSessionTest do
       assert {:ok, 1} = MqttX.Server.deliver("w/1", "first", %{qos: 1})
       assert {:ok, 1} = MqttX.Server.deliver("w/2", "second", %{qos: 1})
 
-      c = drained(c)
+      c = delivered(c)
       assert [%{type: :publish, payload: "first", packet_id: id}] = publishes(sent_all())
-      assert SessionStore.queue_length(ctx.store, "narrow") == 1
+      assert :queue.len(c.outbound_queue) == 1
 
-      _c = feed(c, ack(:puback, id))
+      c = feed(c, ack(:puback, id))
       assert [%{type: :publish, payload: "second"}] = publishes(sent_all())
-      assert SessionStore.queue_length(ctx.store, "narrow") == 0
+      assert :queue.len(c.outbound_queue) == 0
     end
   end
 

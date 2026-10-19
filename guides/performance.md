@@ -127,6 +127,15 @@ End-to-end over loopback, MqttX client against MqttX broker, Apple M4 Pro (64 GB
 | Uplink QoS 1, WebSocket | 77k msg/s | 45k msg/s | 6k msg/s |
 | Fan-out 1 → 50, WebSocket | 478k deliveries/s | 447k deliveries/s | 102k deliveries/s (6.7 GB/s) |
 
+`MqttX.Server.deliver/3`, the broker's own fan-out, has its own scenario in
+the same suite ("fan-out via deliver"). For sessions that end with their
+connection — the clean-session default — it sends to each connection
+directly and measures level with or ahead of the `handle_info` push path
+above at every payload size, on both transports. A persistent session is
+served through its ETS queue instead, so a message cannot be lost in a
+closing connection's mailbox; that path costs roughly three times as much
+per delivery.
+
 The single-publisher uplink figures are bounded by one process doing a `GenServer.call` per publish; many publishers scale with cores. `test/mqttx/load_test.exs` (`mix test --include load`) runs the same shape with 20 concurrent QoS 1 publishers and a 1 → 20 fan-out, asserting that every message arrives exactly as often as it should and every QoS 1 publish is acknowledged.
 
 ## Capacity Planning

@@ -439,6 +439,21 @@ defmodule MqttX.Transport.Handler do
 
   def handle_info(:mqttx_drain, state), do: {:noreply, state}
 
+  # MqttX.Server.deliver/3 sending straight to a session that ends with this
+  # connection — nothing to queue for, so no store round trip. The client id
+  # is a guard against a message meant for a previous holder of the pid.
+  def handle_info(
+        {:mqttx_deliver, client_id, topic, payload, opts, queued_at},
+        %{connected: true, client_id: client_id} = state
+      ) do
+    case age_message_expiry(opts, queued_at) do
+      {:ok, opts} -> {:noreply, send_publish(state, topic, payload, opts)}
+      :expired -> {:noreply, state}
+    end
+  end
+
+  def handle_info({:mqttx_deliver, _, _, _, _, _}, state), do: {:noreply, state}
+
   # §3.1.4-3: a new connection for this client_id is taking the session over.
   # Same as {:server_disconnect, 0x8E, _} — DISCONNECT, only an immediate
   # Will — plus a reply once this process has stopped touching the session
@@ -1341,7 +1356,7 @@ defmodule MqttX.Transport.Handler do
     # connection. The store knows the session from here on.
     requested_sei = Map.get(connect_props, :session_expiry_interval)
     lifetime = session_lifetime(state, protocol_version, requested_sei, packet.clean_session)
-    resumed = begin_session(state, packet, protocol_version)
+    resumed = begin_session(state, packet, protocol_version, lifetime)
 
     # MQTT-4.12.0-5: a successful CONNACK repeats the Authentication Method
     # (and may carry the mechanism's final data); MQTT-4.12.0-6: never
@@ -2133,7 +2148,7 @@ defmodule MqttX.Transport.Handler do
   # Discard (Clean Start 1, §3.1.2.4) or pick up (Clean Start 0) the client's
   # stored session, and record that one exists and is connected — a connected
   # session never expires. Returns what there is to restore, or nil.
-  defp begin_session(state, packet, protocol_version) do
+  defp begin_session(state, packet, protocol_version, lifetime) do
     sessions = state.sessions
     client_id = packet.client_id
 
@@ -2153,9 +2168,13 @@ defmodule MqttX.Transport.Handler do
           }
       end
 
+    # `persistent` tells MqttX.Server.deliver/3 whether a message for this
+    # session must go through the queue (it outlives the connection) or may
+    # be sent to the connection directly (it ends with it)
     SessionStore.put(sessions, client_id, %{
       protocol_version: protocol_version,
-      expires_at: :infinity
+      expires_at: :infinity,
+      persistent: lifetime > 0
     })
 
     resumed

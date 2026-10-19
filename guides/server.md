@@ -101,7 +101,11 @@ A session that is not connected but has not expired gets QoS 1 and 2
 messages queued — bounded by the `:max_outbound_queue` transport option, with
 any Message Expiry Interval still counting down — and receives them in order
 when it reconnects. QoS 0 messages are not queued for an absent client.
-`deliver` returns `{:ok, n}`, the number of sessions the message went to.
+A connected session that will outlive its connection is served through the
+same queue, so a message cannot be lost if the connection drops at the wrong
+moment; a session that ends with its connection is sent to directly, which
+keeps the usual clean-session fan-out at the push path's speed. `deliver`
+returns `{:ok, n}`, the number of sessions the message went to.
 Unlike an inbound PUBLISH, `retain: true` here does not write the retained
 store; it only marks the delivery for Retain As Published subscribers.
 

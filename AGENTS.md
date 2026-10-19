@@ -9,7 +9,7 @@ mental model and the mistakes agents most often make.
 
 ## What MqttX is
 
-A single hex package (`{:mqttx, "~> 0.11.0"}`) that ships **three independent
+A single hex package (`{:mqttx, "~> 0.12.0"}`) that ships **three independent
 pieces** — choose only what you need:
 
 | Piece | Module | Use when |

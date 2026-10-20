@@ -19,6 +19,7 @@ defmodule MqttX.Server.WillDelay do
           required(:retained_table) => :ets.tid(),
           required(:handler) => module(),
           required(:handler_state) => term(),
+          optional(:listener) => term(),
           optional(:max_retained_messages) => non_neg_integer() | nil
         }
 
@@ -96,7 +97,8 @@ defmodule MqttX.Server.WillDelay do
     # The store honors the listener's retained cap — a delayed Will must not
     # be a way around it (existing topics can always be overwritten).
     if will.retain and match?({:ok, _}, result) do
-      MqttX.Server.RetainedStore.store(
+      MqttX.Server.Cluster.store_retained(
+        Map.get(ctx, :listener),
         ctx.retained_table,
         will.topic,
         will.payload,

@@ -73,12 +73,30 @@ defmodule MqttX.Server.RetainedStore do
           map() | nil,
           non_neg_integer() | nil
         ) :: :ok
-  def store(table, topic, payload, _qos, _properties, _max) when payload in [nil, <<>>] do
-    :ets.delete(table, Topic.normalize(topic))
+  def store(table, topic, payload, qos, properties, max) do
+    _ = write(table, topic, payload, qos, properties, max)
     :ok
   end
 
-  def store(table, topic, payload, qos, properties, max) do
+  @doc """
+  `store/6`, returning what changed — the row written, the topic cleared, or
+  `:dropped` at the cap — so it can be replicated to other nodes.
+  """
+  @spec write(
+          table(),
+          binary() | Topic.normalized_topic(),
+          binary() | nil,
+          0 | 1 | 2,
+          map() | nil,
+          non_neg_integer() | nil
+        ) :: {:stored, tuple()} | {:cleared, Topic.normalized_topic(), integer()} | :dropped
+  def write(table, topic, payload, _qos, _properties, _max) when payload in [nil, <<>>] do
+    segments = Topic.normalize(topic)
+    :ets.delete(table, segments)
+    {:cleared, segments, System.system_time(:second)}
+  end
+
+  def write(table, topic, payload, qos, properties, max) do
     segments = Topic.normalize(topic)
 
     if max && not :ets.member(table, segments) && :ets.info(table, :size) >= max do
@@ -87,19 +105,54 @@ defmodule MqttX.Server.RetainedStore do
           "dropping retained message for #{inspect(Topic.flatten(segments))}"
       )
 
-      :ok
+      :dropped
     else
       timestamp = System.system_time(:second)
       expiry_interval = Map.get(properties || %{}, :message_expiry_interval)
-
-      :ets.insert(
-        table,
-        {segments, Topic.flatten(segments), payload, qos, timestamp, expiry_interval}
-      )
-
-      :ok
+      row = {segments, Topic.flatten(segments), payload, qos, timestamp, expiry_interval}
+      :ets.insert(table, row)
+      {:stored, row}
     end
   end
+
+  @doc """
+  Apply a write another node made: a row replaces this node's row for the
+  topic unless that one is newer (last writer wins), and a clear removes a
+  row no newer than it. The cap applies to topics new here.
+  """
+  @spec apply_replica(
+          table(),
+          {:stored, tuple()} | {:cleared, list(), integer()},
+          pos_integer() | nil
+        ) ::
+          :ok
+  def apply_replica(table, {:stored, {segments, _, _, _, timestamp, _} = row}, max) do
+    case :ets.lookup(table, segments) do
+      [{_, _, _, _, existing, _}] when existing > timestamp ->
+        :ok
+
+      [] when max != nil ->
+        if :ets.info(table, :size) < max, do: :ets.insert(table, row)
+        :ok
+
+      _ ->
+        :ets.insert(table, row)
+        :ok
+    end
+  end
+
+  def apply_replica(table, {:cleared, segments, timestamp}, _max) do
+    case :ets.lookup(table, segments) do
+      [{_, _, _, _, existing, _}] when existing > timestamp -> :ok
+      _ -> :ets.delete(table, segments)
+    end
+
+    :ok
+  end
+
+  @doc "Every row, for a node joining the cluster."
+  @spec rows(table()) :: [tuple()]
+  def rows(table), do: :ets.tab2list(table)
 
   @doc """
   Return the non-expired retained messages matching a subscription filter, as

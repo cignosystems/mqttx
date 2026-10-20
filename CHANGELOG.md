@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Clustering.** Broker listeners started with the same `:name` on
+  several nodes of an Erlang cluster act as one broker, via `:pg` (the
+  `mqttx` application starts the scope; nothing to configure;
+  `MqttX.Server.Cluster`):
+  - `MqttX.Server.deliver/3,4` fans a message out on every node; a
+    persistent session away on another node gets it queued there.
+  - A CONNECT on any node takes the client over from the others: an open
+    connection for the same client id elsewhere is disconnected with 0x8E,
+    its Will Delay and Session Expiry are cancelled, and its stored session
+    (subscriptions, in-flight QoS 1/2, queue) moves to the new node; Clean
+    Start 1 discards it everywhere. `handle_connect/4` reports a session
+    held on another node as `session_present`.
+  - Retained messages are replicated (later write wins) and sent to a node
+    that joins.
+  - A shared subscription with members on several nodes delivers each
+    message once across the cluster.
+- **Durable broker sessions.** A `:session_backend` option
+  (`MqttX.Server.SessionBackend` behaviour) saves sessions behind ETS every
+  `:session_flush_interval` ms (default 1000) and loads them back when the
+  listener starts. `MqttX.Server.SessionBackend.DETS` keeps them in a local
+  file; a backend over a shared database lets another node resume a dead
+  node's sessions.
+
 ### Fixed
 
 - **Properties are checked against the packet that carries them

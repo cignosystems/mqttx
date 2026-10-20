@@ -578,7 +578,14 @@ connecting with Clean Start 0 and a Session Expiry Interval (or CleanSession 0
 on 3.1.1) gets `session_present: true` on reconnect, its subscriptions back,
 unacknowledged QoS 1/2 messages re-sent, and whatever `deliver/3` queued while
 it was away. Sessions are kept for at most `max_session_expiry_interval`
-(default one day) and live in memory on one node.
+(default one day), in memory on the node holding them; a `session_backend`
+(e.g. `MqttX.Server.SessionBackend.DETS`) saves them across restarts.
+
+**Clustering:** listeners started with the same `:name` on connected nodes
+act as one broker — `deliver/3` reaches every node, a session follows its
+client to whichever node it connects to, and retained messages and shared
+subscriptions are cluster-wide. See the Clustering section of the server
+guide.
 
 ## Performance
 
@@ -757,8 +764,8 @@ since 0.12.0.
 | **Full MQTT 5.0 Compliance** | Done | Complete server and client compliance — all CONNACK properties, enhanced AUTH, flow control, server redirect |
 | **WebSocket Transport** | Done | MQTT over WebSocket via Bandit (`ws://` and `wss://`) |
 | **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
-| **Clustering** | Planned | Distributed router across Erlang nodes via `pg` |
-| **Session Persistence (Server)** | Done | Session State per listener in ETS: `session_present`, subscriptions and in-flight QoS 1/2 resume on reconnect, `MqttX.Server.deliver/3` queues for sessions that are away. In memory on one node; a durable/shared store is part of Clustering |
+| **Clustering** | Done | Listeners sharing a `:name` form one broker across nodes via `:pg`: cluster-wide `deliver/3`, takeover and session resumption on any node, replicated retained messages, shared subscriptions delivered once cluster-wide |
+| **Session Persistence (Server)** | Done | Session State per listener in ETS: `session_present`, subscriptions and in-flight QoS 1/2 resume on reconnect, `MqttX.Server.deliver/3` queues for sessions that are away. Optional durable `MqttX.Server.SessionBackend` (DETS built in) survives restarts |
 | **MQTT 5.0 Enhanced Auth** | Done | Challenge–response exchange before CONNACK and re-authentication, on both client and broker, via `handle_auth/3`; the mechanism itself (SCRAM, tokens, …) is the handler's — no built-in providers |
 | **Telemetry Docs** | Done | See the [Telemetry guide](https://hexdocs.pm/mqttx/telemetry.html) |
 | **Property-based Tests** | Done | StreamData round-trips + decode/encode fuzzing of the codec |

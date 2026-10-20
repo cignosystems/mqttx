@@ -22,7 +22,8 @@ defmodule MqttX.MixProject do
         ignore_modules: [
           MqttX.Test.FakeBroker,
           MqttX.Test.ForwardingHandler,
-          MqttX.Test.TLSFixtures
+          MqttX.Test.TLSFixtures,
+          MqttX.Test.ClusterBroker
         ]
       ],
       # Include the optional transport deps in the PLT so dialyzer actually

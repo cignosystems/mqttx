@@ -144,4 +144,48 @@ defmodule MqttX.Server.RetainedStoreTest do
       assert :ets.lookup(table, ["$SYS", "old"]) == []
     end
   end
+
+  describe "replicas from other nodes" do
+    test "the newer write wins, and the cap applies to new topics" do
+      table = RetainedStore.new_table()
+      {:stored, row} = RetainedStore.write(table, "r/1", "local", 0, %{}, nil)
+      {segments, topic, _payload, qos, ts, exp} = row
+
+      # Older than what is here: ignored
+      :ok =
+        RetainedStore.apply_replica(
+          table,
+          {:stored, {segments, topic, "old", qos, ts - 5, exp}},
+          nil
+        )
+
+      assert [{"r/1", "local", _, _, _}] = RetainedStore.match(table, "r/1")
+
+      # Newer: replaces
+      :ok =
+        RetainedStore.apply_replica(
+          table,
+          {:stored, {segments, topic, "new", qos, ts + 5, exp}},
+          nil
+        )
+
+      assert [{"r/1", "new", _, _, _}] = RetainedStore.match(table, "r/1")
+
+      # At the cap, a new topic from elsewhere is not added
+      :ok = RetainedStore.apply_replica(table, {:stored, {["r", "2"], "r/2", "x", 0, ts, nil}}, 1)
+      assert RetainedStore.match(table, "r/2") == []
+    end
+
+    test "a clear removes a row no newer than it" do
+      table = RetainedStore.new_table()
+      {:stored, {segments, _, _, _, ts, _}} = RetainedStore.write(table, "c/1", "x", 0, %{}, nil)
+
+      :ok = RetainedStore.apply_replica(table, {:cleared, segments, ts - 5}, nil)
+      assert [_] = RetainedStore.match(table, "c/1")
+
+      :ok = RetainedStore.apply_replica(table, {:cleared, segments, ts}, nil)
+      assert RetainedStore.match(table, "c/1") == []
+      assert {:cleared, ["c", "1"], _} = RetainedStore.write(table, "c/1", "", 0, %{}, nil)
+    end
+  end
 end

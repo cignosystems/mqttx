@@ -115,8 +115,16 @@ The broker keeps Session State (MQTT §4.1) per listener, in ETS: a client
 connecting with Clean Start 0 and a Session Expiry Interval (or CleanSession 0
 on 3.1.1) gets `session_present: true` on reconnect, its subscriptions back,
 and what was queued for it. Sessions are capped at
-`:max_session_expiry_interval` (default one day) and live in memory on one
-node.
+`:max_session_expiry_interval` (default one day) and live in memory on the
+node holding them, unless the listener has a `:session_backend`
+(`MqttX.Server.SessionBackend`; `MqttX.Server.SessionBackend.DETS` built in).
+
+Listeners started with the same `:name` on connected nodes act as one broker
+(`MqttX.Server.Cluster`, unreleased — 0.13): `deliver/3,4` reaches every node,
+a CONNECT on any node takes the client and its session over from the others,
+retained messages are replicated, and a shared subscription delivers once
+cluster-wide. Nodes are connected by your application (libcluster,
+`Node.connect/1`); MqttX does not discover them.
 
 A `{:publish, topic, payload, opts, state}` return from `handle_info` is
 matched against the device's subscriptions (since 0.12): QoS is capped at the
@@ -318,12 +326,16 @@ Full list in MQTT 5.0 §2.4.
 - **Expecting `#` to match `$SYS/...`.** Per MQTT §4.7.2, `$`-prefixed topics
   require explicit subscription. `subscribe(c, "#")` does **not** receive
   `$SYS/broker/uptime`.
-- **Expecting broker sessions to outlive the node.** `MqttX.Server` keeps
-  sessions (since 0.12) — subscriptions, in-flight QoS 1/2, messages queued
-  by `deliver/3` — in ETS on the node holding the connection, for at most
-  `:max_session_expiry_interval` (default one day). They do not survive a
-  BEAM restart and are not shared between nodes; a client that must never
-  lose a message across a deploy needs durable state in your application.
+- **Expecting broker sessions to outlive the node without a backend.**
+  `MqttX.Server` keeps sessions — subscriptions, in-flight QoS 1/2, messages
+  queued by `deliver/3` — in ETS on the node holding them, for at most
+  `:max_session_expiry_interval` (default one day). Without a
+  `:session_backend` they end with the BEAM. With one, they are saved every
+  `:session_flush_interval` ms (default 1000) — a crash can lose that much,
+  and the DETS backend is local to one node.
+- **Giving clustered listeners different names.** Only listeners with the
+  same `:name` form one broker across nodes; an unnamed listener's name is
+  its port.
 - **Hand-rolling device-to-device routing through PubSub.** Subscribing every
   connection to a PubSub topic and matching filters yourself loses
   subscription options, shared subscriptions and offline queueing. Call

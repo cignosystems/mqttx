@@ -174,4 +174,65 @@ defmodule MqttX.Server.SessionStoreTest do
       assert {:ok, :d1} = Store.dequeue(s, "d")
     end
   end
+
+  describe "shared groups across nodes" do
+    test "a member on another node is a candidate, and comes back as :remote" do
+      s = Store.new()
+      :ok = Store.subscribe(s, "here", "$share/g/t/#", %{qos: 1})
+      :ok = Store.put_remote_shared(s, :b@host, ["t", :multi_level], "g", "there", %{qos: 1})
+
+      picks = for _ <- 1..4, do: Store.match(s, "t/x")
+
+      assert {"here", %{qos: 1}} in List.flatten(picks)
+      assert {:remote, :b@host, "there", %{qos: 1}} in List.flatten(picks)
+      assert Enum.all?(picks, &(length(&1) == 1))
+    end
+
+    test "shared: :skip leaves shared groups out" do
+      s = Store.new()
+      :ok = Store.subscribe(s, "here", "$share/g/t", %{qos: 1})
+      :ok = Store.subscribe(s, "plain", "t", %{qos: 0})
+      assert Store.match(s, "t", nil, fn _ -> true end, :skip) == [{"plain", %{qos: 0}}]
+    end
+
+    test "a remove from a node that no longer holds the member is ignored" do
+      s = Store.new()
+      :ok = Store.put_remote_shared(s, :new@host, ["t"], "g", "moved", %{qos: 0})
+      :ok = Store.delete_remote_shared(s, :old@host, ["t"], "g", "moved")
+      assert [{:remote, :new@host, "moved", _}] = Store.match(s, "t")
+
+      :ok = Store.drop_remote_node(s, :new@host)
+      assert Store.match(s, "t") == []
+    end
+
+    test "local_shared lists this node's shared subscriptions only" do
+      s = Store.new()
+      :ok = Store.subscribe(s, "a", "$share/g/x/+", %{qos: 1})
+      :ok = Store.subscribe(s, "a", "y", %{qos: 1})
+      assert Store.local_shared(s) == [{["x", :single_level], "g", "a", %{qos: 1}}]
+    end
+  end
+
+  describe "export/import" do
+    test "a session moves with its subscriptions, in-flight state and queue in order" do
+      from = Store.new()
+      :ok = Store.put(from, "m", %{protocol_version: 5, expires_at: :infinity, persistent: true})
+      :ok = Store.subscribe(from, "m", "a/+", %{qos: 1})
+      :ok = Store.put_inflight(from, "m", {:tx1, 1}, :p1)
+      :ok = Store.put_inflight(from, "m", {:rx2, 2}, :p2)
+      now = System.monotonic_time(:millisecond)
+      for n <- 1..3, do: :ok = Store.enqueue(from, "m", {"a/b", "#{n}", %{qos: 1}, now}, nil)
+
+      record = Store.export(from, "m")
+      to = Store.new()
+      :ok = Store.import(to, "m", record)
+
+      assert Store.get(to, "m").persistent
+      assert [%{filter: "a/+"}] = Store.subscriptions(to, "m")
+      assert Store.inflight(to, "m") == [{{:tx1, 1}, :p1}, {{:rx2, 2}, :p2}]
+
+      assert for(_ <- 1..3, do: elem(Store.dequeue(to, "m"), 1) |> elem(1)) == ["1", "2", "3"]
+      assert Store.export(Store.new(), "nobody") == nil
+    end
+  end
 end

@@ -7,6 +7,7 @@ defmodule MqttX.Transport.Handler do
 
   alias MqttX.Packet.Buffer
   alias MqttX.Packet.Codec
+  alias MqttX.Server.Cluster
   alias MqttX.Server.Router
   alias MqttX.Server.SessionExpiry
   alias MqttX.Server.SessionStore
@@ -216,7 +217,8 @@ defmodule MqttX.Transport.Handler do
     Process.put(:mqttx_listener, %{
       sessions: sessions,
       retained_table: retained_table,
-      max_outbound_queue: state.max_outbound_queue
+      max_outbound_queue: state.max_outbound_queue,
+      listener: sessions.listener
     })
 
     {:ok, reset_idle_timer(state)}
@@ -1275,17 +1277,18 @@ defmodule MqttX.Transport.Handler do
     auth_method = Map.get(connect_props, :authentication_method)
 
     # §3.1.2.4: with Clean Start 0 an existing session is resumed. The handler
-    # learns up front what that would bring back; the restore itself happens
-    # in complete_connect/5, once the CONNECT is authorized.
-    resuming? =
-      not packet.clean_session and SessionStore.exists?(state.sessions, packet.client_id)
+    # learns up front what that would bring back — from this node, another
+    # node of the cluster or the durable backend, without touching it; the
+    # restore itself happens in complete_connect/5, once the CONNECT is
+    # authorized.
+    stored = if packet.clean_session, do: nil, else: peek_session(state, packet.client_id)
 
     connect_info = %{
       protocol_version: protocol_version,
       keep_alive: Map.get(packet, :keep_alive, 0),
       authentication_method: auth_method,
-      session_present: resuming?,
-      subscriptions: if(resuming?, do: stored_subscriptions(state, packet.client_id), else: [])
+      session_present: stored != nil,
+      subscriptions: Enum.map(stored || [], &subscription_info/1)
     }
 
     connect_result =
@@ -1348,8 +1351,11 @@ defmodule MqttX.Transport.Handler do
 
     # §3.1.4-3: a CONNECT with a client_id already in use takes over the
     # session — the existing connection is disconnected (0x8E), and this one
-    # waits for it to let go before reading what it left in the store.
+    # waits for it to let go before reading what it left in the store. The
+    # other nodes of the cluster do the same for their connections and
+    # timers, and hand over (or discard) a session they hold.
     take_over_existing_sessions(packet.client_id, state)
+    claim_session(state, packet)
 
     # §3.1.2.4 Clean Start and §3.1.2.11 Session Expiry Interval: whether an
     # existing session is resumed, and how long this one outlives the
@@ -2174,7 +2180,8 @@ defmodule MqttX.Transport.Handler do
     SessionStore.put(sessions, client_id, %{
       protocol_version: protocol_version,
       expires_at: :infinity,
-      persistent: lifetime > 0
+      persistent: lifetime > 0,
+      lifetime: lifetime
     })
 
     resumed
@@ -2311,17 +2318,65 @@ defmodule MqttX.Transport.Handler do
 
   defp untrack_inflight(state, _key), do: state
 
-  # A stored session's subscriptions in the shape handle_connect/4 reports them
-  defp stored_subscriptions(state, client_id) do
-    for %{filter: filter, opts: opts} <- SessionStore.subscriptions(state.sessions, client_id) do
-      %{
-        topic: filter,
-        qos: Map.get(opts, :qos, 0),
-        no_local: Map.get(opts, :no_local, false),
-        retain_as_published: Map.get(opts, :retain_as_published, false),
-        subscription_identifier: Map.get(opts, :subscription_identifier)
-      }
+  # The subscriptions of the session a Clean Start 0 CONNECT would resume, or
+  # nil if there is none: here, on another node, or in the durable backend
+  defp peek_session(state, client_id) do
+    sessions = state.sessions
+
+    cond do
+      SessionStore.exists?(sessions, client_id) ->
+        SessionStore.subscriptions(sessions, client_id)
+
+      match?({:ok, _}, remote = remote_lookup(sessions, client_id)) ->
+        elem(remote, 1)
+
+      record = SessionStore.load(sessions, client_id) ->
+        record.subscriptions
+
+      true ->
+        nil
     end
+  end
+
+  defp remote_lookup(%{listener: nil}, _client_id), do: :none
+  defp remote_lookup(sessions, client_id), do: Cluster.lookup(sessions.listener, client_id)
+
+  # Bring a session held elsewhere here before begin_session/4 reads the
+  # store: another node hands it over (and drops its connection and timers
+  # for the client), or — with no node holding it — the durable backend has
+  # it. Clean Start 1 has the other nodes discard theirs instead.
+  defp claim_session(state, packet) do
+    sessions = state.sessions
+    client_id = packet.client_id
+    mode = if packet.clean_session, do: :clean, else: :take
+
+    remote =
+      if sessions.listener, do: Cluster.claim(sessions.listener, client_id, mode), else: :none
+
+    cond do
+      packet.clean_session or SessionStore.exists?(sessions, client_id) ->
+        :ok
+
+      match?({:ok, _}, remote) ->
+        SessionStore.import(sessions, client_id, elem(remote, 1))
+
+      record = SessionStore.load(sessions, client_id) ->
+        SessionStore.import(sessions, client_id, record)
+
+      true ->
+        :ok
+    end
+  end
+
+  # A stored subscription in the shape handle_connect/4 reports it
+  defp subscription_info(%{filter: filter, opts: opts}) do
+    %{
+      topic: filter,
+      qos: Map.get(opts, :qos, 0),
+      no_local: Map.get(opts, :no_local, false),
+      retain_as_published: Map.get(opts, :retain_as_published, false),
+      subscription_identifier: Map.get(opts, :subscription_identifier)
+    }
   end
 
   # Extract will message from CONNECT packet
@@ -2360,6 +2415,7 @@ defmodule MqttX.Transport.Handler do
       # reconnects within delay_interval (§3.1.3.2.2).
       ctx = %{
         retained_table: state.retained_table,
+        listener: state.sessions.listener,
         handler: state.handler,
         handler_state: state.handler_state,
         max_retained_messages: state.max_retained_messages
@@ -2423,7 +2479,9 @@ defmodule MqttX.Transport.Handler do
   # (empty-payload clear, :max_retained_messages cap, expiry bookkeeping)
   # live in MqttX.Server.RetainedStore.
   defp store_retained_message(packet, state) do
-    MqttX.Server.RetainedStore.store(
+    # Replicated to the other nodes of the listener's group
+    Cluster.store_retained(
+      state.sessions.listener,
       state.retained_table,
       packet.topic,
       packet.payload,

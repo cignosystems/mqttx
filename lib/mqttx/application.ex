@@ -16,6 +16,11 @@ defmodule MqttX.Application do
       MqttX.Server.SessionExpiry,
       # client_id → connection pid, for §3.1.4-3 session takeover
       {Registry, keys: :duplicate, name: MqttX.Server.ConnectionRegistry},
+      # Delivery across nodes: the :pg scope listeners group by name in, the
+      # per-listener member registry, and the members' supervisor
+      %{id: :mqttx_pg, start: {:pg, :start_link, [MqttX.Server.Cluster.scope()]}},
+      {Registry, keys: :unique, name: MqttX.Server.Cluster.Registry},
+      {DynamicSupervisor, name: MqttX.Server.Cluster.Supervisor, strategy: :one_for_one},
       # DynamicSupervisor for managed client connections
       MqttX.Client.Supervisor
     ]

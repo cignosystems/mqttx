@@ -75,7 +75,13 @@ defmodule MqttX.Server do
   for the interval the client asked for, capped by the listener's
   `:max_session_expiry_interval` (default one day); `handle_session_expired/2`
   fires when it ends. The state is in memory on the node that holds the
-  connection and does not survive a restart of the BEAM.
+  session; it survives a restart only with a `:session_backend` (see
+  `MqttX.Server.SessionBackend`).
+
+  Listeners started with the same `:name` on the nodes of an Erlang cluster
+  act as one broker: delivery reaches every node, a client's session follows
+  it to whichever node it connects to, and retained messages and shared
+  subscriptions are cluster-wide. See `MqttX.Server.Cluster`.
 
   Routing stays the handler's decision — `handle_publish/4` decides what a
   publish may do — and `deliver/3` does the fan-out: it matches every
@@ -473,9 +479,11 @@ defmodule MqttX.Server do
   end
 
   @doc false
-  # Transports call this on start so deliver/4 can find the listener by name
+  # Transports call this on start so deliver/4 can find the listener by name,
+  # and so the listener joins its cluster group (MqttX.Server.Cluster)
   def register_listener(listener, ctx) do
     :persistent_term.put({MqttX.Server.Listener, listener}, ctx)
+    MqttX.Server.Cluster.join(listener, ctx)
   end
 
   @doc """
@@ -485,6 +493,13 @@ defmodule MqttX.Server do
 
   - `:transport` - Transport module (default: `MqttX.Transport.ThousandIsland`)
   - `:port` - Port to listen on (default: 1883)
+  - `:name` - The listener's name: `deliver/4` finds it by this, and
+    listeners with the same name on connected nodes form one broker
+    (`MqttX.Server.Cluster`). Defaults to the port.
+  - `:session_backend` - A `MqttX.Server.SessionBackend` module, or
+    `{module, opts}`, saving sessions so they survive a restart
+  - `:session_flush_interval` - Milliseconds between backend saves
+    (default 1000)
 
   All other options are passed to the transport adapter.
   """

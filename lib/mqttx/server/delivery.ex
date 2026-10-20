@@ -14,34 +14,62 @@ defmodule MqttX.Server.Delivery do
 
   require Logger
 
+  alias MqttX.Server.Cluster
   alias MqttX.Server.SessionStore
   alias MqttX.Topic
 
   @default_max_outbound_queue 10_000
 
+  @default_max_retained 100_000
+  @default_session_flush_interval 1_000
+
   @type ctx :: %{
-          sessions: SessionStore.t(),
-          retained_table: :ets.table(),
-          max_outbound_queue: pos_integer() | nil
+          required(:sessions) => SessionStore.t(),
+          required(:retained_table) => :ets.table(),
+          required(:max_outbound_queue) => pos_integer() | nil,
+          required(:listener) => term() | nil,
+          optional(:max_retained_messages) => pos_integer() | nil,
+          optional(:session_flush_interval) => pos_integer()
         }
 
   @doc """
   The listener context deliver/4 works from, built once per listener from the
-  handler options (whose `:transport_opts` hold the protocol options).
+  handler options (whose `:transport_opts` hold the protocol options) and the
+  listener's own start options.
   """
-  @spec listener_context(term(), SessionStore.t(), :ets.table()) :: ctx()
-  def listener_context(handler_opts, sessions, retained_table) do
+  @spec listener_context(term(), SessionStore.t(), :ets.table(), keyword()) :: ctx()
+  def listener_context(handler_opts, sessions, retained_table, listener_opts \\ []) do
     protocol_opts =
       if Keyword.keyword?(handler_opts),
         do: Keyword.get(handler_opts, :transport_opts, %{}),
         else: %{}
 
+    max_retained =
+      case get_opt(protocol_opts, :max_retained_messages) do
+        :infinity -> nil
+        n when is_integer(n) and n > 0 -> n
+        _ -> @default_max_retained
+      end
+
+    flush_interval =
+      case Keyword.get(listener_opts, :session_flush_interval) do
+        n when is_integer(n) and n > 0 -> n
+        _ -> @default_session_flush_interval
+      end
+
     %{
       sessions: sessions,
       retained_table: retained_table,
-      max_outbound_queue: max_outbound_queue(protocol_opts)
+      max_outbound_queue: max_outbound_queue(protocol_opts),
+      max_retained_messages: max_retained,
+      session_flush_interval: flush_interval,
+      listener: sessions.listener
     }
   end
+
+  defp get_opt(opts, key) when is_map(opts), do: Map.get(opts, key)
+  defp get_opt(opts, key) when is_list(opts), do: Keyword.get(opts, key)
+  defp get_opt(_opts, _key), do: nil
 
   @doc "The :max_outbound_queue protocol option, normalized (`nil` = unbounded)."
   @spec max_outbound_queue(term()) :: pos_integer() | nil
@@ -71,30 +99,58 @@ defmodule MqttX.Server.Delivery do
 
     with {:ok, _segments} <- Topic.validate_publish(topic),
          {:ok, payload, opts} <- encode_payload(payload, opts) do
-      publisher = Map.get(opts, :publisher)
+      count = fan_out(ctx, topic, payload, opts, :all)
 
-      # Topic Alias is per-connection state the broker never assigns
-      # (MQTT-3.1.2-26) and Subscription Identifiers belong to each
-      # subscriber's own subscriptions (§3.3.4): neither may be relayed
-      opts =
-        opts
-        |> Map.delete(:publisher)
-        |> Map.update(:properties, %{}, fn props ->
-          Map.drop(props || %{}, [:topic_alias, :subscription_identifier])
-        end)
-
-      queued_at = System.monotonic_time(:millisecond)
-      online? = fn client -> connections(ctx, client) != [] end
-
-      count =
-        ctx.sessions
-        |> SessionStore.match(topic, publisher, online?)
-        |> Enum.count(fn {client, sub_opts} ->
-          enqueue(ctx, client, topic, payload, apply_subscription(opts, sub_opts), queued_at)
-        end)
+      # Every other node of the listener's group fans out on its own side,
+      # with the payload already encoded; shared groups were decided here
+      if listener = ctx[:listener], do: Cluster.deliver(listener, topic, payload, opts)
 
       {:ok, count}
     end
+  end
+
+  @doc false
+  # The fan-out on this node for a message another node already encoded. Its
+  # shared groups are left out: the delivering node picked one member for
+  # each, across the cluster, and sent that one directly.
+  def deliver_local(ctx, topic, payload, opts),
+    do: {:ok, fan_out(ctx, topic, payload, opts, :skip)}
+
+  @doc false
+  # One delivery to one session on this node: a shared group's member that
+  # another node picked. `opts` already has the subscription applied.
+  def deliver_to(ctx, client, topic, payload, opts) do
+    enqueue(ctx, client, topic, payload, opts, System.monotonic_time(:millisecond))
+  end
+
+  defp fan_out(ctx, topic, payload, opts, shared) do
+    publisher = Map.get(opts, :publisher)
+
+    # Topic Alias is per-connection state the broker never assigns
+    # (MQTT-3.1.2-26) and Subscription Identifiers belong to each
+    # subscriber's own subscriptions (§3.3.4): neither may be relayed
+    opts =
+      opts
+      |> Map.delete(:publisher)
+      |> Map.update(:properties, %{}, fn props ->
+        Map.drop(props || %{}, [:topic_alias, :subscription_identifier])
+      end)
+
+    queued_at = System.monotonic_time(:millisecond)
+    online? = fn client -> connections(ctx, client) != [] end
+
+    ctx.sessions
+    |> SessionStore.match(topic, publisher, online?, shared)
+    |> Enum.count(fn
+      {client, sub_opts} ->
+        enqueue(ctx, client, topic, payload, apply_subscription(opts, sub_opts), queued_at)
+
+      # A shared group's member on another node: that node delivers it
+      {:remote, node, client, sub_opts} ->
+        opts = apply_subscription(opts, sub_opts)
+        Cluster.deliver_to(ctx.listener, node, client, topic, payload, opts)
+        false
+    end)
   end
 
   @doc """

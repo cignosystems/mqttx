@@ -9,7 +9,9 @@ Notes for humans and AI assistants modifying this library itself. If you are
   reassembly buffer shared by the broker handler and the client
 - `lib/mqttx/topic.ex` — topic validation, normalization, wildcard matching, shared subs
 - `lib/mqttx/transport/handler.ex` — per-connection broker state machine (~1900 LoC, big file)
-- `lib/mqttx/server/` — broker pieces: `server.ex`, `router.ex`, `retained_store.ex`, `rate_limiter.ex`, `will_delay.ex`
+- `lib/mqttx/server/` — broker pieces: `server.ex`, `router.ex`, `retained_store.ex`, `rate_limiter.ex`, `will_delay.ex`,
+  `session_store.ex` (Session State in ETS), `delivery.ex` (`deliver/3`), `cluster.ex` (one broker across
+  nodes) and `session_backend.ex` (durable sessions; `session_backend/dets.ex`)
 - `lib/mqttx/client/connection.ex` — client GenServer (~2200 LoC)
 - `lib/mqttx/client/websocket.ex` — RFC 6455 client framing
 - `lib/mqttx/session/` — `Store` behaviour + ETS implementation; `ETSOwner` keeps the
@@ -86,14 +88,11 @@ ordered roughly by ratio of impact to effort.
 
 ### Medium (each ~half-day)
 
-- **Will Delay cancel-on-reconnect across nodes.** `MqttX.Server.WillDelay`
-  cancels by client_id within a single BEAM. For a clustered setup, the cancel
-  must be broadcast (Phoenix.PubSub or `:pg`).
-- **Sessions beyond one node.** `MqttX.Server.SessionStore` is ETS on the
-  node that holds the connection: a client reconnecting to another node
-  starts fresh, and a BEAM restart loses every session. A pluggable store
-  behind the same API (Mnesia, Redis, Ecto) and `MqttX.Server.deliver/3`
-  fanning out across nodes via `pg` are the clustering roadmap item.
+- **Clustering follow-ups.** All five phases in `docs/design/clustering.md`
+  are done; its "Later" list has what remains (a route table instead of
+  broadcast delivery, closing the window in which a moving session can miss
+  a message, a database backend example). `test/mqttx/cluster_test.exs`
+  runs two real nodes with `:peer` (needs epmd).
 
 ### Smaller polish (low risk, do whenever)
 

@@ -308,6 +308,68 @@ The state lives in memory on the node that holds the connection. It survives
 the connection process and a listener restart, not a restart of the BEAM; a
 client reconnecting to another node starts fresh.
 
+## Clustering
+
+Run the same handler on several nodes of an Erlang cluster and give the
+listener the same `:name` on each:
+
+```elixir
+MqttX.Server.start_link(MyApp.MqttHandler, [], name: MyApp.Broker, port: 1883)
+```
+
+Listeners sharing a name form one broker across the connected nodes (via
+`:pg`; connect the nodes with libcluster or `Node.connect/1`). Nothing else
+is configured, and a device may connect to any node:
+
+- **Delivery.** `MqttX.Server.deliver/3,4` fans a message out on every
+  node, so a device connected to node A receives what was published on
+  node B, and a persistent session that is away gets it queued on the node
+  that holds it. `deliver` returns the count for the local node only.
+- **Sessions follow the client.** A CONNECT on one node reaches the others:
+  a connection still open there for the same client id is taken over
+  (DISCONNECT 0x8E, §3.1.4), its pending Will Delay and Session Expiry are
+  cancelled, and its stored session moves to the new node — subscriptions,
+  in-flight QoS 1/2 and queued messages, with Message Expiry still counting.
+  Clean Start 1 discards it on every node instead. `handle_connect/4` sees
+  the session that would be resumed wherever it is (`session_present`,
+  `subscriptions`).
+- **Retained messages** are replicated to every node; a node that joins
+  later receives the others' retained messages. Two nodes writing the same
+  topic at once settle on the later write (by wall-clock second).
+- **Shared subscriptions** deliver each message once across the cluster:
+  members are known to every node, and the publishing node picks one member
+  wherever it is connected (rotating, connected members first).
+
+A CONNECT waits for the other nodes' answer, at most five seconds; a node
+that answers later keeps nothing (its session is discarded, not moved).
+Messages delivered while a session is moving can miss it. A session lives on
+one node at a time, so a node that goes down takes its sessions with it —
+unless the listener has a durable backend the other nodes reach too (next
+section). `docs/design/clustering.md` in the repository has the design
+notes.
+
+### Durable sessions
+
+Sessions live in ETS and end with the node. To keep them across a restart,
+give the listener a `MqttX.Server.SessionBackend`:
+
+```elixir
+MqttX.Server.start_link(MyApp.MqttHandler, [],
+  name: MyApp.Broker,
+  port: 1883,
+  session_backend: {MqttX.Server.SessionBackend.DETS, path: "/var/lib/broker/sessions.dets"},
+  session_flush_interval: 1_000
+)
+```
+
+ETS stays the working copy; changed sessions are saved behind it every
+`:session_flush_interval` milliseconds (default 1000), so a crash loses at
+most that much. When the listener starts it loads back the sessions this
+node saved, and a session saved by a node that is gone is loaded when its
+client connects. `MqttX.Server.SessionBackend.DETS` is a local file — enough
+for one node's restarts; implement the five-callback behaviour over a
+database to let any node of a cluster take over a dead node's sessions.
+
 ## Session Expiry
 
 MQTT 5.0 clients set `session_expiry_interval` in the CONNECT properties.

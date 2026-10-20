@@ -267,7 +267,7 @@ At high connection counts, OS and kernel limits usually bind before BEAM ones:
 
 ### Beyond a single node
 
-Past ~500K connections, consider clustering multiple BEAM nodes behind a load balancer. The constraints at this scale are fault isolation (a single node crash affects all connected devices) and system-level limits described above. A multi-node setup with 3–5 nodes provides both capacity and redundancy.
+Past ~500K connections, consider clustering multiple BEAM nodes behind a load balancer. The constraints at this scale are fault isolation (a single node crash affects all connected devices) and system-level limits described above. A multi-node setup with 3–5 nodes provides both capacity and redundancy. Listeners started with the same `:name` on each node act as one broker — sessions follow their clients between nodes, and retained messages and shared subscriptions are cluster-wide (see Clustering in the server guide); each publish is broadcast to every node, so delivery cost grows with the node count.
 
 ## Deployment Guidelines
 

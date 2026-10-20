@@ -30,7 +30,16 @@ defmodule MqttX.ClusterTest do
         {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:mqttx])
         {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:thousand_island])
 
-        on_exit(fn -> :peer.stop(peer) end)
+        # The peer is linked to the setup_all process, which may have taken it
+        # down already (it has on Elixir 1.18)
+        on_exit(fn ->
+          try do
+            :peer.stop(peer)
+          catch
+            :exit, _ -> :ok
+          end
+        end)
+
         {:ok, peer_node: node}
 
       {:error, reason} ->

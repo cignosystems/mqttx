@@ -196,8 +196,11 @@ defmodule MqttX.Server.SessionStore do
   @doc "Discard the session and everything that belongs to it."
   @spec delete(t(), client_id()) :: :ok
   def delete(store, client_id) when is_binary(client_id) do
-    # An expiry timer can outlive the listener (and so its tables)
+    # An expiry timer, or a connection closing as its listener stops, can
+    # outlive the listener's tables — before this call or partway through it
     if :ets.info(store.sessions) == :undefined, do: :ok, else: do_delete(store, client_id)
+  rescue
+    ArgumentError -> :ok
   end
 
   defp do_delete(store, client_id) do

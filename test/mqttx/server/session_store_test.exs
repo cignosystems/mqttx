@@ -235,4 +235,101 @@ defmodule MqttX.Server.SessionStoreTest do
       assert Store.export(Store.new(), "nobody") == nil
     end
   end
+
+  describe "a session moving between nodes" do
+    @meta %{protocol_version: 5, expires_at: :infinity, persistent: true}
+
+    defp entry(payload, id),
+      do: {"a/b", payload, %{qos: 1, id: id}, System.monotonic_time(:millisecond)}
+
+    defp drain(store, client), do: drain(store, client, [])
+
+    defp drain(store, client, acc) do
+      case Store.dequeue(store, client) do
+        {:ok, {_, payload, _, _}} -> drain(store, client, [payload | acc])
+        :empty -> Enum.reverse(acc)
+      end
+    end
+
+    test "a placeholder is not a session, collects what is forwarded, and queues it after the import" do
+      from = Store.new()
+      :ok = Store.put(from, "m", @meta)
+      :ok = Store.subscribe(from, "m", "a/#", %{qos: 1})
+      :ok = Store.enqueue(from, "m", entry("queued there", make_ref()), nil)
+
+      to = Store.new()
+      until = System.system_time(:millisecond) + 10_000
+      :ok = Store.hold(to, "m", until)
+      refute Store.exists?(to, "m")
+      assert Store.match(to, "a/b") == []
+      :ok = Store.enqueue(to, "m", entry("forwarded", make_ref()), nil)
+
+      :ok = Store.import(to, "m", Store.export(from, "m"))
+      assert Store.exists?(to, "m")
+      assert %{handoff_until: ^until} = Store.get(to, "m")
+      refute Map.has_key?(Store.get(to, "m"), :placeholder)
+      assert drain(to, "m") == ["queued there", "forwarded"]
+    end
+
+    test "the imported queue's message ids count as seen" do
+      from = Store.new()
+      :ok = Store.put(from, "m", @meta)
+      id = make_ref()
+      :ok = Store.enqueue(from, "m", entry("x", id), nil)
+
+      to = Store.new()
+      until = System.system_time(:millisecond) + 10_000
+      :ok = Store.hold(to, "m", until)
+      :ok = Store.import(to, "m", Store.export(from, "m"))
+
+      assert Store.seen?(to, "m", id, until)
+      refute Store.seen?(to, "m", make_ref(), until)
+    end
+
+    test "a moved session is not a session; finishing the move hands over what is left" do
+      s = Store.new()
+      :ok = Store.put(s, "m", @meta)
+      :ok = Store.subscribe(s, "m", "a/#", %{qos: 1})
+      ref = make_ref()
+      :ok = Store.mark_moved(s, "m", :new@host, ref)
+
+      refute Store.exists?(s, "m")
+      assert %{moved_to: :new@host} = Store.get(s, "m")
+      refute Map.has_key?(Store.export(s, "m").meta, :moved_to)
+
+      # A fan-out that read the session before the mark
+      :ok = Store.enqueue(s, "m", entry("late", make_ref()), nil)
+
+      # Not the move that is finishing: nothing happens
+      assert Store.finish_move(s, "m", make_ref()) == []
+      assert Store.get(s, "m")
+
+      assert [{"a/b", "late", _, _}] = Store.finish_move(s, "m", ref)
+      assert Store.get(s, "m") == nil
+      assert Store.match(s, "a/b") == []
+    end
+
+    test "a client back where its session left from gets a placeholder, keeping what was queued" do
+      s = Store.new()
+      :ok = Store.put(s, "m", @meta)
+      :ok = Store.subscribe(s, "m", "a/#", %{qos: 1})
+      :ok = Store.mark_moved(s, "m", :new@host, make_ref())
+      :ok = Store.enqueue(s, "m", entry("left behind", make_ref()), nil)
+
+      :ok = Store.hold(s, "m", System.system_time(:millisecond) + 10_000)
+      assert %{placeholder: true} = Store.get(s, "m")
+      assert Store.match(s, "a/b") == []
+      assert drain(s, "m") == ["left behind"]
+    end
+
+    test "seen ids are swept when their window closes" do
+      s = Store.new()
+      :ok = Store.put(s, "m", @meta)
+      refute Store.seen?(s, "m", :old, System.system_time(:millisecond) - 1)
+      refute Store.seen?(s, "m", :current, System.system_time(:millisecond) + 10_000)
+      assert Store.sweep_seen(s) == 1
+      refute Store.seen?(s, "m", :old, System.system_time(:millisecond) + 10_000)
+      assert Store.seen?(s, "m", :current, System.system_time(:millisecond) + 10_000)
+    end
+  end
 end

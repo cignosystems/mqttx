@@ -99,11 +99,16 @@ defmodule MqttX.Server.Delivery do
 
     with {:ok, _segments} <- Topic.validate_publish(topic),
          {:ok, payload, opts} <- encode_payload(payload, opts) do
-      count = fan_out(ctx, topic, payload, opts, :all)
+      listener = ctx[:listener]
+
+      # Every node sees the message under one id, so a session moving
+      # between two of them gets it once
+      id = if listener, do: make_ref()
+      count = fan_out(ctx, id, topic, payload, opts, :all)
 
       # Every other node of the listener's group fans out on its own side,
       # with the payload already encoded; shared groups were decided here
-      if listener = ctx[:listener], do: Cluster.deliver(listener, topic, payload, opts)
+      if listener, do: Cluster.deliver(listener, id, topic, payload, opts)
 
       {:ok, count}
     end
@@ -113,17 +118,19 @@ defmodule MqttX.Server.Delivery do
   # The fan-out on this node for a message another node already encoded. Its
   # shared groups are left out: the delivering node picked one member for
   # each, across the cluster, and sent that one directly.
-  def deliver_local(ctx, topic, payload, opts),
-    do: {:ok, fan_out(ctx, topic, payload, opts, :skip)}
+  def deliver_local(ctx, id, topic, payload, opts),
+    do: {:ok, fan_out(ctx, id, topic, payload, opts, :skip)}
 
   @doc false
-  # One delivery to one session on this node: a shared group's member that
-  # another node picked. `opts` already has the subscription applied.
-  def deliver_to(ctx, client, topic, payload, opts) do
-    enqueue(ctx, client, topic, payload, opts, System.monotonic_time(:millisecond))
+  # One delivery to one session on this node, from another node: a shared
+  # group's member it picked, or a session that moved here from it. `opts`
+  # already has the subscription applied; `age` is how long ago (ms) the
+  # message was queued there.
+  def deliver_to(ctx, client, {id, topic, payload, opts, age}) do
+    enqueue(ctx, id, client, topic, payload, opts, System.monotonic_time(:millisecond) - age)
   end
 
-  defp fan_out(ctx, topic, payload, opts, shared) do
+  defp fan_out(ctx, id, topic, payload, opts, shared) do
     publisher = Map.get(opts, :publisher)
 
     # Topic Alias is per-connection state the broker never assigns
@@ -143,12 +150,13 @@ defmodule MqttX.Server.Delivery do
     |> SessionStore.match(topic, publisher, online?, shared)
     |> Enum.count(fn
       {client, sub_opts} ->
-        enqueue(ctx, client, topic, payload, apply_subscription(opts, sub_opts), queued_at)
+        opts = apply_subscription(opts, sub_opts)
+        enqueue(ctx, id, client, topic, payload, opts, queued_at)
 
       # A shared group's member on another node: that node delivers it
       {:remote, node, client, sub_opts} ->
         opts = apply_subscription(opts, sub_opts)
-        Cluster.deliver_to(ctx.listener, node, client, topic, payload, opts)
+        Cluster.deliver_to(ctx.listener, node, client, {id, topic, payload, opts, 0})
         false
     end)
   end
@@ -185,9 +193,29 @@ defmodule MqttX.Server.Delivery do
     %{qos: qos, retain: retain, properties: properties}
   end
 
-  defp enqueue(ctx, client, topic, payload, opts, queued_at) do
+  defp enqueue(ctx, id, client, topic, payload, opts, queued_at) do
+    case SessionStore.get(ctx.sessions, client) do
+      # The session left for another node: it is delivered there
+      %{moved_to: node} ->
+        age = System.monotonic_time(:millisecond) - queued_at
+        Cluster.deliver_to(ctx.listener, node, client, {id, topic, payload, opts, age})
+        true
+
+      # The session is arriving from another node, and both may match the
+      # message: only the first copy counts
+      %{handoff_until: until} = session when id != nil ->
+        if until > System.system_time(:millisecond) and
+             SessionStore.seen?(ctx.sessions, client, id, until),
+           do: false,
+           else: hand_over(ctx, session, id, client, topic, payload, opts, queued_at)
+
+      session ->
+        hand_over(ctx, session, id, client, topic, payload, opts, queued_at)
+    end
+  end
+
+  defp hand_over(ctx, session, id, client, topic, payload, opts, queued_at) do
     pids = connections(ctx, client)
-    session = SessionStore.get(ctx.sessions, client)
 
     cond do
       # Queueing QoS 0 for an absent client is optional (§4.1) and this
@@ -206,6 +234,8 @@ defmodule MqttX.Server.Delivery do
       # the direct send keeps the fan-out off the store and out of the
       # publisher's process.
       pids == [] or session[:persistent] ->
+        # The id travels with a queued message, in case the session moves
+        opts = if id, do: Map.put(opts, :id, id), else: opts
         queue(ctx, client, pids, {topic, payload, opts, queued_at})
 
       true ->

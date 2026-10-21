@@ -47,4 +47,25 @@ defmodule MqttX.Test.ClusterBroker do
       5_000 -> {:error, :timeout}
     end
   end
+
+  @doc """
+  Deliver `"<prefix>-1"`, `"<prefix>-2"`, … on `topic` from a process on
+  this node, `burst` at a time every millisecond, until it is sent `:stop`;
+  `notify` then gets `{:published, prefix, count}`.
+  """
+  def publish_loop(name, topic, prefix, burst, notify) do
+    {:ok, spawn(fn -> publish_until_stopped({name, topic, prefix, burst, notify}, 0) end)}
+  end
+
+  defp publish_until_stopped({name, topic, prefix, burst, notify} = loop, sent) do
+    receive do
+      :stop -> send(notify, {:published, prefix, sent})
+    after
+      1 ->
+        for i <- (sent + 1)..(sent + burst),
+            do: {:ok, _} = MqttX.Server.deliver(name, topic, "#{prefix}-#{i}", %{qos: 1})
+
+        publish_until_stopped(loop, sent + burst)
+    end
+  end
 end

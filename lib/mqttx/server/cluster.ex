@@ -16,15 +16,18 @@ defmodule MqttX.Server.Cluster do
       discards it (Clean Start 1).
     * Retained messages are replicated to every node; a node that joins
       receives the others' retained messages. Concurrent writes to one topic
-      resolve to the latest (by wall-clock second).
+      resolve to the latest, and a clear is remembered for an hour, so a
+      node that missed it cannot bring the message back.
     * A shared subscription (§4.8) delivers each message once across the
       cluster: shared group membership is replicated, and the delivering node
       picks one member wherever it is connected.
 
-  A session lives on one node at a time. A node that goes down takes its
-  sessions with it, unless the listener has a `MqttX.Server.SessionBackend`
-  that the other nodes reach too. `docs/design/clustering.md` has the design
-  notes.
+  A session lives on one node at a time. While it moves, the node it left
+  forwards what it matches for it for a few seconds and the node it moved to
+  drops the copies it already has, so a message published meanwhile is
+  delivered once. A node that goes down takes its sessions with it, unless
+  the listener has a `MqttX.Server.SessionBackend` that the other nodes
+  reach too. `docs/design/clustering.md` has the design notes.
   """
 
   use GenServer
@@ -44,6 +47,17 @@ defmodule MqttX.Server.Cluster do
   @claim_timeout 5_000
   # Within that, how long a node waits for its own connection to let go
   @takeover_timeout 4_000
+  # How long a node a session left keeps forwarding to the node it went to,
+  # after handing it over: a message reaching the old node later than this
+  # behind the new one is missed
+  @forward_window 5_000
+  # The new node drops duplicates for this long from the claim on: past
+  # the claim's deadline and the forwarding that follows it
+  @handoff_window @claim_timeout + @forward_window + 5_000
+  # How often hand-off records and cleared retained topics are swept, and
+  # how long (s) a clear is remembered
+  @sweep_interval 30_000
+  @cleared_ttl 3_600
 
   @doc false
   def scope, do: @scope
@@ -93,20 +107,31 @@ defmodule MqttX.Server.Cluster do
   @doc false
   # Hand a (codec-encoded) message to every other node's member for its own
   # local fan-out
-  def deliver(listener, topic, payload, opts) do
-    broadcast(listener, {:deliver, topic, payload, opts})
+  def deliver(listener, id, topic, payload, opts) do
+    broadcast(listener, {:deliver, id, topic, payload, opts})
   end
 
   @doc false
-  # A shared group's member on `node` was picked for this message
-  def deliver_to(listener, node, client_id, topic, payload, opts) do
+  # One message for one session on `node`: a shared group's member picked
+  # there, or a session that moved there. `message` is
+  # `{id, topic, payload, opts, age_ms}`.
+  def deliver_to(listener, node, client_id, message) do
     case Enum.find(remote_members(listener), &(node(&1) == node)) do
       nil -> :ok
-      pid -> send(pid, {:deliver_to, client_id, topic, payload, opts})
+      pid -> send(pid, {:deliver_to, client_id, message})
     end
 
     :ok
   end
+
+  @doc false
+  # Whether other nodes run this listener
+  def clustered?(nil), do: false
+  def clustered?(listener), do: remote_members(listener) != []
+
+  @doc false
+  # Until when (wall-clock ms) a session claimed now drops duplicates
+  def handoff_until, do: System.system_time(:millisecond) + @handoff_window
 
   @doc false
   # A shared subscription came or went on this node
@@ -116,8 +141,8 @@ defmodule MqttX.Server.Cluster do
   # Write a retained message (or clear one) and replicate the write
   def store_retained(listener, table, topic, payload, qos, properties, max) do
     case RetainedStore.write(table, topic, payload, qos, properties, max) do
-      :dropped -> :ok
-      change -> if listener, do: broadcast(listener, {:retained, change}), else: :ok
+      {:ok, row} when listener != nil -> broadcast(listener, {:retained, row})
+      _ -> :ok
     end
   end
 
@@ -182,6 +207,7 @@ defmodule MqttX.Server.Cluster do
     # Whoever is already there learns what this node holds (and tells this
     # node what it holds when it sees the join)
     Enum.each(members, &sync_to(&1, state))
+    Process.send_after(self(), :sweep, @sweep_interval)
     {:ok, schedule_flush(state)}
   end
 
@@ -189,21 +215,21 @@ defmodule MqttX.Server.Cluster do
   def handle_call({:context, ctx}, _from, state), do: {:reply, :ok, %{state | ctx: ctx}}
 
   @impl true
-  def handle_info({:deliver, topic, payload, opts}, state) do
-    guarded(fn -> Delivery.deliver_local(state.ctx, topic, payload, opts) end)
+  def handle_info({:deliver, id, topic, payload, opts}, state) do
+    guarded(fn -> Delivery.deliver_local(state.ctx, id, topic, payload, opts) end)
     {:noreply, state}
   end
 
-  def handle_info({:deliver_to, client_id, topic, payload, opts}, state) do
-    guarded(fn -> Delivery.deliver_to(state.ctx, client_id, topic, payload, opts) end)
+  def handle_info({:deliver_to, client_id, message}, state) do
+    guarded(fn -> Delivery.deliver_to(state.ctx, client_id, message) end)
     {:noreply, state}
   end
 
   def handle_info({:claim, reply_to, client_id, mode}, state) do
-    # A takeover waits for the connection to let go; deliveries meanwhile
-    # must not queue up behind it
+    # A takeover waits for the connection to let go, and a move forwards for
+    # a while after; deliveries meanwhile must not queue up behind either
     ctx = state.ctx
-    spawn(fn -> send(reply_to, {reply_to, serve_claim(ctx, client_id, mode)}) end)
+    spawn(fn -> serve_claim(ctx, reply_to, client_id, mode) end)
     {:noreply, state}
   end
 
@@ -225,9 +251,9 @@ defmodule MqttX.Server.Cluster do
     {:noreply, state}
   end
 
-  def handle_info({:retained, change}, state) do
+  def handle_info({:retained, row}, state) do
     guarded(fn ->
-      RetainedStore.apply_replica(state.ctx.retained_table, change, max_retained(state))
+      RetainedStore.apply_replica(state.ctx.retained_table, row, max_retained(state))
     end)
 
     {:noreply, state}
@@ -238,7 +264,7 @@ defmodule MqttX.Server.Cluster do
     max = max_retained(state)
 
     guarded(fn ->
-      Enum.each(retained, &RetainedStore.apply_replica(table, {:stored, &1}, max))
+      Enum.each(retained, &RetainedStore.apply_replica(table, &1, max))
 
       for {segments, group, client_id, opts} <- shared,
           do: SessionStore.put_remote_shared(sessions, node, segments, group, client_id, opts)
@@ -269,6 +295,22 @@ defmodule MqttX.Server.Cluster do
     end)
 
     {:noreply, schedule_flush(state)}
+  end
+
+  def handle_info(:sweep, state) do
+    # A listener that stopped took its tables along: this member is stale (a
+    # restart under the name starts a new one)
+    if :ets.info(state.ctx.sessions.sessions) == :undefined do
+      {:stop, :normal, state}
+    else
+      guarded(fn ->
+        SessionStore.sweep_seen(state.ctx.sessions)
+        RetainedStore.sweep_cleared(state.ctx.retained_table, @cleared_ttl)
+      end)
+
+      Process.send_after(self(), :sweep, @sweep_interval)
+      {:noreply, state}
+    end
   end
 
   def handle_info(_other, state), do: {:noreply, state}
@@ -308,40 +350,61 @@ defmodule MqttX.Server.Cluster do
   end
 
   # On the node that holds the client or its session, for a CONNECT elsewhere
-  defp serve_claim(ctx, client_id, :peek) do
-    case SessionStore.get(ctx.sessions, client_id) do
-      nil -> :none
-      _meta -> {:ok, SessionStore.subscriptions(ctx.sessions, client_id)}
-    end
+  defp serve_claim(ctx, reply_to, client_id, mode) do
+    send(reply_to, {reply_to, answer_claim(ctx, reply_to, client_id, mode)})
+  end
+
+  defp answer_claim(ctx, _reply_to, client_id, :peek) do
+    if SessionStore.exists?(ctx.sessions, client_id),
+      do: {:ok, SessionStore.subscriptions(ctx.sessions, client_id)},
+      else: :none
   rescue
     _ -> :none
   end
 
-  defp serve_claim(ctx, client_id, mode) do
+  defp answer_claim(ctx, reply_to, client_id, mode) do
     take_over_connections(ctx, client_id)
     scope = {ctx.retained_table, client_id}
     WillDelay.cancel(scope)
     SessionExpiry.cancel(scope)
 
-    case mode do
-      :clean ->
+    cond do
+      not SessionStore.exists?(ctx.sessions, client_id) ->
+        :none
+
+      mode == :clean ->
         SessionStore.delete(ctx.sessions, client_id)
         :none
 
-      :take ->
-        case SessionStore.export(ctx.sessions, client_id) do
-          nil ->
-            :none
-
-          record ->
-            SessionStore.delete(ctx.sessions, client_id)
-            {:ok, record}
-        end
+      true ->
+        # Marked first: a message matched from here on is forwarded, not
+        # queued behind the export
+        to = node(reply_to)
+        ref = make_ref()
+        SessionStore.mark_moved(ctx.sessions, client_id, to, ref)
+        record = SessionStore.export(ctx.sessions, client_id)
+        spawn(fn -> finish_move(ctx, client_id, to, ref) end)
+        {:ok, record}
     end
   rescue
     e ->
       Logger.debug("[MqttX.Server.Cluster] claim failed: #{Exception.message(e)}")
       :none
+  end
+
+  # Forward for a while, then hand over what a fan-out that read the session
+  # just before it was marked queued after the export, and let go
+  defp finish_move(ctx, client_id, to, ref) do
+    Process.sleep(@forward_window)
+    now = System.monotonic_time(:millisecond)
+
+    for {topic, payload, opts, queued_at} <-
+          SessionStore.finish_move(ctx.sessions, client_id, ref) do
+      message = {Map.get(opts, :id), topic, payload, Map.delete(opts, :id), now - queued_at}
+      deliver_to(ctx.listener, to, client_id, message)
+    end
+  rescue
+    e -> Logger.debug("[MqttX.Server.Cluster] move not finished: #{Exception.message(e)}")
   end
 
   # The same handshake a local takeover uses (§3.1.4): the connection

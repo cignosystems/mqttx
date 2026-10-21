@@ -19,6 +19,10 @@ defmodule MqttX.Server.SessionBackendTest do
     )
   end
 
+  defp record_for(_client_id) do
+    %{meta: meta(), subscriptions: [], inflight: [], queue: [], node: node()}
+  end
+
   describe "SessionStore with a backend" do
     test "a flushed session is restored with its subscriptions, in-flight state and queue",
          %{path: path} do
@@ -86,6 +90,31 @@ defmodule MqttX.Server.SessionBackendTest do
       fresh = SessionStore.new(nil, {DETS, path: path})
       assert SessionStore.restore(fresh) == 0
       assert %{subscriptions: [%{filter: "x"}]} = SessionStore.load(fresh, "elsewhere")
+    end
+
+    test "a session that moved away, or is on its way here, is left to the node that has it",
+         %{path: path} do
+      store = SessionStore.new(nil, {DETS, path: path})
+      {DETS, table} = store.backend
+
+      # Moved: the record the new node saved in a shared backend stays
+      :ok = SessionStore.put(store, "moved", meta())
+      :ok = SessionStore.flush(store)
+      :ok = DETS.save(table, "moved", %{record_for("moved") | node: :new@host})
+      ref = make_ref()
+      :ok = SessionStore.mark_moved(store, "moved", :new@host, ref)
+      :ok = SessionStore.flush(store)
+      assert {:ok, %{node: :new@host}} = DETS.load(table, "moved")
+
+      # Gone from here once the move finishes: still not this node's to delete
+      [] = SessionStore.finish_move(store, "moved", ref)
+      :ok = SessionStore.flush(store)
+      assert {:ok, %{node: :new@host}} = DETS.load(table, "moved")
+
+      # A placeholder is not saved
+      :ok = SessionStore.hold(store, "arriving", System.system_time(:millisecond) + 10_000)
+      :ok = SessionStore.flush(store)
+      assert DETS.load(table, "arriving") == :none
     end
 
     test "without a backend nothing is tracked or saved" do

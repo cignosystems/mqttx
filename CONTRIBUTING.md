@@ -90,9 +90,9 @@ ordered roughly by ratio of impact to effort.
 
 - **Clustering follow-ups.** All five phases in `docs/design/clustering.md`
   are done; its "Later" list has what remains (a route table instead of
-  broadcast delivery, closing the window in which a moving session can miss
-  a message, a database backend example). `test/mqttx/cluster_test.exs`
-  runs two real nodes with `:peer` (needs epmd).
+  broadcast delivery, strict per-publisher order while a session moves, a
+  database backend example). `test/mqttx/cluster_test.exs` runs two real
+  nodes with `:peer` (needs epmd).
 
 ### Smaller polish (low risk, do whenever)
 

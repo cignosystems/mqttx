@@ -17,9 +17,14 @@ All notable changes to this project will be documented in this file.
     its Will Delay and Session Expiry are cancelled, and its stored session
     (subscriptions, in-flight QoS 1/2, queue) moves to the new node; Clean
     Start 1 discards it everywhere. `handle_connect/4` reports a session
-    held on another node as `session_present`.
+    held on another node as `session_present`. Messages published while a
+    session moves reach it once each: the old node forwards what it matches
+    for five seconds and the new node drops duplicates by message id (a
+    publisher's messages from the hand-over's few milliseconds may arrive
+    out of order).
   - Retained messages are replicated (later write wins) and sent to a node
-    that joins.
+    that joins. A clear is remembered for an hour, so a node that missed it
+    while cut off cannot bring the message back.
   - A shared subscription with members on several nodes delivers each
     message once across the cluster.
 - **Durable broker sessions.** A `:session_backend` option

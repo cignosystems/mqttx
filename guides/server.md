@@ -335,18 +335,28 @@ is configured, and a device may connect to any node:
   `subscriptions`).
 - **Retained messages** are replicated to every node; a node that joins
   later receives the others' retained messages. Two nodes writing the same
-  topic at once settle on the later write (by wall-clock second).
+  topic at once settle on the later write. A clear (empty retained payload)
+  is remembered for an hour, so a node that missed it — cut off from the
+  others at the time — cannot bring the cleared message back when it
+  reconnects.
 - **Shared subscriptions** deliver each message once across the cluster:
   members are known to every node, and the publishing node picks one member
   wherever it is connected (rotating, connected members first).
 
 A CONNECT waits for the other nodes' answer, at most five seconds; a node
 that answers later keeps nothing (its session is discarded, not moved).
-Messages delivered while a session is moving can miss it. A session lives on
-one node at a time, so a node that goes down takes its sessions with it —
-unless the listener has a durable backend the other nodes reach too (next
-section). `docs/design/clustering.md` in the repository has the design
-notes.
+Messages published while a session moves still reach it, once each: for
+five seconds after the hand-over, the node it left forwards what it matches
+for the client, and the new node drops the copies it already has. A message
+that reaches the old node more than those five seconds after the new one
+can be missed. During the hand-over, a message forwarded by the old node can
+arrive after a later one the new node matched itself, so a publisher's
+messages from those few milliseconds may arrive out of order.
+
+A session lives on one node at a time, so a node that goes down takes its
+sessions with it — unless the listener has a durable backend the other
+nodes reach too (next section). `docs/design/clustering.md` in the
+repository has the design notes.
 
 ### Durable sessions
 

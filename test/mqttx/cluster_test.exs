@@ -16,6 +16,9 @@ defmodule MqttX.ClusterTest do
 
   @persistent [clean_session: false, connect_properties: %{session_expiry_interval: 300}]
 
+  alias MqttX.Server.Cluster
+  alias MqttX.Server.Delivery
+  alias MqttX.Server.RetainedStore
   alias MqttX.Test.ClusterBroker
   alias MqttX.Test.ForwardingHandler
 
@@ -265,6 +268,141 @@ defmodule MqttX.ClusterTest do
     MqttX.Client.disconnect(sub)
   end
 
+  test "messages published while a session moves arrive once each", ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_moving_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    sub = connect(remote_port, "cl-moving", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(sub, "moving/#", qos: 1)
+    disconnect_on(ctx.peer_node, remote_port, sub, "cl-moving")
+
+    # Both nodes keep publishing while the client moves from the peer to this
+    # node: whatever the hand-over overlaps, each message arrives exactly once
+    {:ok, here} = ClusterBroker.publish_loop(name, "moving/l", "l", 10, self())
+
+    {:ok, there} =
+      :erpc.call(ctx.peer_node, ClusterBroker, :publish_loop, [name, "moving/r", "r", 10, self()])
+
+    Process.sleep(20)
+    sub = connect(local_port, "cl-moving", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+    Process.sleep(50)
+    Enum.each([here, there], &send(&1, :stop))
+    assert_receive {:published, "l", local_count}, 5_000
+    assert_receive {:published, "r", remote_count}, 5_000
+    counts = %{"l" => local_count, "r" => remote_count}
+
+    received =
+      for _ <- 1..(local_count + remote_count) do
+        receive do
+          {:mqtt_event, :message, {["moving", _], payload, _}} -> payload
+        after
+          10_000 -> flunk("a message published during the move never arrived")
+        end
+      end
+
+    refute_receive {:mqtt_event, :message, {["moving", _], _, _}}, 500
+    expected = for {p, n} <- counts, i <- 1..n, do: "#{p}-#{i}"
+    assert Enum.sort(received) == Enum.sort(expected)
+
+    # Not asserted: each publisher's order. A message the old node forwards
+    # arrives a hop later than one the new node matched itself, so under
+    # load the hand-over can deliver a few out of order (see
+    # docs/design/clustering.md)
+
+    MqttX.Client.disconnect(sub)
+  end
+
+  test "the node a session left forwards what reaches it late, and a copy arriving both ways counts once",
+       ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_forward_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    sub = connect(remote_port, "cl-forward", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(sub, "fwd/#", qos: 1)
+    disconnect_on(ctx.peer_node, remote_port, sub, "cl-forward")
+    sub = connect(local_port, "cl-forward", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+
+    [here] = Enum.filter(Cluster.members(name), &(node(&1) == node()))
+    [there] = Enum.filter(Cluster.members(name), &(node(&1) == ctx.peer_node))
+    local_ctx = :sys.get_state(here).ctx
+    peer_ctx = :erpc.call(ctx.peer_node, :sys, :get_state, [there]).ctx
+
+    # A message that reaches the old node only now, after the session left
+    # it (this node fanned it out before it had the session)
+    late = make_ref()
+
+    :erpc.call(ctx.peer_node, Delivery, :deliver_local, [
+      peer_ctx,
+      late,
+      "fwd/1",
+      "late",
+      %{qos: 1}
+    ])
+
+    assert_receive {:mqtt_event, :message, {["fwd", "1"], "late", _}}, 3_000
+
+    # The same message fanned out here too: already delivered
+    {:ok, _} = Delivery.deliver_local(local_ctx, late, "fwd/1", "late", %{qos: 1})
+
+    # And the other way round: here first, then forwarded from there
+    both = make_ref()
+    {:ok, 1} = Delivery.deliver_local(local_ctx, both, "fwd/2", "both", %{qos: 1})
+
+    :erpc.call(ctx.peer_node, Delivery, :deliver_local, [
+      peer_ctx,
+      both,
+      "fwd/2",
+      "both",
+      %{qos: 1}
+    ])
+
+    assert_receive {:mqtt_event, :message, {["fwd", "2"], "both", _}}, 3_000
+    refute_receive {:mqtt_event, :message, _}, 500
+
+    MqttX.Client.disconnect(sub)
+  end
+
+  test "a client back on the node its session just left gets the session back", ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_bounce_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    sub = connect(remote_port, "cl-bounce", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(sub, "bounce/#", qos: 1)
+    disconnect_on(ctx.peer_node, remote_port, sub, "cl-bounce")
+
+    # To this node, away again, and back to the peer while the peer still
+    # forwards for the first move
+    sub = connect(local_port, "cl-bounce", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+    disconnect_on(node(), local_port, sub, "cl-bounce")
+    {:ok, 1} = MqttX.Server.deliver(name, "bounce/1", "while away", %{qos: 1})
+
+    sub = connect(remote_port, "cl-bounce", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+    assert_receive {:mqtt_event, :message, {["bounce", "1"], "while away", _}}, 3_000
+
+    {:ok, _} = MqttX.Server.deliver(name, "bounce/2", "from here", %{qos: 1})
+
+    {:ok, _} =
+      :erpc.call(ctx.peer_node, MqttX.Server, :deliver, [
+        name,
+        "bounce/3",
+        "from there",
+        %{qos: 1}
+      ])
+
+    assert_receive {:mqtt_event, :message, {["bounce", "2"], "from here", _}}, 3_000
+    assert_receive {:mqtt_event, :message, {["bounce", "3"], "from there", _}}, 3_000
+    refute_receive {:mqtt_event, :message, _}, 500
+
+    MqttX.Client.disconnect(sub)
+  end
+
   test "a CONNECT on one node takes over the client's connection on the other", ctx do
     if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
     name = :"cluster_takeover_#{System.unique_integer([:positive])}"
@@ -340,12 +478,23 @@ defmodule MqttX.ClusterTest do
     assert_receive {:mqtt_event, :message, {["ret", "late"], "after join", _}}, 3_000
 
     # Clearing on one node clears everywhere
+    [before_clear] = :ets.lookup(:"mqttx_retained_#{local_port}", ["ret", "early"])
     :ok = MqttX.Client.publish(pub, "ret/early", "", qos: 1, retain: true)
+    remote_table = :"mqttx_retained_#{remote_port}"
 
     wait_until(fn ->
-      :erpc.call(ctx.peer_node, :ets, :tab2list, [:"mqttx_retained_#{remote_port}"])
-      |> length() == 1
+      :erpc.call(ctx.peer_node, RetainedStore, :match, [remote_table, "ret/#"]) |> length() == 1
     end)
+
+    # The message as it was before the clear, from a node that missed the
+    # clear while cut off, does not come back: not live, not on rejoin
+    :erpc.call(ctx.peer_node, RetainedStore, :apply_replica, [remote_table, before_clear, nil])
+    [peer_member] = Enum.filter(Cluster.members(name), &(node(&1) == ctx.peer_node))
+    send(peer_member, {:sync, :"cut-off@host", [before_clear], []})
+    Process.sleep(100)
+
+    assert :erpc.call(ctx.peer_node, RetainedStore, :match, [remote_table, "ret/#"]) |> length() ==
+             1
 
     Enum.each([pub, sub], &MqttX.Client.disconnect/1)
   end

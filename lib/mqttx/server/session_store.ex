@@ -25,6 +25,10 @@ defmodule MqttX.Server.SessionStore do
   #                            replicated by MqttX.Server.Cluster
   #   dirty       set          {client_id} sessions changed since the backend
   #                            last saved them (only with a :backend)
+  #   seen        set          {{client_id, message_id}, until_ms} messages
+  #                            already given to a session moving between
+  #                            nodes, so a copy arriving by the other way is
+  #                            dropped
   #
   # `subscriber` is the client id for a normal subscription and
   # `{:share, group, client_id}` for a shared one (§4.8). `subs` is the
@@ -47,6 +51,7 @@ defmodule MqttX.Server.SessionStore do
     :queue,
     :remote,
     :dirty,
+    :seen,
     :backend
   ]
 
@@ -60,6 +65,7 @@ defmodule MqttX.Server.SessionStore do
           queue: :ets.table(),
           remote: :ets.table(),
           dirty: :ets.table(),
+          seen: :ets.table(),
           # A durable MqttX.Server.SessionBackend and its state, or nil
           backend: {module(), term()} | nil
         }
@@ -77,8 +83,16 @@ defmodule MqttX.Server.SessionStore do
         }
 
   @type client_id :: binary()
+  # Besides what a connection records, a session moving between nodes (see
+  # hold/3, mark_moved/4) carries `:placeholder` (claimed here, not arrived
+  # yet), `:moved_to`/`:move_ref` (left here, forwarding to its new node)
+  # and `:handoff_until` (wall-clock ms until which duplicates are dropped).
   @type meta :: %{
           optional(:lifetime) => non_neg_integer(),
+          optional(:placeholder) => true,
+          optional(:moved_to) => node(),
+          optional(:move_ref) => reference(),
+          optional(:handoff_until) => integer(),
           protocol_version: 3 | 4 | 5,
           expires_at: :infinity | integer(),
           persistent: boolean()
@@ -103,6 +117,7 @@ defmodule MqttX.Server.SessionStore do
       queue: named(:"#{base}_queue", :ordered_set),
       remote: named(:"#{base}_remote", :ordered_set),
       dirty: named(:"#{base}_dirty", :set),
+      seen: named(:"#{base}_seen", :set),
       backend: init_backend(backend, listener || base)
     }
   end
@@ -119,6 +134,7 @@ defmodule MqttX.Server.SessionStore do
       queue: anonymous(:ordered_set),
       remote: anonymous(:ordered_set),
       dirty: anonymous(:set),
+      seen: anonymous(:set),
       backend: init_backend(backend, listener || make_ref())
     }
   end
@@ -181,8 +197,19 @@ defmodule MqttX.Server.SessionStore do
     end
   end
 
+  @doc """
+  Whether there is a session to resume: neither a placeholder for one being
+  claimed from another node, nor what is left of one that moved away.
+  """
   @spec exists?(t(), client_id()) :: boolean()
-  def exists?(store, client_id), do: get(store, client_id) != nil
+  def exists?(store, client_id) do
+    case get(store, client_id) do
+      nil -> false
+      %{placeholder: true} -> false
+      %{moved_to: _} -> false
+      _ -> true
+    end
+  end
 
   @doc "Set when the session ends (`:infinity` while it is connected or never expires)."
   @spec set_expiry(t(), client_id(), :infinity | integer()) :: :ok
@@ -615,12 +642,11 @@ defmodule MqttX.Server.SessionStore do
         offset = System.system_time(:millisecond) - System.monotonic_time(:millisecond)
 
         queue =
-          for {_key, {topic, payload, opts, queued_at}} <-
-                :ets.select(store.queue, [{{{client_id, :_}, :_}, [], [:"$_"]}]),
+          for {_key, {topic, payload, opts, queued_at}} <- queued(store, client_id),
               do: {topic, payload, opts, queued_at + offset}
 
         %{
-          meta: meta,
+          meta: Map.drop(meta, [:placeholder, :moved_to, :move_ref, :handoff_until]),
           subscriptions: subscriptions(store, client_id),
           inflight: inflight(store, client_id),
           queue: queue
@@ -631,10 +657,28 @@ defmodule MqttX.Server.SessionStore do
   @doc """
   Install an exported session, replacing whatever the store held for it. The
   queue is not bounded here: what was queued elsewhere was within its bound.
+  A placeholder's queue — messages forwarded while the session was on its
+  way — follows the imported one, and its hand-off window carries over.
   """
   @spec import(t(), client_id(), session_record()) :: :ok
   def import(store, client_id, %{meta: meta} = record) do
+    {forwarded, handoff_until} =
+      case :ets.lookup(store.sessions, client_id) do
+        [{_, %{placeholder: true} = held}] ->
+          {for({_key, entry} <- queued(store, client_id), do: entry),
+           Map.get(held, :handoff_until)}
+
+        _ ->
+          {[], nil}
+      end
+
     delete(store, client_id)
+
+    meta =
+      meta
+      |> Map.drop([:placeholder, :moved_to, :move_ref, :handoff_until])
+      |> then(&if handoff_until, do: Map.put(&1, :handoff_until, handoff_until), else: &1)
+
     put(store, client_id, meta)
 
     for %{filter: filter, opts: opts} <- record.subscriptions,
@@ -644,10 +688,138 @@ defmodule MqttX.Server.SessionStore do
 
     offset = System.system_time(:millisecond) - System.monotonic_time(:millisecond)
 
-    for {topic, payload, opts, queued_at} <- record.queue,
-        do: enqueue(store, client_id, {topic, payload, opts, queued_at - offset}, nil)
+    for {topic, payload, opts, queued_at} <- record.queue do
+      # A message the old node had queued may reach this node again
+      if handoff_until && opts[:id], do: seen?(store, client_id, opts[:id], handoff_until)
+      enqueue(store, client_id, {topic, payload, opts, queued_at - offset}, nil)
+    end
+
+    for entry <- forwarded, do: enqueue(store, client_id, entry, nil)
+    :ok
+  end
+
+  # ---------- A session moving between nodes ----------
+  #
+  # The node a client connects to puts a placeholder down before it claims
+  # the session (hold/3), so what the old node forwards in the meantime is
+  # queued. The old node marks its copy as moved (mark_moved/4) before
+  # exporting it: from then on a message it matches for the client goes to
+  # the new node, and a few seconds later it hands over anything queued in
+  # the gap and drops the copy (finish_move/3). While both nodes match
+  # messages for the client, the new one drops the copies it already has,
+  # by message id (seen?/4).
+
+  @doc false
+  # A session claimed from another node, collecting what that node forwards
+  # until the claim is answered. Expires on its own if the connection dies
+  # before it begins the session.
+  @spec hold(t(), client_id(), integer()) :: :ok
+  def hold(store, client_id, handoff_until) do
+    # Back where it left from: the copy it left behind goes, but what was
+    # queued on it still reaches the client
+    left =
+      case :ets.lookup(store.sessions, client_id) do
+        [{_, %{moved_to: _}}] ->
+          entries = for {_key, entry} <- queued(store, client_id), do: entry
+          delete(store, client_id)
+          entries
+
+        _ ->
+          []
+      end
+
+    meta = %{
+      protocol_version: 5,
+      expires_at: System.system_time(:second) + 60,
+      persistent: true,
+      placeholder: true,
+      handoff_until: handoff_until
+    }
+
+    :ets.insert(store.sessions, {client_id, meta})
+    for entry <- left, do: enqueue(store, client_id, entry, nil)
+    :ok
+  end
+
+  @doc false
+  # Drop duplicates for the session until `until` (it exists here already)
+  @spec mark_handoff(t(), client_id(), integer()) :: :ok
+  def mark_handoff(store, client_id, until) do
+    case :ets.lookup(store.sessions, client_id) do
+      [{_, meta}] ->
+        :ets.insert(store.sessions, {client_id, Map.put(meta, :handoff_until, until)})
+
+      [] ->
+        :ok
+    end
 
     :ok
+  end
+
+  @doc false
+  # The session left for `node`: forward instead of queueing. Not saved to
+  # the backend — the new node saves it — and gone within the minute even if
+  # finish_move/3 never runs.
+  @spec mark_moved(t(), client_id(), node(), reference()) :: :ok
+  def mark_moved(store, client_id, node, ref) do
+    case :ets.lookup(store.sessions, client_id) do
+      [{_, meta}] ->
+        expires_at = System.system_time(:second) + 60
+        moved = Map.merge(meta, %{expires_at: expires_at, moved_to: node, move_ref: ref})
+        :ets.insert(store.sessions, {client_id, moved})
+
+      [] ->
+        :ok
+    end
+
+    :ok
+  end
+
+  @doc false
+  # Discard what a session that moved away left here, if anything: the
+  # client is starting afresh on this node
+  @spec drop_moved(t(), client_id()) :: :ok
+  def drop_moved(store, client_id) do
+    case :ets.lookup(store.sessions, client_id) do
+      [{_, %{moved_to: _}}] -> delete(store, client_id)
+      _ -> :ok
+    end
+  end
+
+  @doc false
+  # The end of a move: what was queued for the client after the export, in
+  # order, and the session deleted — unless it is no longer the one moved
+  # under `ref` (the client came back here meanwhile).
+  @spec finish_move(t(), client_id(), reference()) :: [term()]
+  def finish_move(store, client_id, ref) do
+    case :ets.lookup(store.sessions, client_id) do
+      [{_, %{move_ref: ^ref}}] ->
+        left = for {_key, entry} <- queued(store, client_id), do: entry
+        delete(store, client_id)
+        left
+
+      _ ->
+        []
+    end
+  end
+
+  @doc false
+  # Whether the session already got the message `id`; records it if not
+  @spec seen?(t(), client_id(), term(), integer()) :: boolean()
+  def seen?(store, client_id, id, until) do
+    not :ets.insert_new(store.seen, {{client_id, id}, until})
+  end
+
+  @doc false
+  # Forget message ids whose hand-off window closed
+  @spec sweep_seen(t()) :: non_neg_integer()
+  def sweep_seen(store) do
+    now = System.system_time(:millisecond)
+    :ets.select_delete(store.seen, [{{:_, :"$1"}, [{:<, :"$1", now}], [true]}])
+  end
+
+  defp queued(store, client_id) do
+    :ets.select(store.queue, [{{{client_id, :_}, :_}, [], [:"$_"]}])
   end
 
   # Remember that a session changed, for the next backend save
@@ -669,13 +841,30 @@ defmodule MqttX.Server.SessionStore do
     for {client_id} <- :ets.tab2list(store.dirty) do
       :ets.delete(store.dirty, client_id)
 
-      case export(store, client_id) do
-        nil -> module.delete(state, client_id)
-        record -> module.save(state, client_id, saved_record(record))
+      case :ets.lookup(store.sessions, client_id) do
+        # On its way here, or gone from here: the node that has it saves it
+        [{_, %{placeholder: true}}] -> :ok
+        [{_, %{moved_to: _}}] -> :ok
+        [] -> delete_saved(module, state, client_id)
+        _ -> save(module, state, client_id, export(store, client_id))
       end
     end
 
     :ok
+  end
+
+  defp save(module, state, client_id, nil), do: delete_saved(module, state, client_id)
+
+  defp save(module, state, client_id, record),
+    do: module.save(state, client_id, saved_record(record))
+
+  # With a backend the nodes share, the record may already be another node's:
+  # the session moved there and that node saved it
+  defp delete_saved(module, state, client_id) do
+    case module.load(state, client_id) do
+      {:ok, %{node: node}} when node != node() -> :ok
+      _ -> module.delete(state, client_id)
+    end
   end
 
   # A session saved while connected never expires in the store, but if the

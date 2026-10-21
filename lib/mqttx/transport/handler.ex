@@ -2164,7 +2164,9 @@ defmodule MqttX.Transport.Handler do
           SessionStore.delete(sessions, client_id)
           nil
 
-        SessionStore.get(sessions, client_id) == nil ->
+        not SessionStore.exists?(sessions, client_id) ->
+          # What a session that moved to another node left here is not one
+          SessionStore.drop_moved(sessions, client_id)
           nil
 
         true ->
@@ -2177,12 +2179,22 @@ defmodule MqttX.Transport.Handler do
     # `persistent` tells MqttX.Server.deliver/3 whether a message for this
     # session must go through the queue (it outlives the connection) or may
     # be sent to the connection directly (it ends with it)
-    SessionStore.put(sessions, client_id, %{
+    meta = %{
       protocol_version: protocol_version,
       expires_at: :infinity,
       persistent: lifetime > 0,
       lifetime: lifetime
-    })
+    }
+
+    # A session just claimed from another node keeps dropping the copies of
+    # messages both nodes matched
+    meta =
+      case SessionStore.get(sessions, client_id) do
+        %{handoff_until: until} -> Map.put(meta, :handoff_until, until)
+        _ -> meta
+      end
+
+    SessionStore.put(sessions, client_id, meta)
 
     resumed
   end
@@ -2348,10 +2360,27 @@ defmodule MqttX.Transport.Handler do
   defp claim_session(state, packet) do
     sessions = state.sessions
     client_id = packet.client_id
-    mode = if packet.clean_session, do: :clean, else: :take
+    listener = sessions.listener
 
     remote =
-      if sessions.listener, do: Cluster.claim(sessions.listener, client_id, mode), else: :none
+      cond do
+        not Cluster.clustered?(listener) ->
+          :none
+
+        packet.clean_session ->
+          Cluster.claim(listener, client_id, :clean)
+
+        true ->
+          # Whatever the node holding the session forwards while it answers
+          # is queued here, and copies arriving both ways are dropped
+          until = Cluster.handoff_until()
+
+          if SessionStore.exists?(sessions, client_id),
+            do: SessionStore.mark_handoff(sessions, client_id, until),
+            else: SessionStore.hold(sessions, client_id, until)
+
+          Cluster.claim(listener, client_id, :take)
+      end
 
     cond do
       packet.clean_session or SessionStore.exists?(sessions, client_id) ->

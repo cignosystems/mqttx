@@ -14,7 +14,7 @@ are visible everywhere, and a shared subscription delivers once per message
 cluster-wide.
 
 Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
-(retained). There is no consensus protocol.
+(retained, with clears remembered). There is no consensus protocol.
 
 ## Building blocks
 
@@ -34,7 +34,7 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
 ## Phases (all done, 0.13)
 
 1. **Delivery and timers across nodes.** `deliver` fans out locally, then
-   sends `{:deliver, topic, payload, opts}` to each remote member, which fans
+   sends `{:deliver, id, topic, payload, opts}` to each remote member, which fans
    out on its node with its own context. The payload is already
    codec-encoded, so remote nodes need no codec. `deliver` returns the local
    count only.
@@ -48,18 +48,46 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    for the client id, cancels its Will Delay and Session Expiry, and for
    `:take` exports the session (`SessionStore.export/2`: subscriptions,
    in-flight entries, the queue in order with wall-clock enqueue times) and
-   deletes it; for `:clean` it deletes it. The connecting node imports the
+   lets go of it (below); for `:clean` it deletes it. The connecting node imports the
    export before `begin_session/4`, so the rest of the connect path is the
    single-node one. Replies go to an `:erlang.alias/0` that is dropped after
    the deadline (5 s), so a late reply cannot reach the connection's
    mailbox; a node that answers late has deleted its copy and the client
    gets a fresh session.
+
+   Messages published during the move: every `deliver` carries an id
+   (`make_ref/0`) that all nodes see. Before claiming, the new node puts a
+   placeholder down (`SessionStore.hold/3`: no subscriptions, a queue). The
+   old node marks its copy as moved (`mark_moved/4`) *before* exporting it,
+   so from then on a message it matches for the client is forwarded to the
+   new node (`{:deliver_to, ...}`) rather than queued behind the export.
+   Forwarded messages land in the placeholder's queue, and `import/3` puts
+   them after the exported queue. The old node keeps forwarding for 5 s
+   after the hand-over, then sends on whatever a fan-out that read the
+   session just before the mark queued after the export, and deletes its
+   copy (`finish_move/3`, only if the copy is still the one it moved). For
+   15 s from the claim, the new node drops a message whose id it has
+   already queued or sent for the client (`seen` table, swept by the
+   member). So: none missed unless a message reaches the old node more than
+   5 s after the new one, none duplicated. A client that comes back to the
+   old node within the 5 s gets a placeholder there; the stub's leftovers
+   go into it. A moved stub or a placeholder is not a session
+   (`exists?/2`), and the backend flush skips both; with a shared backend,
+   a node deletes a record only if it saved it itself.
 3. **Retained messages cluster-wide.** Every accepted retained write goes
    through `Cluster.store_retained/7`, which writes locally
-   (`RetainedStore.write/6` returns the row, or the clear) and sends the
-   change to every remote member. `RetainedStore.apply_replica/3` keeps the
-   newer row by its timestamp (seconds; a tie applies) and respects the cap
-   for topics new to that node. When a member sees another join, it sends
+   (`RetainedStore.write/6` returns the row) and sends it to every remote
+   member. Rows carry a version `{microseconds, node, unique}`; a local
+   write takes one later than the row it replaces, so it wins wherever that
+   row went even against a clock running ahead.
+   `RetainedStore.apply_replica/3` keeps whichever row has the higher
+   version and respects the cap for messages on topics new to that node. On
+   a distributed node a clear leaves its row with a `nil` payload (never
+   matched), replicated like any row, so a copy written before the clear —
+   from a node that was cut off — loses to it, live or in the join sync.
+   Cleared rows are swept after an hour (and count toward the cap until
+   then); a node cut off for longer can still bring a cleared message back.
+   When a member sees another join, it sends
    its whole retained table (and its shared subscriptions) to the newcomer;
    both sides do this, so two nodes that connect late converge.
 4. **Shared subscriptions cluster-wide.** `SessionStore.subscribe/4`,
@@ -92,7 +120,10 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
 - Every CONNECT on a clustered listener waits for one round trip to each
   other node (the claim), plus one more for Clean Start 0 when the session
   is not local (the peek). Bounded by the 5 s deadline.
-- Delivery is a broadcast, O(nodes) per publish.
+- Delivery is a broadcast, O(nodes) per publish. Each `deliver` makes one
+  reference; a queued message carries it.
+- A move keeps a forwarding stub for 5 s and message ids for 15 s on the
+  nodes involved; cleared retained topics are kept for an hour.
 - With a backend, one ETS insert per session change and one record save per
   changed session per flush interval.
 
@@ -100,15 +131,14 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
 
 - A route table of filters per node, so delivery skips nodes with no
   matching subscription instead of broadcasting.
-- The moving window: messages delivered while a session is being exported
-  and imported can miss it (the old node has deleted it, the new one has not
-  imported it yet). Queuing on the new node from the claim onward would
-  close it.
+- Order during a move: a message the old node forwards arrives a hop
+  later than one the new node matched itself, so a publisher's messages
+  from the hand-over's few milliseconds can arrive out of order (§4.6).
+  Holding the new node's own copies until the old node stops forwarding
+  would restore it, at the cost of delaying them.
 - Remote shared members are assumed reachable; replicating whether they are
   connected would let the pick prefer online members cluster-wide.
 - A database backend example (Ecto/Postgres) in the guides.
-- Retained clears are not tombstoned: a node that was partitioned during a
-  clear can bring the cleared message back when it rejoins.
 
 ## Operational notes
 

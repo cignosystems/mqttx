@@ -5,7 +5,14 @@ defmodule MqttX.Server.RetainedStore do
   #
   # Rows are keyed by the topic's segment list in an `:ordered_set`:
   #
-  #     {segments, topic, payload, qos, timestamp, expiry_interval}
+  #     {segments, topic, payload, qos, timestamp, expiry_interval, version}
+  #
+  # `timestamp` (seconds) is when the message was stored, for Message Expiry;
+  # `version` (`{microseconds, node, unique}`) orders writes across nodes. On
+  # a distributed node a clear leaves its row behind with a `nil` payload,
+  # so a replica written before the clear — from a node that missed it while
+  # partitioned — loses to it instead of bringing the message back. Cleared
+  # rows are swept after an hour (`sweep_cleared/2`) and are never matched.
   #
   # A subscription filter is answered with a single `:ets.select/2` whose
   # match pattern mirrors the filter — literal segments bound, `+` a wildcard
@@ -79,8 +86,9 @@ defmodule MqttX.Server.RetainedStore do
   end
 
   @doc """
-  `store/6`, returning what changed — the row written, the topic cleared, or
-  `:dropped` at the cap — so it can be replicated to other nodes.
+  `store/6`, returning the row written — a cleared topic's row has a `nil`
+  payload — or `:dropped` at the cap, so the write can be replicated to
+  other nodes.
   """
   @spec write(
           table(),
@@ -89,49 +97,64 @@ defmodule MqttX.Server.RetainedStore do
           0 | 1 | 2,
           map() | nil,
           non_neg_integer() | nil
-        ) :: {:stored, tuple()} | {:cleared, Topic.normalized_topic(), integer()} | :dropped
-  def write(table, topic, payload, _qos, _properties, _max) when payload in [nil, <<>>] do
-    segments = Topic.normalize(topic)
-    :ets.delete(table, segments)
-    {:cleared, segments, System.system_time(:second)}
-  end
-
+        ) :: {:ok, tuple()} | :dropped
   def write(table, topic, payload, qos, properties, max) do
     segments = Topic.normalize(topic)
+    existing = :ets.lookup(table, segments)
+    version = next_version(existing)
+    now = System.system_time(:second)
 
-    if max && not :ets.member(table, segments) && :ets.info(table, :size) >= max do
-      Logger.warning(
-        "[MqttX.Server.RetainedStore] Retained store full (#{max} topics) — " <>
-          "dropping retained message for #{inspect(Topic.flatten(segments))}"
-      )
+    cond do
+      payload in [nil, <<>>] ->
+        row = {segments, Topic.flatten(segments), nil, 0, now, nil, version}
 
-      :dropped
-    else
-      timestamp = System.system_time(:second)
-      expiry_interval = Map.get(properties || %{}, :message_expiry_interval)
-      row = {segments, Topic.flatten(segments), payload, qos, timestamp, expiry_interval}
-      :ets.insert(table, row)
-      {:stored, row}
+        # Only another node can hold a stale copy to bring back
+        if Node.alive?(), do: :ets.insert(table, row), else: :ets.delete(table, segments)
+        {:ok, row}
+
+      max && existing == [] && :ets.info(table, :size) >= max ->
+        Logger.warning(
+          "[MqttX.Server.RetainedStore] Retained store full (#{max} topics) — " <>
+            "dropping retained message for #{inspect(Topic.flatten(segments))}"
+        )
+
+        :dropped
+
+      true ->
+        expiry_interval = Map.get(properties || %{}, :message_expiry_interval)
+        row = {segments, Topic.flatten(segments), payload, qos, now, expiry_interval, version}
+        :ets.insert(table, row)
+        {:ok, row}
     end
   end
 
+  # Later than the clock, and than whatever this node already has for the
+  # topic: a write here must win wherever the row it replaces went, even if
+  # another node's clock is ahead
+  defp next_version(existing) do
+    now = System.system_time(:microsecond)
+
+    time =
+      case existing do
+        [{_, _, _, _, _, _, {time, _, _}}] when time >= now -> time + 1
+        _ -> now
+      end
+
+    {time, node(), :erlang.unique_integer([:monotonic])}
+  end
+
   @doc """
-  Apply a write another node made: a row replaces this node's row for the
-  topic unless that one is newer (last writer wins), and a clear removes a
-  row no newer than it. The cap applies to topics new here.
+  Apply a row another node wrote (a cleared row included): it replaces this
+  node's row for the topic unless that one is as new or newer. The cap
+  applies to messages on topics new here.
   """
-  @spec apply_replica(
-          table(),
-          {:stored, tuple()} | {:cleared, list(), integer()},
-          pos_integer() | nil
-        ) ::
-          :ok
-  def apply_replica(table, {:stored, {segments, _, _, _, timestamp, _} = row}, max) do
+  @spec apply_replica(table(), tuple(), pos_integer() | nil) :: :ok
+  def apply_replica(table, {segments, _, payload, _, _, _, version} = row, max) do
     case :ets.lookup(table, segments) do
-      [{_, _, _, _, existing, _}] when existing > timestamp ->
+      [{_, _, _, _, _, _, existing}] when existing >= version ->
         :ok
 
-      [] when max != nil ->
+      [] when max != nil and payload != nil ->
         if :ets.info(table, :size) < max, do: :ets.insert(table, row)
         :ok
 
@@ -141,16 +164,17 @@ defmodule MqttX.Server.RetainedStore do
     end
   end
 
-  def apply_replica(table, {:cleared, segments, timestamp}, _max) do
-    case :ets.lookup(table, segments) do
-      [{_, _, _, _, existing, _}] when existing > timestamp -> :ok
-      _ -> :ets.delete(table, segments)
-    end
+  @doc "Forget cleared topics older than `ttl` seconds. Returns how many went."
+  @spec sweep_cleared(table(), pos_integer()) :: non_neg_integer()
+  def sweep_cleared(table, ttl) do
+    cutoff = System.system_time(:microsecond) - ttl * 1_000_000
 
-    :ok
+    :ets.select_delete(table, [
+      {{:_, :_, nil, :_, :_, :_, {:"$1", :_, :_}}, [{:<, :"$1", cutoff}], [true]}
+    ])
   end
 
-  @doc "Every row, for a node joining the cluster."
+  @doc "Every row, cleared ones included, for a node joining the cluster."
   @spec rows(table()) :: [tuple()]
   def rows(table), do: :ets.tab2list(table)
 
@@ -169,10 +193,14 @@ defmodule MqttX.Server.RetainedStore do
 
     candidates =
       if Topic.wildcard?(filter) do
-        :ets.select(table, [{{key_pattern(filter), :_, :_, :_, :_, :_}, [], [:"$_"]}])
+        :ets.select(table, [
+          {{key_pattern(filter), :_, :"$1", :_, :_, :_, :_}, [{:"=/=", :"$1", nil}], [:"$_"]}
+        ])
       else
         # An all-literal filter is exactly a key
-        :ets.lookup(table, filter)
+        for {_, _, payload, _, _, _, _} = row <- :ets.lookup(table, filter),
+            payload != nil,
+            do: row
       end
 
     # Expiry runs on everything the select reached — BEFORE the §4.7.2
@@ -180,15 +208,17 @@ defmodule MqttX.Server.RetainedStore do
     # still purged (this lazy delete is the store's only expiry sweep, and a
     # store pinned at its cap by expired rows would otherwise never recover).
     {live, expired} =
-      Enum.split_with(candidates, fn {_key, _topic, _payload, _qos, ts, exp} ->
+      Enum.split_with(candidates, fn {_key, _topic, _payload, _qos, ts, exp, _version} ->
         not expired?(ts, exp, now)
       end)
 
-    Enum.each(expired, fn {key, _, _, _, _, _} -> :ets.delete(table, key) end)
+    Enum.each(expired, fn {key, _, _, _, _, _, _} -> :ets.delete(table, key) end)
 
     live
     |> reject_dollar_topics(filter)
-    |> Enum.map(fn {_key, topic, payload, qos, ts, exp} -> {topic, payload, qos, ts, exp} end)
+    |> Enum.map(fn {_key, topic, payload, qos, ts, exp, _version} ->
+      {topic, payload, qos, ts, exp}
+    end)
   end
 
   # Build the ETS key pattern for a normalized filter. `#` matches the parent
@@ -204,7 +234,7 @@ defmodule MqttX.Server.RetainedStore do
   # level is already bound in the select pattern.
   defp reject_dollar_topics(rows, [first | _]) when first in [:single_level, :multi_level] do
     Enum.reject(rows, fn
-      {[<<"$", _::binary>> | _], _, _, _, _, _} -> true
+      {[<<"$", _::binary>> | _], _, _, _, _, _, _} -> true
       _ -> false
     end)
   end

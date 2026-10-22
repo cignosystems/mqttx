@@ -15,6 +15,8 @@ defmodule MqttX.Server.SessionStore do
   #   sessions    set          {client_id, meta}
   #                            {{:qlen, client_id}, n}        queue length
   #                            {{:rr, filter, group}, n}      shared round-robin
+  #                            {{:routes_synced, node}, true} that node's routes arrived
+  #                            {{:fence, client_id}, ref}     the session's fence is up
   #                            {:seq, n}                      global sequence
   #   subs        ordered_set  {{filter_segments, subscriber}, opts}
   #   client_subs ordered_set  {{client_id, filter_binary}, {filter_segments, subscriber}}
@@ -29,6 +31,13 @@ defmodule MqttX.Server.SessionStore do
   #                            already given to a session moving between
   #                            nodes, so a copy arriving by the other way is
   #                            dropped
+  #   held        ordered_set  {{client_id, seq}, {id, topic, payload, opts, queued_at}}
+  #                            messages matched here for a session that just
+  #                            arrived, held until what the node it left
+  #                            forwards has gone ahead (its fence)
+  #   routes      ordered_set  {{filter_segments, node}, true} the filters of
+  #                            normal subscriptions on other nodes, written
+  #                            by MqttX.Server.Cluster.Relay
   #
   # `subscriber` is the client id for a normal subscription and
   # `{:share, group, client_id}` for a shared one (§4.8). `subs` is the
@@ -52,6 +61,8 @@ defmodule MqttX.Server.SessionStore do
     :remote,
     :dirty,
     :seen,
+    :held,
+    :routes,
     :backend
   ]
 
@@ -63,6 +74,8 @@ defmodule MqttX.Server.SessionStore do
           client_subs: :ets.table(),
           inflight: :ets.table(),
           queue: :ets.table(),
+          held: :ets.table(),
+          routes: :ets.table(),
           remote: :ets.table(),
           dirty: :ets.table(),
           seen: :ets.table(),
@@ -73,9 +86,13 @@ defmodule MqttX.Server.SessionStore do
   @typedoc """
   A whole session, as moved between nodes and saved to a backend. Queued
   messages carry the wall-clock millisecond they were queued at, so Message
-  Expiry keeps counting on another node or after a restart.
+  Expiry keeps counting on another node or after a restart. One handed
+  over by another node names it (`:from`); one saved names the node that
+  saved it (`:node`).
   """
   @type session_record :: %{
+          optional(:from) => node(),
+          optional(:node) => node(),
           meta: meta(),
           subscriptions: [%{filter: binary(), opts: map()}],
           inflight: [{inflight_key(), term()}],
@@ -118,6 +135,8 @@ defmodule MqttX.Server.SessionStore do
       remote: named(:"#{base}_remote", :ordered_set),
       dirty: named(:"#{base}_dirty", :set),
       seen: named(:"#{base}_seen", :set),
+      held: named(:"#{base}_held", :ordered_set),
+      routes: named(:"#{base}_routes", :ordered_set),
       backend: init_backend(backend, listener || base)
     }
   end
@@ -135,6 +154,8 @@ defmodule MqttX.Server.SessionStore do
       remote: anonymous(:ordered_set),
       dirty: anonymous(:set),
       seen: anonymous(:set),
+      held: anonymous(:ordered_set),
+      routes: anonymous(:ordered_set),
       backend: init_backend(backend, listener || make_ref())
     }
   end
@@ -231,18 +252,26 @@ defmodule MqttX.Server.SessionStore do
   end
 
   defp do_delete(store, client_id) do
+    drop_state(store, client_id)
+    :ets.select_delete(store.queue, [{{{client_id, :_}, :_}, [], [true]}])
+    :ets.select_delete(store.held, [{{{client_id, :_}, :_}, [], [true]}])
+    :ets.delete(store.sessions, {:qlen, client_id})
+    :ets.delete(store.sessions, {:fence, client_id})
+    :ets.delete(store.sessions, client_id)
+    touch(store, client_id)
+  end
+
+  # A session's subscriptions and in-flight state, not its queue or its row
+  defp drop_state(store, client_id) do
     for {{^client_id, _filter}, {segments, subscriber}} <-
           :ets.select(store.client_subs, [{{{client_id, :_}, :_}, [], [:"$_"]}]) do
       :ets.delete(store.subs, {segments, subscriber})
       announce_shared(store, :remove, segments, subscriber, nil)
+      announce_route(store, segments, subscriber)
     end
 
     :ets.select_delete(store.client_subs, [{{{client_id, :_}, :_}, [], [true]}])
     :ets.select_delete(store.inflight, [{{{client_id, :_}, :_, :_}, [], [true]}])
-    :ets.select_delete(store.queue, [{{{client_id, :_}, :_}, [], [true]}])
-    :ets.delete(store.sessions, {:qlen, client_id})
-    :ets.delete(store.sessions, client_id)
-    touch(store, client_id)
   end
 
   # ---------- Subscriptions ----------
@@ -262,14 +291,17 @@ defmodule MqttX.Server.SessionStore do
       [{_, {old_segments, old_subscriber} = old_key}] when old_key != {segments, subscriber} ->
         :ets.delete(store.subs, old_key)
         announce_shared(store, :remove, old_segments, old_subscriber, nil)
+        announce_route(store, old_segments, old_subscriber)
 
       _ ->
         :ok
     end
 
-    :ets.insert(store.subs, {{segments, subscriber}, opts})
+    new? = :ets.insert_new(store.subs, {{segments, subscriber}, opts})
+    if not new?, do: :ets.insert(store.subs, {{segments, subscriber}, opts})
     :ets.insert(store.client_subs, {{client_id, filter}, {segments, subscriber}})
     announce_shared(store, :add, segments, subscriber, opts)
+    if new?, do: announce_route(store, segments, subscriber)
     touch(store, client_id)
   end
 
@@ -280,6 +312,7 @@ defmodule MqttX.Server.SessionStore do
         :ets.delete(store.subs, key)
         :ets.delete(store.client_subs, {client_id, filter})
         announce_shared(store, :remove, segments, subscriber, nil)
+        announce_route(store, segments, subscriber)
         touch(store, client_id)
 
       [] ->
@@ -568,6 +601,77 @@ defmodule MqttX.Server.SessionStore do
         do: {segments, group, client, opts}
   end
 
+  # ---------- Routes: which nodes have a filter matching a topic ----------
+
+  # A normal subscription came or went here: the listener's relay 0 tells the
+  # other nodes if that changed whether this node has the filter at all
+  defp announce_route(%{listener: nil}, _segments, _subscriber), do: :ok
+
+  defp announce_route(store, segments, client) when is_binary(client) do
+    MqttX.Server.Cluster.route_changed(store.listener, segments)
+  end
+
+  defp announce_route(_store, _segments, _subscriber), do: :ok
+
+  @doc false
+  # Whether this node has a normal subscription to exactly this filter
+  def route?(store, segments) do
+    :ets.select(store.subs, [{{{segments, :"$1"}, :_}, [{:is_binary, :"$1"}], [true]}], 1) !=
+      :"$end_of_table"
+  end
+
+  @doc false
+  # Every filter this node has a normal subscription to
+  def route_filters(store) do
+    store.subs
+    |> :ets.select([{{{:"$1", :"$2"}, :_}, [{:is_binary, :"$2"}], [:"$1"]}])
+    |> Enum.dedup()
+  end
+
+  @doc false
+  # The other nodes with a filter matching `topic`
+  def route_nodes(store, topic) do
+    if :ets.first(store.routes) == :"$end_of_table" do
+      MapSet.new()
+    else
+      for {_filter, node, _} <- walk(store.routes, Topic.normalize(topic)),
+          into: MapSet.new(),
+          do: node
+    end
+  end
+
+  @doc false
+  # Whether `node`'s routes have arrived (until then it is sent everything)
+  def routes_synced?(store, node), do: :ets.member(store.sessions, {:routes_synced, node})
+
+  @doc false
+  def put_route(store, node, segments, true) do
+    :ets.insert(store.routes, {{segments, node}, true})
+    :ok
+  end
+
+  def put_route(store, node, segments, false) do
+    :ets.delete(store.routes, {segments, node})
+    :ok
+  end
+
+  @doc false
+  # All of `node`'s routes, as it sent them when it joined
+  def replace_routes(store, node, filters) do
+    :ets.select_delete(store.routes, [{{{:_, node}, :_}, [], [true]}])
+    :ets.insert(store.routes, for(segments <- filters, do: {{segments, node}, true}))
+    :ets.insert(store.sessions, {{:routes_synced, node}, true})
+    :ok
+  end
+
+  @doc false
+  # `node` left
+  def drop_routes(store, node) do
+    :ets.delete(store.sessions, {:routes_synced, node})
+    :ets.select_delete(store.routes, [{{{:_, node}, :_}, [], [true]}])
+    :ok
+  end
+
   # ---------- In-flight QoS 1/2 state ----------
 
   @doc """
@@ -691,10 +795,12 @@ defmodule MqttX.Server.SessionStore do
   queue is not bounded here: what was queued elsewhere was within its bound.
   A placeholder's queue — messages forwarded while the session was on its
   way — follows the imported one (one forwarded while the import runs may
-  come first), and its hand-off window carries over.
+  come first), and its hand-off window carries over. With a `fence`, what
+  this node matches for the session is held (`hold_message/3`) until
+  `lower_fence/3`; it is raised before the subscriptions go in.
   """
-  @spec import(t(), client_id(), session_record()) :: :ok
-  def import(store, client_id, %{meta: meta} = record) do
+  @spec import(t(), client_id(), session_record(), reference() | nil) :: :ok
+  def import(store, client_id, %{meta: meta} = record, fence \\ nil) do
     {forwarded, handoff_until} =
       case :ets.lookup(store.sessions, client_id) do
         # Taken entry by entry and the row replaced, not deleted: a message
@@ -714,6 +820,7 @@ defmodule MqttX.Server.SessionStore do
       |> then(&if handoff_until, do: Map.put(&1, :handoff_until, handoff_until), else: &1)
 
     put(store, client_id, meta)
+    if fence, do: :ets.insert(store.sessions, {{:fence, client_id}, fence})
 
     for %{filter: filter, opts: opts} <- record.subscriptions,
         do: subscribe(store, client_id, filter, opts)
@@ -750,13 +857,13 @@ defmodule MqttX.Server.SessionStore do
   @spec hold(t(), client_id(), integer()) :: :ok
   def hold(store, client_id, handoff_until) do
     # Back where it left from: the copy it left behind goes, but what was
-    # queued on it still reaches the client
+    # queued on it still reaches the client. Its row is replaced below, not
+    # deleted, so nothing finds the client without a session meanwhile.
     left =
       case :ets.lookup(store.sessions, client_id) do
         [{_, %{moved_to: _}}] ->
-          entries = for {_key, entry} <- queued(store, client_id), do: entry
-          delete(store, client_id)
-          entries
+          drop_state(store, client_id)
+          take_queued(store, client_id)
 
         _ ->
           []
@@ -836,6 +943,45 @@ defmodule MqttX.Server.SessionStore do
         []
     end
   end
+
+  @doc false
+  # A message matched here for a session whose fence is up
+  @spec hold_message(t(), client_id(), tuple()) :: :ok
+  def hold_message(store, client_id, message) do
+    :ets.insert(store.held, {{client_id, next_seq(store)}, message})
+    :ok
+  end
+
+  @doc false
+  def held?(store, client_id) do
+    case :ets.next(store.held, {client_id, 0}) do
+      {^client_id, _} -> true
+      _ -> false
+    end
+  end
+
+  @doc false
+  # The held messages, oldest first, taken out
+  @spec take_held(t(), client_id()) :: [tuple()]
+  def take_held(store, client_id) do
+    for seq <- :ets.select(store.held, [{{{client_id, :"$1"}, :_}, [], [:"$1"]}]),
+        [{_, message}] <- [:ets.take(store.held, {client_id, seq})],
+        do: message
+  end
+
+  @doc false
+  # The fence `ref` is down: what is matched here is delivered again
+  @spec lower_fence(t(), client_id(), reference()) :: :ok
+  def lower_fence(store, client_id, ref) do
+    :ets.delete_object(store.sessions, {{:fence, client_id}, ref})
+    :ok
+  end
+
+  @doc false
+  # Whether the session's fence is up — a key of its own, so rewriting the
+  # session's metadata cannot raise it again
+  @spec fenced?(t(), client_id()) :: boolean()
+  def fenced?(store, client_id), do: :ets.member(store.sessions, {:fence, client_id})
 
   @doc false
   # Whether the session already got the message `id`; records it if not

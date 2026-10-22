@@ -2387,7 +2387,14 @@ defmodule MqttX.Transport.Handler do
         :ok
 
       match?({:ok, _}, remote) ->
-        SessionStore.import(sessions, client_id, elem(remote, 1))
+        record = elem(remote, 1)
+
+        # Imported where what its old node forwards arrives, which goes ahead
+        # of what this node matches for it
+        case record do
+          %{from: _} -> Cluster.import_moved(listener, client_id, record)
+          _ -> SessionStore.import(sessions, client_id, record)
+        end
 
       record = SessionStore.load(sessions, client_id) ->
         SessionStore.import(sessions, client_id, record)

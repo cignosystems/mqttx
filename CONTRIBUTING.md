@@ -11,7 +11,8 @@ Notes for humans and AI assistants modifying this library itself. If you are
 - `lib/mqttx/transport/handler.ex` — per-connection broker state machine (~1900 LoC, big file)
 - `lib/mqttx/server/` — broker pieces: `server.ex`, `router.ex`, `retained_store.ex`, `rate_limiter.ex`, `will_delay.ex`,
   `session_store.ex` (Session State in ETS), `delivery.ex` (`deliver/3`), `cluster.ex` (one broker across
-  nodes) and `session_backend.ex` (durable sessions; `session_backend/dets.ex`)
+  nodes; `cluster/relay.ex` sends to the other nodes and keeps the route table) and `session_backend.ex`
+  (durable sessions; `session_backend/dets.ex`, `session_backend/replicated.ex`)
 - `lib/mqttx/client/connection.ex` — client GenServer (~2200 LoC)
 - `lib/mqttx/client/websocket.ex` — RFC 6455 client framing
 - `lib/mqttx/session/` — `Store` behaviour + ETS implementation; `ETSOwner` keeps the
@@ -88,11 +89,10 @@ ordered roughly by ratio of impact to effort.
 
 ### Medium (each ~half-day)
 
-- **Clustering follow-ups.** All five phases in `docs/design/clustering.md`
-  are done; its "Later" list has what remains (a route table instead of
-  broadcast delivery, strict per-publisher order while a session moves, a
-  database backend example). `test/mqttx/cluster_test.exs` runs two real
-  nodes with `:peer` (needs epmd).
+- **Clustering follow-ups.** The phases in `docs/design/clustering.md` are
+  done; its "Later" list has what remains (exactly-once shared delivery
+  across a node loss, a database backend example).
+  `test/mqttx/cluster_test.exs` runs real nodes with `:peer` (needs epmd).
 
 ### Smaller polish (low risk, do whenever)
 

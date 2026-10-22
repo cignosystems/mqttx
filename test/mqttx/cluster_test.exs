@@ -269,7 +269,7 @@ defmodule MqttX.ClusterTest do
     MqttX.Client.disconnect(sub)
   end
 
-  test "messages published while a session moves arrive once each", ctx do
+  test "messages published while a session moves arrive once each, in order", ctx do
     if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
     name = :"cluster_moving_#{System.unique_integer([:positive])}"
     {local_port, remote_port} = start_pair(ctx, name)
@@ -307,10 +307,11 @@ defmodule MqttX.ClusterTest do
     expected = for {p, n} <- counts, i <- 1..n, do: "#{p}-#{i}"
     assert Enum.sort(received) == Enum.sort(expected)
 
-    # Not asserted: each publisher's order. A message the old node forwards
-    # arrives a hop later than one the new node matched itself, so under
-    # load the hand-over can deliver a few out of order (see
-    # docs/design/clustering.md)
+    # And each publisher's in the order it published (§4.6)
+    for {prefix, n} <- counts do
+      sent = for i <- 1..n, do: "#{prefix}-#{i}"
+      assert Enum.filter(received, &String.starts_with?(&1, prefix <> "-")) == sent
+    end
 
     MqttX.Client.disconnect(sub)
   end
@@ -632,5 +633,150 @@ defmodule MqttX.ClusterTest do
     refute_receive {_, {:mqtt_event, :message, {["shg", _], _, _}}}, 300
 
     Enum.each([here, there], &MqttX.Client.disconnect/1)
+  end
+
+  test "what the new node matches for a session that just arrived waits behind what the old node forwards",
+       ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_fence_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    sub = connect(remote_port, "cl-fence", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(sub, "fen/#", qos: 1)
+    disconnect_on(ctx.peer_node, remote_port, sub, "cl-fence")
+
+    # The old node's relay 0 holds the fence up until it is resumed
+    peer_relay = :erpc.call(ctx.peer_node, Cluster, :relays, [name]) |> elem(0)
+    :ok = :erpc.call(ctx.peer_node, :sys, :suspend, [peer_relay])
+
+    sub = connect(local_port, "cl-fence", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+
+    [member] = Enum.filter(Cluster.members(name), &(node(&1) == node()))
+    local_ctx = :sys.get_state(member).ctx
+
+    # Matched here: held
+    {:ok, 1} = Delivery.deliver_local(local_ctx, make_ref(), "fen/2", "matched here", %{qos: 1})
+    refute_receive {:mqtt_event, :message, _}, 300
+
+    # Forwarded from the old node: goes ahead
+    send(
+      member,
+      {:deliver_to, "cl-fence",
+       {make_ref(), "fen/1", "forwarded", %{qos: 1, retain: false, properties: %{}}, 0}}
+    )
+
+    assert_receive {:mqtt_event, :message, {["fen", "1"], "forwarded", _}}, 3_000
+    refute_receive {:mqtt_event, :message, _}, 300
+
+    :ok = :erpc.call(ctx.peer_node, :sys, :resume, [peer_relay])
+    assert_receive {:mqtt_event, :message, {["fen", "2"], "matched here", _}}, 3_000
+
+    # And with the fence down, straight through
+    {:ok, 1} = Delivery.deliver_local(local_ctx, make_ref(), "fen/3", "after", %{qos: 1})
+    assert_receive {:mqtt_event, :message, {["fen", "3"], "after", _}}, 3_000
+
+    MqttX.Client.disconnect(sub)
+  end
+
+  test "a node is sent only the messages its subscriptions match", ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_routes_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    [member] = Enum.filter(Cluster.members(name), &(node(&1) == node()))
+    [peer_member] = Enum.filter(Cluster.members(name), &(node(&1) == ctx.peer_node))
+    sessions = :sys.get_state(member).ctx.sessions
+
+    sub = connect(remote_port, "cl-routes", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(sub, "rt/a/+", qos: 1)
+
+    wait_until(fn ->
+      SessionStore.route_nodes(sessions, "rt/a/1") == MapSet.new([ctx.peer_node])
+    end)
+
+    assert SessionStore.route_nodes(sessions, "rt/b/1") == MapSet.new()
+
+    queued = fn ->
+      :erpc.call(ctx.peer_node, Process, :info, [peer_member, :message_queue_len])
+    end
+
+    :ok = :erpc.call(ctx.peer_node, :sys, :suspend, [peer_member])
+
+    for i <- 1..5, do: {:ok, 0} = MqttX.Server.deliver(name, "rt/b/#{i}", "x", %{qos: 1})
+    {:ok, 0} = MqttX.Server.deliver(name, "rt/a/1", "for the peer", %{qos: 1})
+    wait_until(fn -> queued.() == {:message_queue_len, 1} end)
+    Process.sleep(100)
+    assert queued.() == {:message_queue_len, 1}
+
+    :ok = :erpc.call(ctx.peer_node, :sys, :resume, [peer_member])
+    assert_receive {:mqtt_event, :message, {["rt", "a", "1"], "for the peer", _}}, 3_000
+
+    # Gone with the last subscription to it
+    :ok = MqttX.Client.unsubscribe(sub, "rt/a/+")
+    wait_until(fn -> SessionStore.route_nodes(sessions, "rt/a/1") == MapSet.new() end)
+
+    MqttX.Client.disconnect(sub)
+    _ = local_port
+  end
+
+  test "with the replicated backend, a session outlives the node that held it", ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_durable_#{System.unique_integer([:positive])}"
+    opts = [session_backend: MqttX.Server.SessionBackend.Replicated, session_flush_interval: 50]
+
+    # A node of its own, to take down
+    {:ok, peer, doomed} =
+      :peer.start(%{name: :"mqttx_doomed_#{System.unique_integer([:positive])}"})
+
+    :ok = :erpc.call(doomed, :code, :add_paths, [:code.get_path()])
+    :ok = :erpc.call(doomed, Logger, :configure, [[level: :warning]])
+    {:ok, _} = :erpc.call(doomed, Application, :ensure_all_started, [:mqttx])
+    {:ok, _} = :erpc.call(doomed, Application, :ensure_all_started, [:thousand_island])
+
+    on_exit(fn ->
+      try do
+        :peer.stop(peer)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    local_port = free_port()
+    {:ok, server, owner} = ClusterBroker.start_listener(name, local_port, opts)
+
+    on_exit(fn ->
+      ThousandIsland.stop(server)
+      Process.exit(owner, :kill)
+    end)
+
+    doomed_port = free_port()
+    {:ok, _, _} = :erpc.call(doomed, ClusterBroker, :start_listener, [name, doomed_port, opts])
+    wait_until(fn -> length(Cluster.members(name)) == 2 end)
+
+    sub = connect(doomed_port, "cl-durable", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(sub, "dur/#", qos: 1)
+    disconnect_on(doomed, doomed_port, sub, "cl-durable")
+    {:ok, 0} = MqttX.Server.deliver(name, "dur/1", "kept", %{qos: 1})
+
+    # This node has the session as the doomed one last saved it
+    [member] = Enum.filter(Cluster.members(name), &(node(&1) == node()))
+    sessions = :sys.get_state(member).ctx.sessions
+
+    wait_until(fn ->
+      match?(%{queue: [_]}, SessionStore.load(sessions, "cl-durable"))
+    end)
+
+    :peer.stop(peer)
+    wait_until(fn -> length(Cluster.members(name)) == 1 end)
+
+    sub = connect(local_port, "cl-durable", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+    assert_receive {:mqtt_event, :message, {["dur", "1"], "kept", _}}, 3_000
+
+    # Still subscribed
+    {:ok, _} = MqttX.Server.deliver(name, "dur/2", "after", %{qos: 1})
+    assert_receive {:mqtt_event, :message, {["dur", "2"], "after", _}}, 3_000
+    MqttX.Client.disconnect(sub)
   end
 end

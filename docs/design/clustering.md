@@ -68,8 +68,11 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    copy (`finish_move/3`, only if the copy is still the one it moved). For
    15 s from the claim, the new node drops a message whose id it has
    already queued or sent for the client (`seen` table, swept by the
-   member). So: none missed unless a message reaches the old node more than
-   5 s after the new one, none duplicated. A client that comes back to the
+   member). The new node's member imports the session
+   (`Cluster.import_moved/3`) — forwarded messages arrive at that member,
+   so none lands in the middle of the imported queue — and raises its fence
+   (phase 7), which keeps each publisher's order and removes the 5 s bound:
+   none missed, none duplicated. A client that comes back to the
    old node within the 5 s gets a placeholder there; the stub's leftovers
    go into it. A moved stub or a placeholder is not a session
    (`exists?/2`), and the backend flush skips both; with a shared backend,
@@ -124,30 +127,82 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    database that is how a dead node's sessions move. The bundled
    `SessionBackend.DETS` is a local file.
 
+6. **Routes, and relays to send them in order.** Each listener has a few
+   relays per node (`Cluster.Relay`, one per scheduler up to 8, started
+   with its member). Everything a node sends other nodes for delivery —
+   `{:deliver, ...}`, forwards, fence answers — goes through the relay
+   picked by the sender's pid, so one process's messages leave in the
+   order it sent them, whichever node they go to. Relay 0 also keeps the
+   route table: a normal subscription coming or going makes it check
+   whether this node still has that filter at all (`SessionStore.route?/2`)
+   and, if that changed, tell relay 0 on every other node; a relay 0 that
+   joins is sent the full list. Those land in the store's `routes` table
+   (keyed like the subscription index, the node in the key), and a relay
+   sends a `{:deliver, ...}` only to the nodes with a filter matching the
+   topic (`SessionStore.route_nodes/2`) — every node until its routes have
+   arrived. Routes are written by relay 0 alone, so the order it applies
+   them in is the order they were announced in. Shared subscriptions keep
+   their own replication (phase 4).
+7. **Order while a session moves (the fence).** After the import, the new
+   node's member sends `{:fence, ...}` to its relay 0 — after the routes
+   the import announced, from the same process. Relay 0 sends it to relay
+   0 on every node, which sends it to that node's other relays; every relay
+   then sends `{:fence_pass, ...}` to the old node's member, behind every
+   message it sent there before. That member answers the new node through
+   its own relay, behind what it forwarded for those messages. Until every
+   relay of every node (as of the fence) has answered — or 5 s pass, or a
+   node leaves — a message the new node matches for the session itself is
+   held (`held` table, `hold_message/3`); forwarded ones go straight
+   through. Then the held messages are delivered in order, the copies
+   already forwarded dropped by id. A message the new node matched is
+   therefore never ahead of an earlier one from the same publisher that
+   reached the old node; once the fence is down, every node routes to the
+   new node and the old node's forwarding only produces duplicates. The
+   fence is a key of its own (`{:fence, client_id}` in `sessions`), so a
+   connection rewriting the session's metadata cannot raise it again; a
+   process that holds a message as the fence comes down asks the member to
+   let the held ones out first (`Cluster.release/2`).
+8. **Sessions that outlive their node.** `SessionBackend.Replicated` keeps
+   a table of every saved session on every node, owned by a process in the
+   `{Replicated, listener}` `:pg` group: a save or delete is applied
+   locally and sent to the others, and a joining node is sent everything.
+   Versions are a hybrid clock (`{max(now, stored + 1), node}`), so a late
+   save of a session that moved cannot replace the newer one; a delete
+   applies only to a record the deleting node saved and leaves a `nil`
+   record for an hour so a late save cannot bring it back. When a node
+   leaves, its sessions saved while connected start their expiry clock;
+   expired ones are swept on every node.
+
 ## Costs
 
 - Every CONNECT on a clustered listener waits for one round trip to each
   other node (the claim), plus one more for Clean Start 0 when the session
   is not local (the peek). Bounded by the 5 s deadline.
-- Delivery is a broadcast, O(nodes) per publish. Each `deliver` makes one
+- A publish goes to the nodes with a matching filter, through the
+  publisher's relay: one local message and a walk of the route table per
+  publish when the listener is clustered. Each `deliver` makes one
   reference; a queued message carries it.
+- A subscription to a filter new to its node, or the last one going, is
+  announced to every node. A moved session's fence is a round trip
+  through every relay of every node; what the new node matches for it
+  waits that long.
 - A shared delivery to another node goes through the publishing node's
   member and is answered: two messages more than a direct send, and the
   payload is held there for that round trip.
 - A move keeps a forwarding stub for 5 s and message ids for 15 s on the
   nodes involved; cleared retained topics are kept for an hour.
 - With a backend, one ETS insert per session change and one record save per
-  changed session per flush interval.
+  changed session per flush interval; with `Replicated`, every node holds
+  every persistent session and each save is sent to every node.
 
 ## Later
 
-- A route table of filters per node, so delivery skips nodes with no
-  matching subscription instead of broadcasting.
-- Order during a move: a message the old node forwards arrives a hop
-  later than one the new node matched itself, so a publisher's messages
-  from the hand-over's few milliseconds can arrive out of order (§4.6).
-  Holding the new node's own copies until the old node stops forwarding
-  would restore it, at the cost of delaying them.
+- A subscription is announced to the other nodes asynchronously: a
+  message published elsewhere right after a SUBACK, before the
+  announcement arrives, does not reach it (it is concurrent with the
+  subscription across nodes).
+- Replicated sessions are lost when the whole cluster restarts; a
+  database backend keeps them.
 - A shared delivery to a node that leaves after taking it but before
   answering is delivered again elsewhere (at least once). Exactly once
   across a node loss would need the member's session to outlive the node.
@@ -157,4 +212,5 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
 
 Nodes must be connected (libcluster or manual `Node.connect/1`) and share the
 handler module and listener names. A node that goes down takes the sessions
-it held with it, unless a backend every node reaches has them.
+it held with it, unless a backend every node reaches has them
+(`SessionBackend.Replicated`, or one over a shared database).

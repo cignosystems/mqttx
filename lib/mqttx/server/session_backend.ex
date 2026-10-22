@@ -15,6 +15,10 @@ defmodule MqttX.Server.SessionBackend do
         session_backend: {MqttX.Server.SessionBackend.DETS, path: "/var/lib/broker/sessions.dets"}
       )
 
+  Built in: `MqttX.Server.SessionBackend.DETS` (a local file, for one node's
+  restarts) and `MqttX.Server.SessionBackend.Replicated` (every node of a
+  cluster, in memory, so another node resumes a dead node's sessions).
+
   ETS stays the working copy: the subscription index and the queues are read
   there, and the backend is written behind it. A session changed since the
   last save is marked, and the listener saves the marked sessions every

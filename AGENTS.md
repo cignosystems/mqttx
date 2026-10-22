@@ -117,7 +117,8 @@ on 3.1.1) gets `session_present: true` on reconnect, its subscriptions back,
 and what was queued for it. Sessions are capped at
 `:max_session_expiry_interval` (default one day) and live in memory on the
 node holding them, unless the listener has a `:session_backend`
-(`MqttX.Server.SessionBackend`; `MqttX.Server.SessionBackend.DETS` built in).
+(`MqttX.Server.SessionBackend`; `MqttX.Server.SessionBackend.DETS` and,
+for a cluster, `MqttX.Server.SessionBackend.Replicated` built in).
 
 Listeners started with the same `:name` on connected nodes act as one broker
 (`MqttX.Server.Cluster`, unreleased — 0.13): `deliver/3,4` reaches every node,
@@ -332,7 +333,8 @@ Full list in MQTT 5.0 §2.4.
   `:max_session_expiry_interval` (default one day). Without a
   `:session_backend` they end with the BEAM. With one, they are saved every
   `:session_flush_interval` ms (default 1000) — a crash can lose that much,
-  and the DETS backend is local to one node.
+  and the DETS backend is local to one node (`SessionBackend.Replicated`
+  keeps them on every node of a cluster, but not across a full restart).
 - **Giving clustered listeners different names.** Only listeners with the
   same `:name` form one broker across nodes; an unnamed listener's name is
   its port.

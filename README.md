@@ -579,7 +579,8 @@ on 3.1.1) gets `session_present: true` on reconnect, its subscriptions back,
 unacknowledged QoS 1/2 messages re-sent, and whatever `deliver/3` queued while
 it was away. Sessions are kept for at most `max_session_expiry_interval`
 (default one day), in memory on the node holding them; a `session_backend`
-(e.g. `MqttX.Server.SessionBackend.DETS`) saves them across restarts.
+(e.g. `MqttX.Server.SessionBackend.DETS`) saves them across restarts;
+`MqttX.Server.SessionBackend.Replicated` keeps them on every node of a cluster.
 
 **Clustering:** listeners started with the same `:name` on connected nodes
 act as one broker — `deliver/3` reaches every node, a session follows its
@@ -765,7 +766,7 @@ since 0.12.0.
 | **WebSocket Transport** | Done | MQTT over WebSocket via Bandit (`ws://` and `wss://`) |
 | **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
 | **Clustering** | Done | Listeners sharing a `:name` form one broker across nodes via `:pg`: cluster-wide `deliver/3`, takeover and session resumption on any node, replicated retained messages, shared subscriptions delivered once cluster-wide |
-| **Session Persistence (Server)** | Done | Session State per listener in ETS: `session_present`, subscriptions and in-flight QoS 1/2 resume on reconnect, `MqttX.Server.deliver/3` queues for sessions that are away. Optional durable `MqttX.Server.SessionBackend` (DETS built in) survives restarts |
+| **Session Persistence (Server)** | Done | Session State per listener in ETS: `session_present`, subscriptions and in-flight QoS 1/2 resume on reconnect, `MqttX.Server.deliver/3` queues for sessions that are away. Optional durable `MqttX.Server.SessionBackend` (DETS and cluster-replicated built in) survives restarts or the loss of a node |
 | **MQTT 5.0 Enhanced Auth** | Done | Challenge–response exchange before CONNACK and re-authentication, on both client and broker, via `handle_auth/3`; the mechanism itself (SCRAM, tokens, …) is the handler's — no built-in providers |
 | **Telemetry Docs** | Done | See the [Telemetry guide](https://hexdocs.pm/mqttx/telemetry.html) |
 | **Property-based Tests** | Done | StreamData round-trips + decode/encode fuzzing of the codec |

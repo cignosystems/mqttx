@@ -127,7 +127,8 @@ defmodule MqttX.Server.Delivery do
   # already has the subscription applied; `age` is how long ago (ms) the
   # message was queued there.
   def deliver_to(ctx, client, {id, topic, payload, opts, age}) do
-    enqueue(ctx, id, client, topic, payload, opts, System.monotonic_time(:millisecond) - age)
+    queued_at = System.monotonic_time(:millisecond) - age
+    enqueue(ctx, id, client, topic, payload, opts, queued_at, :forwarded)
   end
 
   defp fan_out(ctx, id, topic, payload, opts, shared) do
@@ -150,7 +151,7 @@ defmodule MqttX.Server.Delivery do
     |> Enum.count(fn
       {client, sub_opts} ->
         opts = apply_subscription(opts, sub_opts)
-        enqueue(ctx, id, client, topic, payload, opts, queued_at)
+        enqueue(ctx, id, client, topic, payload, opts, queued_at, :direct)
 
       # A shared group's member on another node: this node's cluster member
       # sends it there and picks another member if that node does not take it
@@ -192,7 +193,9 @@ defmodule MqttX.Server.Delivery do
 
         cond do
           online or Map.has_key?(session, :placeholder) or (force and opts.qos > 0) ->
-            if enqueue(ctx, id, client, topic, payload, opts, queued_at), do: :ok, else: :gone
+            if enqueue(ctx, id, client, topic, payload, opts, queued_at, :forwarded),
+              do: :ok,
+              else: :gone
 
           opts.qos > 0 ->
             :offline
@@ -227,7 +230,18 @@ defmodule MqttX.Server.Delivery do
 
       {{client, sub_opts}, _} ->
         opts = apply_subscription(shared.opts, sub_opts)
-        enqueue(ctx, shared.id, client, shared.topic, shared.payload, opts, shared.queued_at)
+
+        enqueue(
+          ctx,
+          shared.id,
+          client,
+          shared.topic,
+          shared.payload,
+          opts,
+          shared.queued_at,
+          :forwarded
+        )
+
         :done
 
       {nil, [{node, client, sub_opts} | rest]} ->
@@ -283,7 +297,25 @@ defmodule MqttX.Server.Delivery do
     %{qos: qos, retain: retain, properties: properties}
   end
 
-  defp enqueue(ctx, id, client, topic, payload, opts, queued_at) do
+  @doc false
+  # Deliver what was held for a session while its fence was up, oldest
+  # first; a copy the node it left forwarded meanwhile went ahead
+  def release(ctx, client) do
+    case SessionStore.take_held(ctx.sessions, client) do
+      [] ->
+        :ok
+
+      held ->
+        for {id, topic, payload, opts, queued_at} <- held,
+            do: enqueue(ctx, id, client, topic, payload, opts, queued_at, :released)
+
+        release(ctx, client)
+    end
+  end
+
+  # `via`: `:direct` for a message this node matched, `:forwarded` for one
+  # another node sent for the session, `:released` for one held here
+  defp enqueue(ctx, id, client, topic, payload, opts, queued_at, via) do
     case SessionStore.get(ctx.sessions, client) do
       # The session left for another node: it is delivered there
       %{moved_to: node} ->
@@ -294,10 +326,32 @@ defmodule MqttX.Server.Delivery do
       # The session is arriving from another node, and both may match the
       # message: only the first copy counts
       %{handoff_until: until} = session when id != nil ->
-        if until > System.system_time(:millisecond) and
-             SessionStore.seen?(ctx.sessions, client, id, until),
-           do: false,
-           else: hand_over(ctx, session, id, client, topic, payload, opts, queued_at)
+        cond do
+          # It just arrived, and the node it left forwards what it matched
+          # before: a message matched here waits behind those, so a
+          # publisher's messages keep their order (§4.6)
+          via == :direct and SessionStore.fenced?(ctx.sessions, client) ->
+            SessionStore.hold_message(ctx.sessions, client, {id, topic, payload, opts, queued_at})
+
+            # The fence may have come down while this went in, after the
+            # held messages were let out
+            if not SessionStore.fenced?(ctx.sessions, client),
+              do: Cluster.release(ctx, client)
+
+            true
+
+          until > System.system_time(:millisecond) ->
+            # Held messages are older than this one
+            if via == :direct and SessionStore.held?(ctx.sessions, client),
+              do: Cluster.release(ctx, client)
+
+            if SessionStore.seen?(ctx.sessions, client, id, until),
+              do: false,
+              else: hand_over(ctx, session, id, client, topic, payload, opts, queued_at)
+
+          true ->
+            hand_over(ctx, session, id, client, topic, payload, opts, queued_at)
+        end
 
       session ->
         hand_over(ctx, session, id, client, topic, payload, opts, queued_at)

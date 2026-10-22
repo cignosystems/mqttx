@@ -8,7 +8,9 @@ defmodule MqttX.Server.Cluster do
   distributed the group has one member and none of this costs anything.
   Within a group:
 
-    * `MqttX.Server.deliver/3` fans a message out on every node.
+    * `MqttX.Server.deliver/3` fans a message out on every node with a
+      matching subscription: each node tells the others which filters its
+      sessions subscribe to.
     * A client may connect to any node. Its CONNECT reaches every other node
       of the group, which disconnects a connection it still holds for that
       client id (§3.1.4 takeover), cancels its pending Will Delay and
@@ -26,17 +28,21 @@ defmodule MqttX.Server.Cluster do
       member is picked, a connected one first.
 
   A session lives on one node at a time. While it moves, the node it left
-  forwards what it matches for it for a few seconds and the node it moved to
-  drops the copies it already has, so a message published meanwhile is
-  delivered once. A node that goes down takes its sessions with it, unless
-  the listener has a `MqttX.Server.SessionBackend` that the other nodes
-  reach too. `docs/design/clustering.md` has the design notes.
+  forwards what it matches for it and the node it moved to drops the copies
+  it already has, and holds back what it matches itself until everything
+  sent to the old node before the move has been forwarded — so a message
+  published meanwhile is delivered once, in its publisher's order. A node
+  that goes down takes its sessions with it, unless the listener has a
+  `MqttX.Server.SessionBackend` that the other nodes reach too
+  (`MqttX.Server.SessionBackend.Replicated`). `docs/design/clustering.md`
+  has the design notes.
   """
 
   use GenServer
 
   require Logger
 
+  alias MqttX.Server.Cluster.Relay
   alias MqttX.Server.Delivery
   alias MqttX.Server.RetainedStore
   alias MqttX.Server.SessionExpiry
@@ -57,6 +63,8 @@ defmodule MqttX.Server.Cluster do
   # The new node drops duplicates for this long from the claim on: past
   # the claim's deadline and the forwarding that follows it
   @handoff_window @claim_timeout + @forward_window + 5_000
+  # Relays per listener per node
+  @relays min(System.schedulers_online(), 8)
   # How often hand-off records and cleared retained topics are swept, and
   # how long (s) a clear is remembered
   @sweep_interval 30_000
@@ -111,7 +119,8 @@ defmodule MqttX.Server.Cluster do
   # Hand a (codec-encoded) message to every other node's member for its own
   # local fan-out
   def deliver(listener, id, topic, payload, opts) do
-    broadcast(listener, {:deliver, id, topic, payload, opts})
+    if clustered?(listener), do: send(relay(listener), {:deliver, id, topic, payload, opts})
+    :ok
   end
 
   @doc false
@@ -120,10 +129,56 @@ defmodule MqttX.Server.Cluster do
   def deliver_to(listener, node, client_id, message) do
     case Enum.find(remote_members(listener), &(node(&1) == node)) do
       nil -> :ok
-      pid -> send(pid, {:deliver_to, client_id, message})
+      pid -> send(relay(listener), {:send, pid, {:deliver_to, client_id, message}})
     end
 
     :ok
+  end
+
+  @doc false
+  # This node's relays for a listener
+  def relays(listener), do: :persistent_term.get({Relay, listener})
+
+  # The relay this process sends through: always the same one, so what it
+  # sends leaves in order
+  defp relay(listener) do
+    relays = relays(listener)
+    elem(relays, :erlang.phash2(self(), tuple_size(relays)))
+  end
+
+  @doc false
+  # A normal subscription to `segments` came or went on this node
+  def route_changed(listener, segments) do
+    case :persistent_term.get({Relay, listener}, nil) do
+      nil -> :ok
+      relays -> send(elem(relays, 0), {:route_changed, segments})
+    end
+
+    :ok
+  end
+
+  @doc false
+  # A session a connection here took over from another node: imported by
+  # this node's member, which is where everything forwarded for it arrives —
+  # so nothing forwarded lands in the middle of its queue — and fenced: what
+  # this node matches for it is held until everything any node sent the old
+  # node before the takeover has been forwarded from there. The fence goes
+  # out after the routes the import announced.
+  def import_moved(listener, client_id, %{from: _} = record) do
+    GenServer.call(via(listener), {:import, client_id, record}, 30_000)
+  end
+
+  @doc false
+  # Deliver what was held for `client_id` now that its fence is down (a
+  # process that held a message as the fence came down makes sure of it)
+  def release(ctx, client_id) do
+    case GenServer.whereis(via(ctx.listener)) do
+      pid when pid == self() -> Delivery.release(ctx, client_id)
+      nil -> Delivery.release(ctx, client_id)
+      pid -> GenServer.call(pid, {:release, client_id})
+    end
+  catch
+    :exit, _ -> :ok
   end
 
   @doc false
@@ -212,8 +267,18 @@ defmodule MqttX.Server.Cluster do
   def init({listener, ctx}) do
     :ok = :pg.join(@scope, listener, self())
     {ref, members} = :pg.monitor(@scope, listener)
-    # `pending`: shared deliveries sent to another node and not yet answered
-    state = %{listener: listener, ctx: ctx, monitor: ref, pending: %{}}
+
+    relays =
+      for index <- 0..(@relays - 1) do
+        {:ok, pid} = Relay.start_link(listener, ctx, index, @relays, self())
+        pid
+      end
+
+    :persistent_term.put({Relay, listener}, List.to_tuple(relays))
+
+    # `pending`: shared deliveries sent to another node and not yet answered;
+    # `fences`: sessions that arrived here, waiting for their fence
+    state = %{listener: listener, ctx: ctx, monitor: ref, pending: %{}, fences: %{}}
 
     # Whoever is already there learns what this node holds (and tells this
     # node what it holds when it sees the join)
@@ -223,7 +288,22 @@ defmodule MqttX.Server.Cluster do
   end
 
   @impl true
-  def handle_call({:context, ctx}, _from, state), do: {:reply, :ok, %{state | ctx: ctx}}
+  def handle_call({:context, ctx}, _from, state) do
+    for pid <- Tuple.to_list(relays(state.listener)), do: GenServer.call(pid, {:context, ctx})
+    {:reply, :ok, %{state | ctx: ctx}}
+  end
+
+  def handle_call({:import, client_id, %{from: from} = record}, _from, state) do
+    ref = make_ref()
+    SessionStore.import(state.ctx.sessions, client_id, record, ref)
+    send(elem(relays(state.listener), 0), {:fence, ref, client_id, from, self()})
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:release, client_id}, _from, state) do
+    guarded(fn -> Delivery.release(state.ctx, client_id) end)
+    {:reply, :ok, state}
+  end
 
   @impl true
   def handle_cast({:shared_out, node, client_id, sub_opts, shared}, state) do
@@ -269,6 +349,48 @@ defmodule MqttX.Server.Cluster do
             else: shared
 
         {:noreply, retry_shared(%{state | pending: pending}, shared)}
+    end
+  end
+
+  # ---------- Fences ----------
+
+  # On the node a session left: a relay of `node` passed the fence, after
+  # everything it sent here before; what this member forwarded for those
+  # went ahead through its relay, and so does the answer
+  def handle_info({:fence_pass, ref, _client_id, waiter, node, index, count}, state) do
+    send(relay(state.listener), {:send, waiter, {:fence_done, ref, node, index, count}})
+    {:noreply, state}
+  end
+
+  # On the node it arrived at: which nodes' relays to wait for
+  def handle_info({:fence_wait, ref, client_id, nodes}, state) do
+    Process.send_after(self(), {:fence_timeout, ref}, @forward_window)
+    fence = Map.get(state.fences, ref, %{done: %{}, counts: %{}})
+    fence = Map.merge(fence, %{client_id: client_id, nodes: nodes})
+    {:noreply, check_fence(state, ref, fence)}
+  end
+
+  def handle_info({:fence_done, ref, node, index, count}, state) do
+    fence = Map.get(state.fences, ref, %{done: %{}, counts: %{}, nodes: nil})
+
+    fence = %{
+      fence
+      | done: Map.update(fence.done, node, MapSet.new([index]), &MapSet.put(&1, index)),
+        counts: Map.put(fence.counts, node, count)
+    }
+
+    {:noreply, check_fence(state, ref, fence)}
+  end
+
+  # A node that does not answer in time (or the node the session left being
+  # slow) holds the session's messages no longer
+  def handle_info({:fence_timeout, ref}, state) do
+    case Map.pop(state.fences, ref) do
+      {%{client_id: client_id}, fences} ->
+        {:noreply, lower_fence(%{state | fences: fences}, ref, client_id)}
+
+      {_, fences} ->
+        {:noreply, %{state | fences: fences}}
     end
   end
 
@@ -331,6 +453,20 @@ defmodule MqttX.Server.Cluster do
     for pid <- pids, node(pid) != node() do
       guarded(fn -> SessionStore.drop_remote_node(state.ctx.sessions, node(pid)) end)
     end
+
+    # A node that left passes every fence
+    gone = for pid <- pids, node(pid) != node(), do: node(pid)
+
+    state =
+      Enum.reduce(state.fences, state, fn {ref, fence}, state ->
+        case fence do
+          %{nodes: nodes} when is_list(nodes) ->
+            check_fence(state, ref, %{fence | nodes: nodes -- gone})
+
+          _ ->
+            state
+        end
+      end)
 
     # What was sent to them and not answered goes to another member: it may
     # have been delivered there before they left, it may not
@@ -395,6 +531,31 @@ defmodule MqttX.Server.Cluster do
     fun.()
   rescue
     e -> Logger.debug("[MqttX.Server.Cluster] skipped: #{Exception.message(e)}")
+  end
+
+  defp check_fence(state, ref, %{nodes: nodes} = fence) when is_list(nodes) do
+    passed? =
+      Enum.all?(nodes, fn node ->
+        count = Map.get(fence.counts, node)
+        count != nil and MapSet.size(Map.get(fence.done, node, MapSet.new())) >= count
+      end)
+
+    if passed? do
+      lower_fence(%{state | fences: Map.delete(state.fences, ref)}, ref, fence.client_id)
+    else
+      %{state | fences: Map.put(state.fences, ref, fence)}
+    end
+  end
+
+  defp check_fence(state, ref, fence), do: %{state | fences: Map.put(state.fences, ref, fence)}
+
+  defp lower_fence(state, ref, client_id) do
+    guarded(fn ->
+      SessionStore.lower_fence(state.ctx.sessions, client_id, ref)
+      Delivery.release(state.ctx, client_id)
+    end)
+
+    state
   end
 
   defp send_shared(state, node, client_id, sub_opts, message, force, shared) do
@@ -467,7 +628,7 @@ defmodule MqttX.Server.Cluster do
         SessionStore.mark_moved(ctx.sessions, client_id, to, ref)
         record = SessionStore.export(ctx.sessions, client_id)
         spawn(fn -> finish_move(ctx, client_id, to, ref) end)
-        {:ok, record}
+        {:ok, Map.put(record, :from, node())}
     end
   rescue
     e ->

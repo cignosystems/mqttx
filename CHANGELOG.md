@@ -10,18 +10,21 @@ All notable changes to this project will be documented in this file.
   several nodes of an Erlang cluster act as one broker, via `:pg` (the
   `mqttx` application starts the scope; nothing to configure;
   `MqttX.Server.Cluster`):
-  - `MqttX.Server.deliver/3,4` fans a message out on every node; a
-    persistent session away on another node gets it queued there.
+  - `MqttX.Server.deliver/3,4` reaches every node with a matching
+    subscription (each node tells the others which filters it has; a node
+    whose filters have not arrived yet gets everything); a persistent
+    session away on another node gets it queued there.
   - A CONNECT on any node takes the client over from the others: an open
     connection for the same client id elsewhere is disconnected with 0x8E,
     its Will Delay and Session Expiry are cancelled, and its stored session
     (subscriptions, in-flight QoS 1/2, queue) moves to the new node; Clean
     Start 1 discards it everywhere. `handle_connect/4` reports a session
     held on another node as `session_present`. Messages published while a
-    session moves reach it once each: the old node forwards what it matches
-    for five seconds and the new node drops duplicates by message id (a
-    publisher's messages from the hand-over's few milliseconds may arrive
-    out of order).
+    session moves reach it once each and in each publisher's order: the
+    old node forwards what it matches, the new node drops duplicates by
+    message id and holds back what it matches itself until everything sent
+    to the old node before the hand-over has been forwarded (at most five
+    seconds, after which order is not guaranteed for the held messages).
   - Retained messages are replicated (later write wins) and sent to a node
     that joins. A clear is remembered for an hour, so a node that missed it
     while cut off cannot bring the message back.
@@ -35,8 +38,10 @@ All notable changes to this project will be documented in this file.
   (`MqttX.Server.SessionBackend` behaviour) saves sessions behind ETS every
   `:session_flush_interval` ms (default 1000) and loads them back when the
   listener starts. `MqttX.Server.SessionBackend.DETS` keeps them in a local
-  file; a backend over a shared database lets another node resume a dead
-  node's sessions.
+  file; `MqttX.Server.SessionBackend.Replicated` keeps them on every node of
+  the cluster, in memory, so another node resumes a dead node's sessions
+  (not across a restart of the whole cluster); a backend over a shared
+  database does both.
 
 ### Fixed
 

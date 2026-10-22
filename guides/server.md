@@ -321,10 +321,15 @@ Listeners sharing a name form one broker across the connected nodes (via
 `:pg`; connect the nodes with libcluster or `Node.connect/1`). Nothing else
 is configured, and a device may connect to any node:
 
-- **Delivery.** `MqttX.Server.deliver/3,4` fans a message out on every
-  node, so a device connected to node A receives what was published on
-  node B, and a persistent session that is away gets it queued on the node
-  that holds it. `deliver` returns the count for the local node only.
+- **Delivery.** `MqttX.Server.deliver/3,4` reaches every node with a
+  matching subscription, so a device connected to node A receives what was
+  published on node B, and a persistent session that is away gets it
+  queued on the node that holds it. Each node tells the others which
+  filters its sessions subscribe to, and a message goes only to the nodes
+  with a matching one (to every node until that node's filters have
+  arrived). A new subscription reaches the other nodes within one message
+  between them; a message published elsewhere in that moment can miss it.
+  `deliver` returns the count for the local node only.
 - **Sessions follow the client.** A CONNECT on one node reaches the others:
   a connection still open there for the same client id is taken over
   (DISCONNECT 0x8E, §3.1.4), its pending Will Delay and Session Expiry are
@@ -351,13 +356,14 @@ is configured, and a device may connect to any node:
 
 A CONNECT waits for the other nodes' answer, at most five seconds; a node
 that answers later keeps nothing (its session is discarded, not moved).
-Messages published while a session moves still reach it, once each: for
-five seconds after the hand-over, the node it left forwards what it matches
-for the client, and the new node drops the copies it already has. A message
-that reaches the old node more than those five seconds after the new one
-can be missed. During the hand-over, a message forwarded by the old node can
-arrive after a later one the new node matched itself, so a publisher's
-messages from those few milliseconds may arrive out of order.
+Messages published while a session moves reach it once each and in each
+publisher's order (§4.6): the node it left forwards what it matches for the
+client, the new node drops the copies it already has, and until everything
+any node sent the old node before the hand-over has been forwarded — a
+round trip through every node, milliseconds — the new node holds back what
+it matches itself. If that takes longer than five seconds (a node not
+answering), the held messages are delivered anyway, and order is no longer
+guaranteed for them.
 
 A session lives on one node at a time, so a node that goes down takes its
 sessions with it — unless the listener has a durable backend the other
@@ -383,8 +389,12 @@ ETS stays the working copy; changed sessions are saved behind it every
 most that much. When the listener starts it loads back the sessions this
 node saved, and a session saved by a node that is gone is loaded when its
 client connects. `MqttX.Server.SessionBackend.DETS` is a local file — enough
-for one node's restarts; implement the five-callback behaviour over a
-database to let any node of a cluster take over a dead node's sessions.
+for one node's restarts. `MqttX.Server.SessionBackend.Replicated` keeps every
+saved session on every node of the cluster, in memory, so a client whose
+node goes down resumes its session on another (at the cost of every node
+holding every persistent session); it does not survive a restart of the
+whole cluster. For both, implement the five-callback behaviour over a
+database.
 
 ## Session Expiry
 

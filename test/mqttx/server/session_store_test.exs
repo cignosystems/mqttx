@@ -301,6 +301,48 @@ defmodule MqttX.Server.SessionStoreTest do
       assert drain(to, "m") == ["queued there", "forwarded"]
     end
 
+    test "what is forwarded while the import runs is neither dropped nor wiped" do
+      from = Store.new()
+      :ok = Store.put(from, "m", @meta)
+      for n <- 1..2_000, do: :ok = Store.enqueue(from, "m", entry("queued-#{n}", make_ref()), nil)
+
+      to = Store.new()
+      :ok = Store.hold(to, "m", System.system_time(:millisecond) + 10_000)
+      for n <- 1..20_000, do: :ok = Store.enqueue(to, "m", entry("held-#{n}", make_ref()), nil)
+
+      # Forwarding the way the delivery does it: a message for a session
+      # that is not there is dropped
+      test = self()
+
+      forwarder =
+        spawn_link(fn ->
+          forward = fn forward, n, dropped ->
+            receive do
+              :stop -> send(test, {:forwarded, n, dropped})
+            after
+              0 ->
+                if Store.get(to, "m") do
+                  :ok = Store.enqueue(to, "m", entry("late-#{n + 1}", make_ref()), nil)
+                  forward.(forward, n + 1, dropped)
+                else
+                  forward.(forward, n, dropped + 1)
+                end
+            end
+          end
+
+          forward.(forward, 0, 0)
+        end)
+
+      Process.sleep(5)
+      :ok = Store.import(to, "m", Store.export(from, "m"))
+      send(forwarder, :stop)
+      assert_receive {:forwarded, late, 0}
+
+      got = MapSet.new(drain(to, "m"))
+      assert MapSet.size(got) == 2_000 + 20_000 + late
+      assert Enum.all?(1..late, &MapSet.member?(got, "late-#{&1}"))
+    end
+
     test "the imported queue's message ids count as seen" do
       from = Store.new()
       :ok = Store.put(from, "m", @meta)

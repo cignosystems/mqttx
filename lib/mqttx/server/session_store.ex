@@ -690,21 +690,23 @@ defmodule MqttX.Server.SessionStore do
   Install an exported session, replacing whatever the store held for it. The
   queue is not bounded here: what was queued elsewhere was within its bound.
   A placeholder's queue — messages forwarded while the session was on its
-  way — follows the imported one, and its hand-off window carries over.
+  way — follows the imported one (one forwarded while the import runs may
+  come first), and its hand-off window carries over.
   """
   @spec import(t(), client_id(), session_record()) :: :ok
   def import(store, client_id, %{meta: meta} = record) do
     {forwarded, handoff_until} =
       case :ets.lookup(store.sessions, client_id) do
+        # Taken entry by entry and the row replaced, not deleted: a message
+        # forwarded meanwhile must neither be wiped with the queue nor find
+        # no session at all (it would be dropped)
         [{_, %{placeholder: true} = held}] ->
-          {for({_key, entry} <- queued(store, client_id), do: entry),
-           Map.get(held, :handoff_until)}
+          {take_queued(store, client_id), Map.get(held, :handoff_until)}
 
         _ ->
+          delete(store, client_id)
           {[], nil}
       end
-
-    delete(store, client_id)
 
     meta =
       meta
@@ -852,6 +854,15 @@ defmodule MqttX.Server.SessionStore do
 
   defp queued(store, client_id) do
     :ets.select(store.queue, [{{{client_id, :_}, :_}, [], [:"$_"]}])
+  end
+
+  defp take_queued(store, client_id) do
+    for {key, _entry} <- queued(store, client_id),
+        [{_, entry}] <- [:ets.take(store.queue, key)] do
+      key = {:qlen, client_id}
+      :ets.update_counter(store.sessions, key, {2, -1}, {key, 0})
+      entry
+    end
   end
 
   # Remember that a session changed, for the next backend save

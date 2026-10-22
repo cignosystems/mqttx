@@ -98,9 +98,18 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    new node, remove from the old) cannot lose its entry to reordering. The
    publishing node walks both tables and picks one member per group
    (connected local members and all remote members are candidates,
-   rotating; offline local members only when there are none); a remote pick
-   becomes a targeted `{:deliver_to, ...}` to that node, and the broadcast
-   fan-out on the other nodes skips shared groups (`shared: :skip`). A node
+   rotating; offline local members only when there are none), and the
+   broadcast fan-out on the other nodes skips shared groups
+   (`shared: :skip`). A remote pick goes to the publishing node's member,
+   which sends `{:deliver_shared, ...}` to that node and keeps the message
+   until it answers: `:ok` (taken), `:offline` (a session without a
+   connection) or `:gone` (no session there, or QoS 0 for an offline
+   client). Anything but `:ok`, or the node's member leaving the group
+   first, re-picks among the members not yet tried
+   (`SessionStore.pick_shared/6`); members that answered `:offline` are
+   sent the message again with `force` only once no other member is left.
+   Erlang distribution does not lose a message between connected nodes, so
+   no timer is needed: an answer or a `:pg` leave always comes. A node
    leaving drops its members from every `remote` table.
 5. **Durable, pluggable store.** `MqttX.Server.SessionBackend` (init, save,
    load, delete, list) stores whole session records. ETS stays the working
@@ -122,6 +131,9 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
   is not local (the peek). Bounded by the 5 s deadline.
 - Delivery is a broadcast, O(nodes) per publish. Each `deliver` makes one
   reference; a queued message carries it.
+- A shared delivery to another node goes through the publishing node's
+  member and is answered: two messages more than a direct send, and the
+  payload is held there for that round trip.
 - A move keeps a forwarding stub for 5 s and message ids for 15 s on the
   nodes involved; cleared retained topics are kept for an hour.
 - With a backend, one ETS insert per session change and one record save per
@@ -136,8 +148,9 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
   from the hand-over's few milliseconds can arrive out of order (§4.6).
   Holding the new node's own copies until the old node stops forwarding
   would restore it, at the cost of delaying them.
-- Remote shared members are assumed reachable; replicating whether they are
-  connected would let the pick prefer online members cluster-wide.
+- A shared delivery to a node that leaves after taking it but before
+  answering is delivered again elsewhere (at least once). Exactly once
+  across a node loss would need the member's session to outlive the node.
 - A database backend example (Ecto/Postgres) in the guides.
 
 ## Operational notes

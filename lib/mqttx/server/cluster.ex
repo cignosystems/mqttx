@@ -20,7 +20,10 @@ defmodule MqttX.Server.Cluster do
       node that missed it cannot bring the message back.
     * A shared subscription (§4.8) delivers each message once across the
       cluster: shared group membership is replicated, and the delivering node
-      picks one member wherever it is connected.
+      picks one member wherever it is connected. The node holding that member
+      answers whether it took the message; if not — its client is offline,
+      its session is gone, or the node leaves before answering — the next
+      member is picked, a connected one first.
 
   A session lives on one node at a time. While it moves, the node it left
   forwards what it matches for it for a few seconds and the node it moved to
@@ -112,8 +115,7 @@ defmodule MqttX.Server.Cluster do
   end
 
   @doc false
-  # One message for one session on `node`: a shared group's member picked
-  # there, or a session that moved there. `message` is
+  # One message for one session that moved to `node`. `message` is
   # `{id, topic, payload, opts, age_ms}`.
   def deliver_to(listener, node, client_id, message) do
     case Enum.find(remote_members(listener), &(node(&1) == node)) do
@@ -122,6 +124,14 @@ defmodule MqttX.Server.Cluster do
     end
 
     :ok
+  end
+
+  @doc false
+  # A shared group's member picked on `node`: this node's member sends it
+  # and keeps it until that node says it took it, picking the group's next
+  # member if it did not or if the node leaves first
+  def deliver_shared(listener, node, client_id, sub_opts, shared) do
+    GenServer.cast(via(listener), {:shared_out, node, client_id, sub_opts, shared})
   end
 
   @doc false
@@ -202,7 +212,8 @@ defmodule MqttX.Server.Cluster do
   def init({listener, ctx}) do
     :ok = :pg.join(@scope, listener, self())
     {ref, members} = :pg.monitor(@scope, listener)
-    state = %{listener: listener, ctx: ctx, monitor: ref}
+    # `pending`: shared deliveries sent to another node and not yet answered
+    state = %{listener: listener, ctx: ctx, monitor: ref, pending: %{}}
 
     # Whoever is already there learns what this node holds (and tells this
     # node what it holds when it sees the join)
@@ -215,6 +226,12 @@ defmodule MqttX.Server.Cluster do
   def handle_call({:context, ctx}, _from, state), do: {:reply, :ok, %{state | ctx: ctx}}
 
   @impl true
+  def handle_cast({:shared_out, node, client_id, sub_opts, shared}, state) do
+    message = Delivery.shared_message(shared, sub_opts)
+    {:noreply, send_shared(state, node, client_id, sub_opts, message, false, shared)}
+  end
+
+  @impl true
   def handle_info({:deliver, id, topic, payload, opts}, state) do
     guarded(fn -> Delivery.deliver_local(state.ctx, id, topic, payload, opts) end)
     {:noreply, state}
@@ -223,6 +240,36 @@ defmodule MqttX.Server.Cluster do
   def handle_info({:deliver_to, client_id, message}, state) do
     guarded(fn -> Delivery.deliver_to(state.ctx, client_id, message) end)
     {:noreply, state}
+  end
+
+  def handle_info({:deliver_shared, from, ref, client_id, message, force}, state) do
+    result =
+      try do
+        Delivery.deliver_shared(state.ctx, client_id, message, force)
+      rescue
+        _ -> :gone
+      end
+
+    send(from, {:shared_ack, ref, result})
+    {:noreply, state}
+  end
+
+  def handle_info({:shared_ack, ref, result}, state) do
+    case Map.pop(state.pending, ref) do
+      {nil, _} ->
+        {:noreply, state}
+
+      {{_pid, _client_id, _sub_opts, _shared}, pending} when result == :ok ->
+        {:noreply, %{state | pending: pending}}
+
+      {{pid, client_id, sub_opts, shared}, pending} ->
+        shared =
+          if result == :offline,
+            do: %{shared | offline: shared.offline ++ [{node(pid), client_id, sub_opts}]},
+            else: shared
+
+        {:noreply, retry_shared(%{state | pending: pending}, shared)}
+    end
   end
 
   def handle_info({:claim, reply_to, client_id, mode}, state) do
@@ -285,6 +332,16 @@ defmodule MqttX.Server.Cluster do
       guarded(fn -> SessionStore.drop_remote_node(state.ctx.sessions, node(pid)) end)
     end
 
+    # What was sent to them and not answered goes to another member: it may
+    # have been delivered there before they left, it may not
+    {lost, pending} = Map.split_with(state.pending, fn {_ref, {pid, _, _, _}} -> pid in pids end)
+    state = %{state | pending: pending}
+
+    state =
+      Enum.reduce(lost, state, fn {_ref, {_pid, _client_id, _sub_opts, shared}}, state ->
+        retry_shared(state, shared)
+      end)
+
     {:noreply, state}
   end
 
@@ -338,6 +395,32 @@ defmodule MqttX.Server.Cluster do
     fun.()
   rescue
     e -> Logger.debug("[MqttX.Server.Cluster] skipped: #{Exception.message(e)}")
+  end
+
+  defp send_shared(state, node, client_id, sub_opts, message, force, shared) do
+    case Enum.find(remote_members(state.listener), &(node(&1) == node)) do
+      nil ->
+        retry_shared(state, shared)
+
+      pid ->
+        ref = make_ref()
+        send(pid, {:deliver_shared, self(), ref, client_id, message, force})
+        %{state | pending: Map.put(state.pending, ref, {pid, client_id, sub_opts, shared})}
+    end
+  end
+
+  defp retry_shared(state, shared) do
+    case Delivery.next_shared(state.ctx, shared) do
+      {:send, node, client_id, sub_opts, message, force, shared} ->
+        send_shared(state, node, client_id, sub_opts, message, force, shared)
+
+      :done ->
+        state
+    end
+  rescue
+    e ->
+      Logger.debug("[MqttX.Server.Cluster] shared delivery dropped: #{Exception.message(e)}")
+      state
   end
 
   defp max_retained(state), do: Map.get(state.ctx, :max_retained_messages)

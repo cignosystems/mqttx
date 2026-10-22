@@ -318,7 +318,9 @@ defmodule MqttX.Server.SessionStore do
   members for which `online?` returns true and the members other nodes hold
   (replicated into the `remote` table), rotating; with none of those, one
   offline local member is chosen so the message is queued for its session.
-  A member on another node comes back as `{:remote, node, client_id, opts}`.
+  A member on another node comes back as
+  `{:remote, node, client_id, opts, {filter, group}}`; if that node does not
+  take the message, `pick_shared/6` picks the group's next member.
   `shared: :skip` leaves shared groups out — a node fanning out a message
   another node delivered does that, because the delivering node picked the
   group's member already.
@@ -329,7 +331,7 @@ defmodule MqttX.Server.SessionStore do
           term(),
           (client_id() -> boolean()),
           :all | :skip
-        ) :: [{client_id(), map()} | {:remote, node(), client_id(), map()}]
+        ) :: [{client_id(), map()} | {:remote, node(), client_id(), map(), {list(), binary()}}]
   def match(store, topic, publisher \\ nil, online? \\ fn _ -> true end, shared \\ :all) do
     segments = Topic.normalize(topic)
     hits = walk(store.subs, segments)
@@ -370,12 +372,41 @@ defmodule MqttX.Server.SessionStore do
     (local ++ remote)
     |> Enum.group_by(fn {key, _member} -> key end, fn {_key, member} -> member end)
     |> Enum.flat_map(fn {{filter, group}, members} ->
-      pick_shared_member(store, filter, group, members, online?)
+      case pick_shared_member(store, filter, group, members, online?) do
+        [{:remote, node, client, opts}] -> [{:remote, node, client, opts, {filter, group}}]
+        local -> local
+      end
     end)
     |> Enum.reject(fn
       {client, _opts} -> MapSet.member?(taken, client)
-      {:remote, _node, _client, _opts} -> false
+      {:remote, _node, _client, _opts, _key} -> false
     end)
+  end
+
+  @doc false
+  # Pick a shared group's member again, leaving out the `{node, client_id}`s
+  # in `tried` — the node holding the one picked before did not take the
+  # message. Returns `{client_id, opts}` (on this node),
+  # `{:remote, node, client_id, opts}`, or `nil` with no member left.
+  def pick_shared(store, filter, group, publisher, tried, online?) do
+    local =
+      for [client, opts] <-
+            :ets.match(store.subs, {{filter, {:share, group, :"$1"}}, :"$2"}),
+          not MapSet.member?(tried, {node(), client}),
+          do: {:local, client, opts}
+
+    remote =
+      for [client, node, opts] <-
+            :ets.match(store.remote, {{filter, {:share, group, :"$1"}}, {:"$2", :"$3"}}),
+          not MapSet.member?(tried, {node, client}),
+          not (client == publisher and Map.get(opts, :no_local, false)),
+          do: {:remote, node, client, opts}
+
+    case pick_shared_member(store, filter, group, local ++ remote, online?) do
+      [{client, opts}] -> {client, opts}
+      [remote] -> remote
+      [] -> nil
+    end
   end
 
   # Walk the topic one level at a time. `prefixes` are the filter prefixes
@@ -455,8 +486,9 @@ defmodule MqttX.Server.SessionStore do
   defp pick_shared_member(store, filter, group, members, online?) do
     members = Enum.sort_by(members, &member_sort_key/1)
 
-    # Members on other nodes count as reachable: their node queues for them
-    # if they are away
+    # Members on other nodes count as reachable: their node answers whether
+    # it took the message, and if not the next member is picked
+    # (`pick_shared/6`)
     reachable =
       Enum.filter(members, fn
         {:local, client, _opts} -> online?.(client)

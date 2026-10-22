@@ -122,8 +122,8 @@ defmodule MqttX.Server.Delivery do
     do: {:ok, fan_out(ctx, id, topic, payload, opts, :skip)}
 
   @doc false
-  # One delivery to one session on this node, from another node: a shared
-  # group's member it picked, or a session that moved here from it. `opts`
+  # One delivery to one session on this node, from another node: a session
+  # that moved here from it. `opts`
   # already has the subscription applied; `age` is how long ago (ms) the
   # message was queued there.
   def deliver_to(ctx, client, {id, topic, payload, opts, age}) do
@@ -144,21 +144,111 @@ defmodule MqttX.Server.Delivery do
       end)
 
     queued_at = System.monotonic_time(:millisecond)
-    online? = fn client -> connections(ctx, client) != [] end
 
     ctx.sessions
-    |> SessionStore.match(topic, publisher, online?, shared)
+    |> SessionStore.match(topic, publisher, online?(ctx), shared)
     |> Enum.count(fn
       {client, sub_opts} ->
         opts = apply_subscription(opts, sub_opts)
         enqueue(ctx, id, client, topic, payload, opts, queued_at)
 
-      # A shared group's member on another node: that node delivers it
-      {:remote, node, client, sub_opts} ->
-        opts = apply_subscription(opts, sub_opts)
-        Cluster.deliver_to(ctx.listener, node, client, {id, topic, payload, opts, 0})
+      # A shared group's member on another node: this node's cluster member
+      # sends it there and picks another member if that node does not take it
+      {:remote, node, client, sub_opts, {filter, group}} ->
+        shared = %{
+          id: id,
+          topic: topic,
+          payload: payload,
+          opts: opts,
+          publisher: publisher,
+          filter: filter,
+          group: group,
+          queued_at: queued_at,
+          tried: MapSet.new([{node, client}]),
+          offline: []
+        }
+
+        Cluster.deliver_shared(ctx.listener, node, client, sub_opts, shared)
         false
     end)
+  end
+
+  defp online?(ctx), do: fn client -> connections(ctx, client) != [] end
+
+  @doc false
+  # A shared group's member on this node, picked by another node: `:ok` if
+  # the message was taken, `:offline` if its client is not connected (the
+  # picking node tries a connected member first, and comes back with
+  # `force` if there is none), `:gone` if it cannot be delivered here.
+  def deliver_shared(ctx, client, {id, topic, payload, opts, age}, force) do
+    queued_at = System.monotonic_time(:millisecond) - age
+
+    case SessionStore.get(ctx.sessions, client) do
+      nil ->
+        :gone
+
+      session ->
+        online = connections(ctx, client) != [] or Map.has_key?(session, :moved_to)
+
+        cond do
+          online or Map.has_key?(session, :placeholder) or (force and opts.qos > 0) ->
+            if enqueue(ctx, id, client, topic, payload, opts, queued_at), do: :ok, else: :gone
+
+          opts.qos > 0 ->
+            :offline
+
+          true ->
+            :gone
+        end
+    end
+  end
+
+  @doc false
+  # The next member for a shared delivery the picked member's node did not
+  # take: delivered here (`:done`), or `{:send, node, client, sub_opts,
+  # message, force, shared}` for the cluster member to send. A member that
+  # answered `:offline` is tried again, with `force`, only once no connected
+  # member is left.
+  def next_shared(ctx, shared) do
+    pick =
+      SessionStore.pick_shared(
+        ctx.sessions,
+        shared.filter,
+        shared.group,
+        shared.publisher,
+        shared.tried,
+        online?(ctx)
+      )
+
+    case {pick, shared.offline} do
+      {{:remote, node, client, sub_opts}, _} ->
+        shared = %{shared | tried: MapSet.put(shared.tried, {node, client})}
+        {:send, node, client, sub_opts, shared_message(shared, sub_opts), false, shared}
+
+      {{client, sub_opts}, _} ->
+        opts = apply_subscription(shared.opts, sub_opts)
+        enqueue(ctx, shared.id, client, shared.topic, shared.payload, opts, shared.queued_at)
+        :done
+
+      {nil, [{node, client, sub_opts} | rest]} ->
+        shared = %{shared | offline: rest}
+        {:send, node, client, sub_opts, shared_message(shared, sub_opts), true, shared}
+
+      {nil, []} ->
+        Logger.debug(
+          "[MqttX.Server] No member of shared group #{inspect(shared.group)} took " <>
+            "the message on #{inspect(shared.topic)}"
+        )
+
+        :done
+    end
+  end
+
+  @doc false
+  def shared_message(shared, sub_opts) do
+    opts = apply_subscription(shared.opts, sub_opts)
+    age = System.monotonic_time(:millisecond) - shared.queued_at
+    {shared.id, shared.topic, shared.payload, opts, age}
   end
 
   @doc """

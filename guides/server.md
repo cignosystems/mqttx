@@ -341,7 +341,13 @@ is configured, and a device may connect to any node:
   reconnects.
 - **Shared subscriptions** deliver each message once across the cluster:
   members are known to every node, and the publishing node picks one member
-  wherever it is connected (rotating, connected members first).
+  wherever it is connected (rotating, connected members first). The node
+  holding a member it picked answers whether it took the message; when its
+  client is offline, its session is gone, or that node leaves before
+  answering, the next member is picked — connected members first, an
+  offline member's session only when none is left. A node that leaves after
+  taking a message but before answering can cause it to be delivered twice
+  (at least once, as §4.8.2 allows when a member's connection is lost).
 
 A CONNECT waits for the other nodes' answer, at most five seconds; a node
 that answers later keeps nothing (its session is discarded, not moved).

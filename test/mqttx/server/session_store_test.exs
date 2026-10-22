@@ -184,8 +184,38 @@ defmodule MqttX.Server.SessionStoreTest do
       picks = for _ <- 1..4, do: Store.match(s, "t/x")
 
       assert {"here", %{qos: 1}} in List.flatten(picks)
-      assert {:remote, :b@host, "there", %{qos: 1}} in List.flatten(picks)
+
+      assert {:remote, :b@host, "there", %{qos: 1}, {["t", :multi_level], "g"}} in List.flatten(
+               picks
+             )
+
       assert Enum.all?(picks, &(length(&1) == 1))
+    end
+
+    test "pick_shared picks again without the members already tried" do
+      s = Store.new()
+      :ok = Store.subscribe(s, "here", "$share/g/t", %{qos: 1})
+      :ok = Store.put_remote_shared(s, :b@host, ["t"], "g", "there", %{qos: 1})
+      :ok = Store.put_remote_shared(s, :c@host, ["t"], "g", "far", %{qos: 0})
+      online? = fn _ -> true end
+
+      tried = MapSet.new([{:b@host, "there"}, {node(), "here"}])
+
+      assert {:remote, :c@host, "far", %{qos: 0}} =
+               Store.pick_shared(s, ["t"], "g", nil, tried, online?)
+
+      tried = MapSet.put(tried, {:c@host, "far"})
+      assert Store.pick_shared(s, ["t"], "g", nil, tried, online?) == nil
+
+      # A connected member here is picked before one there; an offline one
+      # only when no other is left
+      tried = MapSet.new([{:c@host, "far"}])
+
+      assert {:remote, :b@host, "there", _} =
+               Store.pick_shared(s, ["t"], "g", nil, tried, fn _ -> false end)
+
+      tried = MapSet.put(tried, {:b@host, "there"})
+      assert {"here", %{qos: 1}} = Store.pick_shared(s, ["t"], "g", nil, tried, fn _ -> false end)
     end
 
     test "shared: :skip leaves shared groups out" do
@@ -199,7 +229,7 @@ defmodule MqttX.Server.SessionStoreTest do
       s = Store.new()
       :ok = Store.put_remote_shared(s, :new@host, ["t"], "g", "moved", %{qos: 0})
       :ok = Store.delete_remote_shared(s, :old@host, ["t"], "g", "moved")
-      assert [{:remote, :new@host, "moved", _}] = Store.match(s, "t")
+      assert [{:remote, :new@host, "moved", _, _}] = Store.match(s, "t")
 
       :ok = Store.drop_remote_node(s, :new@host)
       assert Store.match(s, "t") == []

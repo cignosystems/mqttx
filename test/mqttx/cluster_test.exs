@@ -19,6 +19,7 @@ defmodule MqttX.ClusterTest do
   alias MqttX.Server.Cluster
   alias MqttX.Server.Delivery
   alias MqttX.Server.RetainedStore
+  alias MqttX.Server.SessionStore
   alias MqttX.Test.ClusterBroker
   alias MqttX.Test.ForwardingHandler
 
@@ -537,5 +538,99 @@ defmodule MqttX.ClusterTest do
     assert tags[:here] > 0 and tags[:there] > 0
 
     Enum.each([here, there, pub], &MqttX.Client.disconnect/1)
+  end
+
+  test "a shared message goes to a member that takes it, not one that is offline or gone", ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_shared_away_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    # A member there with a session but no connection, and one here online
+    away = connect(remote_port, "cl-sha-away", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(away, "$share/g/sha/#", qos: 1)
+    disconnect_on(ctx.peer_node, remote_port, away, "cl-sha-away")
+
+    here = tagged_connect(local_port, "cl-sha-here", :here)
+    {:ok, [1]} = MqttX.Client.subscribe(here, "$share/g/sha/#", qos: 1)
+    wait_until(fn -> :ets.info(:"mqttx_#{local_port}_remote", :size) == 1 end)
+
+    # And one this node believes is there, whose session is not
+    [member] = Enum.filter(Cluster.members(name), &(node(&1) == node()))
+    sessions = :sys.get_state(member).ctx.sessions
+
+    :ok =
+      SessionStore.put_remote_shared(
+        sessions,
+        ctx.peer_node,
+        ["sha", :multi_level],
+        "g",
+        "cl-sha-ghost",
+        %{qos: 1}
+      )
+
+    for i <- 1..12, do: {:ok, _} = MqttX.Server.deliver(name, "sha/#{i}", "m#{i}", %{qos: 1})
+
+    received =
+      for _ <- 1..12 do
+        receive do
+          {:here, {:mqtt_event, :message, {["sha", _], payload, _}}} -> payload
+        after
+          3_000 -> flunk("a shared message never arrived")
+        end
+      end
+
+    assert Enum.sort(received) == Enum.sort(for i <- 1..12, do: "m#{i}")
+
+    # With no connected member left, the offline one gets it queued
+    MqttX.Client.disconnect(here)
+
+    wait_until(fn ->
+      Registry.lookup(
+        MqttX.Server.ConnectionRegistry,
+        {:"mqttx_retained_#{local_port}", "cl-sha-here"}
+      ) == []
+    end)
+
+    {:ok, _} = MqttX.Server.deliver(name, "sha/last", "last", %{qos: 1})
+
+    away = connect(remote_port, "cl-sha-away", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+    assert_receive {:mqtt_event, :message, {["sha", "last"], "last", _}}, 3_000
+    refute_receive {:mqtt_event, :message, {["sha", _], _, _}}, 300
+    MqttX.Client.disconnect(away)
+  end
+
+  test "a shared message sent to a node whose member leaves before answering goes to another member",
+       ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_shared_gone_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    here = tagged_connect(local_port, "cl-shg-here", :here)
+    there = tagged_connect(remote_port, "cl-shg-there", :there)
+    {:ok, [1]} = MqttX.Client.subscribe(here, "$share/g/shg/#", qos: 1)
+    {:ok, [1]} = MqttX.Client.subscribe(there, "$share/g/shg/#", qos: 1)
+    wait_until(fn -> :ets.info(:"mqttx_#{local_port}_remote", :size) == 1 end)
+
+    # The member there takes what it is sent but never answers, then goes
+    [peer_member] = Enum.filter(Cluster.members(name), &(node(&1) == ctx.peer_node))
+    :ok = :erpc.call(ctx.peer_node, :sys, :suspend, [peer_member])
+
+    for i <- 1..10, do: {:ok, _} = MqttX.Server.deliver(name, "shg/#{i}", "m#{i}", %{qos: 1})
+    Process.exit(peer_member, :kill)
+
+    received =
+      for _ <- 1..10 do
+        receive do
+          {:here, {:mqtt_event, :message, {["shg", _], payload, _}}} -> payload
+        after
+          3_000 -> flunk("a shared message never arrived")
+        end
+      end
+
+    assert Enum.sort(received) == Enum.sort(for i <- 1..10, do: "m#{i}")
+    refute_receive {_, {:mqtt_event, :message, {["shg", _], _, _}}}, 300
+
+    Enum.each([here, there], &MqttX.Client.disconnect/1)
   end
 end

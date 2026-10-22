@@ -26,7 +26,11 @@ All notable changes to this project will be documented in this file.
     that joins. A clear is remembered for an hour, so a node that missed it
     while cut off cannot bring the message back.
   - A shared subscription with members on several nodes delivers each
-    message once across the cluster.
+    message once across the cluster. A member on another node is sent the
+    message only if that node takes it: if its client is offline, its
+    session is gone, or the node leaves before answering, the next member is
+    picked, a connected one first (a message the leaving node took just
+    before can then arrive twice).
 - **Durable broker sessions.** A `:session_backend` option
   (`MqttX.Server.SessionBackend` behaviour) saves sessions behind ETS every
   `:session_flush_interval` ms (default 1000) and loads them back when the

@@ -73,6 +73,11 @@ All notable changes to this project will be documented in this file.
   was dropped at every subscriber with "Failed to encode publish". The
   other Will Properties are sent as before, User Properties in their order
   (MQTT-3.1.3-10).
+- **A delayed Will can be delivered with `MqttX.Server.deliver/3`.** A Will
+  with a Will Delay Interval is published from `MqttX.Server.WillDelay`,
+  where `deliver/3` found no listener and returned `{:error, :no_listener}`,
+  so a handler routing as the server guide shows never delivered it. The
+  connection's listener is now set for that `handle_publish/4` call.
 
 ## [0.12.0] - 2026-10-19
 

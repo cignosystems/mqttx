@@ -2456,6 +2456,10 @@ defmodule MqttX.Transport.Handler do
       ctx = %{
         retained_table: state.retained_table,
         listener: state.sessions.listener,
+        # What MqttX.Server.deliver/3 finds in this process, so a handler
+        # that delivers from handle_publish/4 can still do so when the Will
+        # is published from WillDelay's
+        delivery: Process.get(:mqttx_listener),
         handler: state.handler,
         handler_state: state.handler_state,
         max_retained_messages: state.max_retained_messages

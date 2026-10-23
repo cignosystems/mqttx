@@ -20,6 +20,7 @@ defmodule MqttX.Server.WillDelay do
           required(:handler) => module(),
           required(:handler_state) => term(),
           optional(:listener) => term(),
+          optional(:delivery) => map() | nil,
           optional(:max_retained_messages) => non_neg_integer() | nil
         }
 
@@ -92,7 +93,10 @@ defmodule MqttX.Server.WillDelay do
     # Same rule as the immediate Will path in MqttX.Transport.Handler: the Will
     # is attacker-supplied and handle_publish is its only authorization gate, so
     # ask first and store the retained entry only if the handler accepted it.
-    result = ctx.handler.handle_publish(will.topic, will.payload, opts, ctx.handler_state)
+    result =
+      with_delivery(Map.get(ctx, :delivery), fn ->
+        ctx.handler.handle_publish(will.topic, will.payload, opts, ctx.handler_state)
+      end)
 
     # The store honors the listener's retained cap — a delayed Will must not
     # be a way around it (existing topics can always be overwritten).
@@ -109,5 +113,20 @@ defmodule MqttX.Server.WillDelay do
     end
 
     result
+  end
+
+  # MqttX.Server.deliver/3 finds its listener in the calling process. This
+  # process serves every listener, so the Will's connection context is set
+  # only for the handle_publish/4 call that publishes it
+  defp with_delivery(nil, fun), do: fun.()
+
+  defp with_delivery(delivery, fun) do
+    Process.put(:mqttx_listener, delivery)
+
+    try do
+      fun.()
+    after
+      Process.delete(:mqttx_listener)
+    end
   end
 end

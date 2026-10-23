@@ -2430,7 +2430,9 @@ defmodule MqttX.Transport.Handler do
       qos: Map.get(will, :qos, 0),
       retain: Map.get(will, :retain, false),
       delay_interval: delay_interval,
-      properties: will_props
+      # The rest become the Will's PUBLISH properties; Will Delay Interval is
+      # a Will Property only (§2.2.2.2) and would fail the PUBLISH's encoding
+      properties: Map.delete(will_props, :will_delay_interval)
     }
   end
 

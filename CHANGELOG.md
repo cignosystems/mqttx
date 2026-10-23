@@ -67,6 +67,12 @@ All notable changes to this project will be documented in this file.
   connection down. A successful CONNACK naming a different method is
   refused the same way; one that leaves the method out is still accepted.
   Previously the client handed any method to `handle_auth/3`.
+- **A v5 Will with Will Properties reaches its subscribers.** The broker
+  copied the Will Delay Interval into the Will's PUBLISH, which the encoder
+  now refuses (§2.2.2.2), so a Will that set a Will Delay Interval (even 0)
+  was dropped at every subscriber with "Failed to encode publish". The
+  other Will Properties are sent as before, User Properties in their order
+  (MQTT-3.1.3-10).
 
 ## [0.12.0] - 2026-10-19
 

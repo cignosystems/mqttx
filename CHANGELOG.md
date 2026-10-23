@@ -78,6 +78,12 @@ All notable changes to this project will be documented in this file.
   where `deliver/3` found no listener and returned `{:error, :no_listener}`,
   so a handler routing as the server guide shows never delivered it. The
   connection's listener is now set for that `handle_publish/4` call.
+- **Retained messages keep their properties.** Only the Message Expiry
+  Interval was stored; a retained message sent on SUBSCRIBE now carries the
+  Payload Format Indicator, Content Type, Response Topic, Correlation Data
+  and User Properties it was published with (MQTT-3.3.2-4, -15, -16, -17,
+  -20). Retained rows (and the rows replicated between cluster nodes) gain
+  a `properties` field before `version`.
 
 ## [0.12.0] - 2026-10-19
 

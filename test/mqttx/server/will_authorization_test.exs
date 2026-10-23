@@ -172,7 +172,11 @@ defmodule MqttX.Server.WillAuthorizationTest do
 
       # Seed a retained entry directly — the delete path is what we are testing
       table = :"mqttx_retained_#{port}"
-      :ets.insert(table, {["fleet", "config"], "fleet/config", "v1", 0, 0, nil, {0, node(), 0}})
+
+      :ets.insert(
+        table,
+        {["fleet", "config"], "fleet/config", "v1", 0, 0, nil, %{}, {0, node(), 0}}
+      )
 
       socket =
         connect_with_will(port, "attacker", %{
@@ -188,7 +192,7 @@ defmodule MqttX.Server.WillAuthorizationTest do
       assert_receive {:publish_rejected, "fleet/config", _}, 2_000
       Process.sleep(100)
 
-      assert [{_, "fleet/config", "v1", _, _, _, _}] = retained_entries(port),
+      assert [{_, "fleet/config", "v1", _, _, _, _, _}] = retained_entries(port),
              "rejected Will deleted a retained message it was not authorized to touch"
     end
   end
@@ -246,7 +250,7 @@ defmodule MqttX.Server.WillAuthorizationTest do
       assert_receive {:publish_accepted, "sensors/room2/status", "offline"}, 4_000
       Process.sleep(100)
 
-      assert [{_, "sensors/room2/status", "offline", 1, _, _, _}] = retained_entries(port),
+      assert [{_, "sensors/room2/status", "offline", 1, _, _, _, _}] = retained_entries(port),
              "accepted delayed Will should have been retained"
     end
   end

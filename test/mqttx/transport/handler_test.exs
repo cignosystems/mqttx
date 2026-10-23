@@ -1514,7 +1514,7 @@ defmodule MqttX.Transport.HandlerTest do
       :ets.insert(
         ctx.retained_table,
         {["rh", "topic"], "rh/topic", "retained-payload", 0, System.system_time(:second), nil,
-         {0, node(), 0}}
+         %{}, {0, node(), 0}}
       )
 
       # Subscribe with retain_handling: 2 (don't send retained)
@@ -1544,7 +1544,7 @@ defmodule MqttX.Transport.HandlerTest do
       :ets.insert(
         ctx.retained_table,
         {["rh0", "topic"], "rh0/topic", "retained-payload", 0, System.system_time(:second), nil,
-         {0, node(), 0}}
+         %{}, {0, node(), 0}}
       )
 
       # Subscribe with retain_handling: 0 (send retained)
@@ -1719,7 +1719,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       :ets.insert(
         ctx.retained_table,
-        {["denied", "t"], "denied/t", "secret", 0, System.system_time(:second), nil,
+        {["denied", "t"], "denied/t", "secret", 0, System.system_time(:second), nil, %{},
          {0, node(), 0}}
       )
 
@@ -1831,7 +1831,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       :ets.insert(
         ctx.retained_table,
-        {["retid", "t"], "retid/t", "v", 0, System.system_time(:second), nil, {0, node(), 0}}
+        {["retid", "t"], "retid/t", "v", 0, System.system_time(:second), nil, %{}, {0, node(), 0}}
       )
 
       {:ok, data} =
@@ -2495,7 +2495,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       :ets.insert(
         ctx.retained_table,
-        {["rh1", "topic"], "rh1/topic", "retained-1", 0, System.system_time(:second), nil,
+        {["rh1", "topic"], "rh1/topic", "retained-1", 0, System.system_time(:second), nil, %{},
          {0, node(), 0}}
       )
 
@@ -2522,7 +2522,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       :ets.insert(
         ctx.retained_table,
-        {["rh1e", "topic"], "rh1e/topic", "retained-1", 0, System.system_time(:second), nil,
+        {["rh1e", "topic"], "rh1e/topic", "retained-1", 0, System.system_time(:second), nil, %{},
          {0, node(), 0}}
       )
 

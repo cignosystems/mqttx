@@ -2545,13 +2545,13 @@ defmodule MqttX.Transport.Handler do
     Enum.reduce(topics, state, fn sub, st ->
       matches = MqttX.Server.RetainedStore.match(st.retained_table, get_topic_filter(sub))
 
-      Enum.reduce(matches, st, fn {topic, payload, qos, timestamp, expiry_interval}, st ->
-        send_retained(st, topic, payload, qos, timestamp, expiry_interval, sub, now)
-      end)
+      Enum.reduce(matches, st, fn retained, st -> send_retained(st, retained, sub, now) end)
     end)
   end
 
-  defp send_retained(state, topic, payload, qos, timestamp, expiry_interval, sub, now) do
+  defp send_retained(state, retained, sub, now) do
+    {topic, payload, qos, timestamp, expiry_interval, stored_properties} = retained
+
     # retain_handling (§3.8.3.1): 2 = never send on subscribe;
     # 1 = send only if this subscription did not already exist
     retain_handling = Map.get(sub, :retain_handling, 0)
@@ -2570,10 +2570,12 @@ defmodule MqttX.Transport.Handler do
           {ts, exp} -> max(0, exp - (now - ts))
         end
 
+      # Sent as published (MQTT-3.3.2-4, -15, -16, -17, -20), with the
+      # remaining Message Expiry (MQTT-3.3.2-6)
       properties =
         if remaining_expiry,
-          do: %{message_expiry_interval: remaining_expiry},
-          else: %{}
+          do: Map.put(stored_properties, :message_expiry_interval, remaining_expiry),
+          else: stored_properties
 
       # §3.3.2.3.8: retained messages sent on subscribe carry the
       # subscription's Subscription Identifier, if the SUBSCRIBE had one

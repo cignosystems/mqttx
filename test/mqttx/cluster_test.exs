@@ -737,7 +737,7 @@ defmodule MqttX.ClusterTest do
       :erpc.call(ctx.peer_node, :ets, :info, [remote_table, :size]) == 1_201
     end)
 
-    assert [{_, "v1201", _, _, _}] =
+    assert [{_, "v1201", _, _, _, _}] =
              :erpc.call(ctx.peer_node, RetainedStore, :match, [remote_table, "big/1201"])
   end
 

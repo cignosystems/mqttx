@@ -250,7 +250,10 @@ defmodule MqttX.Transport.HandlerQos2Test do
       state = feed(state, 5, %{type: :pubrel, packet_id: 9, reason_code: 0, properties: %{}})
       assert %{type: :pubcomp, packet_id: 9} = sent()
       assert_received {:handle_publish, "ret/q2", "v"}
-      assert [{"ret/q2", "v", 2, _ts, _expiry}] = RetainedStore.match(ctx.retained, "ret/q2")
+
+      assert [{"ret/q2", "v", 2, _ts, _expiry, _props}] =
+               RetainedStore.match(ctx.retained, "ret/q2")
+
       assert state.pending_qos2_rx == %{}
     end
 

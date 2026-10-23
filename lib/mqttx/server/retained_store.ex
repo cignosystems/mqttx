@@ -5,9 +5,12 @@ defmodule MqttX.Server.RetainedStore do
   #
   # Rows are keyed by the topic's segment list in an `:ordered_set`:
   #
-  #     {segments, topic, payload, qos, timestamp, expiry_interval, version}
+  #     {segments, topic, payload, qos, timestamp, expiry_interval, properties, version}
   #
   # `timestamp` (seconds) is when the message was stored, for Message Expiry;
+  # `properties` are the PUBLISH properties a subscriber receives with the
+  # message (MQTT-3.3.2-4, -15, -16, -17, -20), less Message Expiry, which
+  # is recomputed on delivery from `timestamp` and `expiry_interval`;
   # `version` (`{microseconds, node, unique}`) orders writes across nodes. On
   # a distributed node a clear leaves its row behind with a `nil` payload,
   # so a replica written before the clear — from a node that missed it while
@@ -106,7 +109,7 @@ defmodule MqttX.Server.RetainedStore do
 
     cond do
       payload in [nil, <<>>] ->
-        row = {segments, Topic.flatten(segments), nil, 0, now, nil, version}
+        row = {segments, Topic.flatten(segments), nil, 0, now, nil, %{}, version}
 
         # Only another node can hold a stale copy to bring back
         if Node.alive?(), do: :ets.insert(table, row), else: :ets.delete(table, segments)
@@ -121,8 +124,13 @@ defmodule MqttX.Server.RetainedStore do
         :dropped
 
       true ->
-        expiry_interval = Map.get(properties || %{}, :message_expiry_interval)
-        row = {segments, Topic.flatten(segments), payload, qos, now, expiry_interval, version}
+        properties = properties || %{}
+        expiry_interval = Map.get(properties, :message_expiry_interval)
+
+        row =
+          {segments, Topic.flatten(segments), payload, qos, now, expiry_interval,
+           forwarded_properties(properties), version}
+
         :ets.insert(table, row)
         {:ok, row}
     end
@@ -136,7 +144,7 @@ defmodule MqttX.Server.RetainedStore do
 
     time =
       case existing do
-        [{_, _, _, _, _, _, {time, _, _}}] when time >= now -> time + 1
+        [{_, _, _, _, _, _, _, {time, _, _}}] when time >= now -> time + 1
         _ -> now
       end
 
@@ -149,9 +157,9 @@ defmodule MqttX.Server.RetainedStore do
   applies to messages on topics new here.
   """
   @spec apply_replica(table(), tuple(), pos_integer() | nil) :: :ok
-  def apply_replica(table, {segments, _, payload, _, _, _, version} = row, max) do
+  def apply_replica(table, {segments, _, payload, _, _, _, _, version} = row, max) do
     case :ets.lookup(table, segments) do
-      [{_, _, _, _, _, _, existing}] when existing >= version ->
+      [{_, _, _, _, _, _, _, existing}] when existing >= version ->
         :ok
 
       [] when max != nil and payload != nil ->
@@ -170,7 +178,7 @@ defmodule MqttX.Server.RetainedStore do
     cutoff = System.system_time(:microsecond) - ttl * 1_000_000
 
     :ets.select_delete(table, [
-      {{:_, :_, nil, :_, :_, :_, {:"$1", :_, :_}}, [{:<, :"$1", cutoff}], [true]}
+      {{:_, :_, nil, :_, :_, :_, :_, {:"$1", :_, :_}}, [{:<, :"$1", cutoff}], [true]}
     ])
   end
 
@@ -191,13 +199,13 @@ defmodule MqttX.Server.RetainedStore do
 
   @doc """
   Return the non-expired retained messages matching a subscription filter, as
-  `{topic, payload, qos, timestamp, expiry_interval}` tuples.
+  `{topic, payload, qos, timestamp, expiry_interval, properties}` tuples.
 
   Expired entries encountered along the way are deleted. Per §4.7.2, a filter
   whose first level is a wildcard does not match `$`-prefixed topics.
   """
   @spec match(table(), binary() | Topic.normalized_topic()) ::
-          [{binary(), binary(), 0 | 1 | 2, integer() | nil, non_neg_integer() | nil}]
+          [{binary(), binary(), 0 | 1 | 2, integer() | nil, non_neg_integer() | nil, map()}]
   def match(table, filter) do
     filter = Topic.normalize(filter)
     now = System.system_time(:second)
@@ -205,11 +213,11 @@ defmodule MqttX.Server.RetainedStore do
     candidates =
       if Topic.wildcard?(filter) do
         :ets.select(table, [
-          {{key_pattern(filter), :_, :"$1", :_, :_, :_, :_}, [{:"=/=", :"$1", nil}], [:"$_"]}
+          {{key_pattern(filter), :_, :"$1", :_, :_, :_, :_, :_}, [{:"=/=", :"$1", nil}], [:"$_"]}
         ])
       else
         # An all-literal filter is exactly a key
-        for {_, _, payload, _, _, _, _} = row <- :ets.lookup(table, filter),
+        for {_, _, payload, _, _, _, _, _} = row <- :ets.lookup(table, filter),
             payload != nil,
             do: row
       end
@@ -219,16 +227,16 @@ defmodule MqttX.Server.RetainedStore do
     # still purged (this lazy delete is the store's only expiry sweep, and a
     # store pinned at its cap by expired rows would otherwise never recover).
     {live, expired} =
-      Enum.split_with(candidates, fn {_key, _topic, _payload, _qos, ts, exp, _version} ->
+      Enum.split_with(candidates, fn {_key, _topic, _payload, _qos, ts, exp, _props, _version} ->
         not expired?(ts, exp, now)
       end)
 
-    Enum.each(expired, fn {key, _, _, _, _, _, _} -> :ets.delete(table, key) end)
+    Enum.each(expired, fn {key, _, _, _, _, _, _, _} -> :ets.delete(table, key) end)
 
     live
     |> reject_dollar_topics(filter)
-    |> Enum.map(fn {_key, topic, payload, qos, ts, exp, _version} ->
-      {topic, payload, qos, ts, exp}
+    |> Enum.map(fn {_key, topic, payload, qos, ts, exp, props, _version} ->
+      {topic, payload, qos, ts, exp, props}
     end)
   end
 
@@ -245,12 +253,18 @@ defmodule MqttX.Server.RetainedStore do
   # level is already bound in the select pattern.
   defp reject_dollar_topics(rows, [first | _]) when first in [:single_level, :multi_level] do
     Enum.reject(rows, fn
-      {[<<"$", _::binary>> | _], _, _, _, _, _, _} -> true
+      {[<<"$", _::binary>> | _], _, _, _, _, _, _, _} -> true
       _ -> false
     end)
   end
 
   defp reject_dollar_topics(rows, _filter), do: rows
+
+  # Topic Alias is the publisher's connection state and a Subscription
+  # Identifier belongs to each subscriber's subscription (§3.3.4), so neither
+  # is kept; Message Expiry has its own column
+  defp forwarded_properties(properties),
+    do: Map.drop(properties, [:topic_alias, :subscription_identifier, :message_expiry_interval])
 
   defp expired?(nil, _exp, _now), do: false
   defp expired?(_ts, nil, _now), do: false

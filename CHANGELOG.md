@@ -45,7 +45,8 @@ All notable changes to this project will be documented in this file.
   file; `MqttX.Server.SessionBackend.Replicated` keeps them on every node of
   the cluster, in memory, so another node resumes a dead node's sessions
   (not across a restart of the whole cluster); a backend over a shared
-  database does both.
+  database does both — the server guide has a worked Ecto/Postgres one. A
+  save that fails (the database is down) is retried at the next flush.
 
 ### Fixed
 

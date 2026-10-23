@@ -580,7 +580,8 @@ unacknowledged QoS 1/2 messages re-sent, and whatever `deliver/3` queued while
 it was away. Sessions are kept for at most `max_session_expiry_interval`
 (default one day), in memory on the node holding them; a `session_backend`
 (e.g. `MqttX.Server.SessionBackend.DETS`) saves them across restarts;
-`MqttX.Server.SessionBackend.Replicated` keeps them on every node of a cluster.
+`MqttX.Server.SessionBackend.Replicated` keeps them on every node of a cluster,
+and the server guide has an Ecto/Postgres backend for a database.
 
 **Clustering:** listeners started with the same `:name` on connected nodes
 act as one broker — `deliver/3` reaches every node, a session follows its

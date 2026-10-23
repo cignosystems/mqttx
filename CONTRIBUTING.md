@@ -95,8 +95,8 @@ ordered roughly by ratio of impact to effort.
 
 - **Clustering follow-ups.** The phases in `docs/design/clustering.md` are
   done; its "Later" list has what remains (exactly-once shared delivery
-  across a node loss, merging session copies after a split, a database
-  backend example). `test/mqttx/cluster_test.exs` and
+  across a node loss, merging session copies after a split).
+  `test/mqttx/cluster_test.exs` and
   `cluster_split_test.exs` run real nodes with `:peer` (needs epmd).
 
 ### Smaller polish (low risk, do whenever)

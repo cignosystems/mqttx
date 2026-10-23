@@ -118,7 +118,8 @@ and what was queued for it. Sessions are capped at
 `:max_session_expiry_interval` (default one day) and live in memory on the
 node holding them, unless the listener has a `:session_backend`
 (`MqttX.Server.SessionBackend`; `MqttX.Server.SessionBackend.DETS` and,
-for a cluster, `MqttX.Server.SessionBackend.Replicated` built in).
+for a cluster, `MqttX.Server.SessionBackend.Replicated` built in; the
+server guide has an Ecto/Postgres one for a database).
 
 Listeners started with the same `:name` on connected nodes act as one broker
 (`MqttX.Server.Cluster`, unreleased — 0.13): `deliver/3,4` reaches every node,

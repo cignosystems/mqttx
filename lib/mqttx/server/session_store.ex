@@ -49,6 +49,8 @@ defmodule MqttX.Server.SessionStore do
   # The per-client tables are keyed `{client_id, …}` so one client's rows are
   # a contiguous range an `:ets.select/2` with a bound prefix walks directly.
 
+  require Logger
+
   alias MqttX.Topic
 
   defstruct [
@@ -1044,19 +1046,33 @@ defmodule MqttX.Server.SessionStore do
   def flush(%{backend: nil}), do: :ok
 
   def flush(%{backend: {module, state}} = store) do
-    for {client_id} <- :ets.tab2list(store.dirty) do
+    Enum.reduce_while(:ets.tab2list(store.dirty), :ok, fn {client_id}, :ok ->
       :ets.delete(store.dirty, client_id)
 
-      case :ets.lookup(store.sessions, client_id) do
-        # On its way here, or gone from here: the node that has it saves it
-        [{_, %{placeholder: true}}] -> :ok
-        [{_, %{moved_to: _}}] -> :ok
-        [] -> delete_saved(module, state, client_id)
-        _ -> save(module, state, client_id, export(store, client_id))
-      end
-    end
+      try do
+        case :ets.lookup(store.sessions, client_id) do
+          # On its way here, or gone from here: the node that has it saves it
+          [{_, %{placeholder: true}}] -> :ok
+          [{_, %{moved_to: _}}] -> :ok
+          [] -> delete_saved(module, state, client_id)
+          _ -> save(module, state, client_id, export(store, client_id))
+        end
 
-    :ok
+        {:cont, :ok}
+      rescue
+        e -> retry_later(store, module, client_id, Exception.message(e))
+      catch
+        :exit, reason -> retry_later(store, module, client_id, inspect(reason))
+      end
+    end)
+  end
+
+  # Marked again, and the rest keep their marks: the next flush retries, so
+  # a backend that is down (a database) loses nothing
+  defp retry_later(store, module, client_id, why) do
+    :ets.insert(store.dirty, {client_id})
+    Logger.warning("[MqttX.Server.SessionStore] sessions not saved to #{inspect(module)}: #{why}")
+    {:halt, :ok}
   end
 
   defp save(module, state, client_id, nil), do: delete_saved(module, state, client_id)

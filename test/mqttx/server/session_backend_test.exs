@@ -12,6 +12,31 @@ defmodule MqttX.Server.SessionBackendTest do
     {:ok, path: Path.join(dir, "sessions.dets")}
   end
 
+  # A backend over a store that can be down, as a database can
+  defmodule Flaky do
+    @behaviour MqttX.Server.SessionBackend
+
+    def init(_listener, opts), do: {:ok, Keyword.fetch!(opts, :agent)}
+
+    def save(agent, client_id, record) do
+      if Agent.get(agent, & &1.down), do: raise("database down")
+      Agent.update(agent, &put_in(&1.saved[client_id], record))
+    end
+
+    def load(agent, client_id) do
+      case Agent.get(agent, & &1.saved[client_id]) do
+        nil -> :none
+        record -> {:ok, record}
+      end
+    end
+
+    def delete(agent, client_id) do
+      Agent.update(agent, &%{&1 | saved: Map.delete(&1.saved, client_id)})
+    end
+
+    def list(agent), do: Agent.get(agent, &Map.to_list(&1.saved))
+  end
+
   defp meta(overrides \\ %{}) do
     Map.merge(
       %{protocol_version: 5, expires_at: :infinity, persistent: true, lifetime: 60},
@@ -115,6 +140,23 @@ defmodule MqttX.Server.SessionBackendTest do
       :ok = SessionStore.hold(store, "arriving", System.system_time(:millisecond) + 10_000)
       :ok = SessionStore.flush(store)
       assert DETS.load(table, "arriving") == :none
+    end
+
+    test "a save that fails leaves the session marked, and the flush goes on next time" do
+      {:ok, agent} = Agent.start_link(fn -> %{down: false, saved: %{}} end)
+      store = SessionStore.new(nil, {Flaky, agent: agent})
+      :ok = SessionStore.put(store, "a", meta())
+      :ok = SessionStore.put(store, "b", meta())
+
+      Agent.update(agent, &%{&1 | down: true})
+      assert :ok = SessionStore.flush(store)
+      assert :ets.info(store.dirty, :size) == 2
+      assert Agent.get(agent, & &1.saved) == %{}
+
+      Agent.update(agent, &%{&1 | down: false})
+      assert :ok = SessionStore.flush(store)
+      assert :ets.info(store.dirty, :size) == 0
+      assert Agent.get(agent, & &1.saved) |> Map.keys() |> Enum.sort() == ["a", "b"]
     end
 
     test "without a backend nothing is tracked or saved" do

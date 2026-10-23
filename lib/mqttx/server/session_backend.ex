@@ -17,7 +17,10 @@ defmodule MqttX.Server.SessionBackend do
 
   Built in: `MqttX.Server.SessionBackend.DETS` (a local file, for one node's
   restarts) and `MqttX.Server.SessionBackend.Replicated` (every node of a
-  cluster, in memory, so another node resumes a dead node's sessions).
+  cluster, in memory, so another node resumes a dead node's sessions). For
+  sessions that survive a restart of the whole cluster, implement the
+  behaviour over a database; the server guide ("Durable sessions") has a
+  worked Ecto/Postgres backend.
 
   ETS stays the working copy: the subscription index and the queues are read
   there, and the backend is written behind it. A session changed since the
@@ -25,6 +28,8 @@ defmodule MqttX.Server.SessionBackend do
   `:session_flush_interval` milliseconds (default 1000), so a node that dies
   loses at most that much of its sessions' changes. Each save is the whole
   record: its subscriptions, its in-flight QoS 1/2 messages and its queue.
+  A `save/3` or `delete/2` that raises is logged, the session stays marked,
+  and the next flush tries again.
 
   ## Records
 

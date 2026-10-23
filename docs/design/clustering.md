@@ -125,7 +125,9 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    `lifetime` kept in its metadata). A record from another node is loaded
    only on CONNECT when no running node holds the session — with a shared
    database that is how a dead node's sessions move. The bundled
-   `SessionBackend.DETS` is a local file.
+   `SessionBackend.DETS` is a local file; the server guide has an
+   Ecto/Postgres backend. A save or delete that raises re-marks the session
+   and ends that flush; the next one retries.
 
 6. **Routes, and relays to send them in order.** Each listener has a few
    relays per node (`Cluster.Relay`, one per scheduler up to 8, started
@@ -231,7 +233,6 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
   carried over. Wall clocks decide which copy began last.
 - Splits are tested with two nodes on one machine; not under real network
   partitions or with more than two nodes.
-- A database backend example (Ecto/Postgres) in the guides.
 
 ## Operational notes
 

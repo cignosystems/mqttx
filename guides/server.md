@@ -400,8 +400,141 @@ for one node's restarts. `MqttX.Server.SessionBackend.Replicated` keeps every
 saved session on every node of the cluster, in memory, so a client whose
 node goes down resumes its session on another (at the cost of every node
 holding every persistent session); it does not survive a restart of the
-whole cluster. For both, implement the five-callback behaviour over a
-database.
+whole cluster. For both, put the sessions in a database.
+
+#### A database backend
+
+The behaviour has five callbacks, and a record is an opaque term, so a
+table with the listener, the client id and the record as a binary is
+enough. With Ecto and Postgres:
+
+```elixir
+# priv/repo/migrations/20260101000000_create_mqtt_sessions.exs
+defmodule MyApp.Repo.Migrations.CreateMqttSessions do
+  use Ecto.Migration
+
+  def change do
+    create table(:mqtt_sessions, primary_key: false) do
+      # Client ids are UTF-8 strings of up to 65 535 bytes (§3.1.3.1)
+      add :listener, :text, primary_key: true
+      add :client_id, :text, primary_key: true
+      # The node that saved the record; `expires_at` is null while connected
+      add :node, :text, null: false
+      add :expires_at, :utc_datetime
+      add :record, :binary, null: false
+      add :updated_at, :utc_datetime, null: false
+    end
+
+    create index(:mqtt_sessions, [:node])
+    create index(:mqtt_sessions, [:expires_at])
+  end
+end
+```
+
+```elixir
+defmodule MyApp.MqttSessions do
+  @moduledoc """
+  The broker's sessions in Postgres, through Ecto. Every node reaches the
+  same table, so a session survives the loss of its node and a restart of
+  the whole cluster.
+  """
+
+  @behaviour MqttX.Server.SessionBackend
+
+  import Ecto.Query, only: [from: 2]
+  alias MyApp.Repo
+
+  @table "mqtt_sessions"
+
+  # One table serves every listener; the listener's name is part of the key
+  @impl true
+  def init(listener, _opts), do: {:ok, inspect(listener)}
+
+  @impl true
+  def save(listener, client_id, record) do
+    row = %{
+      listener: listener,
+      client_id: client_id,
+      node: to_string(Map.get(record, :node, node())),
+      expires_at: expires_at(record),
+      record: :erlang.term_to_binary(record),
+      updated_at: DateTime.utc_now(:second)
+    }
+
+    {1, _} =
+      Repo.insert_all(@table, [row],
+        on_conflict: {:replace, [:node, :expires_at, :record, :updated_at]},
+        conflict_target: [:listener, :client_id]
+      )
+
+    :ok
+  end
+
+  @impl true
+  def load(listener, client_id) do
+    query =
+      from(s in @table,
+        where: s.listener == ^listener and s.client_id == ^client_id,
+        select: s.record
+      )
+
+    case Repo.one(query) do
+      nil -> :none
+      binary -> {:ok, :erlang.binary_to_term(binary)}
+    end
+  end
+
+  @impl true
+  def delete(listener, client_id) do
+    Repo.delete_all(
+      from(s in @table, where: s.listener == ^listener and s.client_id == ^client_id)
+    )
+
+    :ok
+  end
+
+  @impl true
+  def list(listener) do
+    query = from(s in @table, where: s.listener == ^listener, select: {s.client_id, s.record})
+    for {client_id, binary} <- Repo.all(query), do: {client_id, :erlang.binary_to_term(binary)}
+  end
+
+  @doc """
+  Delete the sessions whose expiry has passed. Run it periodically (a cron
+  job, Oban, Quantum): the broker deletes an expired session only from a
+  node that held it, and nobody holds the sessions of a node that never
+  came back. A session saved while its client was connected has no expiry
+  here (its clock starts when a node loads it), so the rows of a node
+  retired for good are deleted by `node`.
+  """
+  def sweep do
+    now = DateTime.utc_now()
+    {count, _} = Repo.delete_all(from(s in @table, where: s.expires_at < ^now))
+    count
+  end
+
+  # When a disconnected session ends; nil while its client is connected
+  defp expires_at(%{meta: %{expires_at: at}}) when is_integer(at), do: DateTime.from_unix!(at)
+  defp expires_at(_record), do: nil
+end
+```
+
+```elixir
+MqttX.Server.start_link(MyApp.MqttHandler, [],
+  name: MyApp.Broker,
+  port: 1883,
+  session_backend: MyApp.MqttSessions
+)
+```
+
+The callbacks run from one process per listener and node: `save` and
+`delete` in the flush, once per changed session every
+`:session_flush_interval` ms; `load` on a CONNECT for a session no running
+node holds; `list` when the listener starts. A `save` that raises — the
+database is down — is logged, the session stays marked, and the next flush
+tries again, so nothing is lost while the node lives. Run `sweep/0` from a
+scheduler: the broker deletes an expired session only from a node that
+holds it.
 
 ## Session Expiry
 

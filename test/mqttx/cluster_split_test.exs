@@ -177,9 +177,9 @@ defmodule MqttX.ClusterSplitTest do
     remote_table = :"mqttx_retained_#{remote_port}"
 
     wait_until(fn ->
-      match?([{_, "there", _, _, _}], RetainedStore.match(local_table, "split/r")) and
+      match?([{_, "there", _, _, _, _}], RetainedStore.match(local_table, "split/r")) and
         match?(
-          [{_, "there", _, _, _}],
+          [{_, "there", _, _, _, _}],
           :peer.call(ctx.peer, RetainedStore, :match, [remote_table, "split/r"])
         )
     end)

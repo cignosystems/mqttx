@@ -135,4 +135,49 @@ defmodule MqttX.WillRetainedE2ETest do
       stop(ctx, [sub])
     end
   end
+
+  describe "retained messages (§3.3.1.3)" do
+    test "are delivered on SUBSCRIBE with the properties they were published with", ctx do
+      pub = connect(ctx.port, "retain-pub")
+
+      properties = %{
+        payload_format_indicator: true,
+        content_type: "application/json",
+        response_topic: "replies/1",
+        correlation_data: <<1, 2, 3>>,
+        message_expiry_interval: 300,
+        user_properties: @user_properties
+      }
+
+      :ok =
+        MqttX.Client.publish(pub, "state/lamp", ~s({"on":true}),
+          qos: 1,
+          retain: true,
+          properties: properties
+        )
+
+      # The broker stored it once our own subscription sees it
+      {:ok, [1]} = MqttX.Client.subscribe(pub, "state/lamp", qos: 1)
+      assert_receive {:mqtt_event, :message, {["state", "lamp"], _, _}}, 2_000
+
+      sub = connect(ctx.port, "retain-sub")
+      {:ok, [1]} = MqttX.Client.subscribe(sub, "state/+", qos: 1)
+
+      assert_receive {:mqtt_event, :message, {["state", "lamp"], ~s({"on":true}), packet}},
+                     2_000
+
+      assert packet.retain
+      props = packet.properties
+      # MQTT-3.3.2-4, -15, -16, -17 and -20: forwarded unaltered
+      assert props.payload_format_indicator == true
+      assert props.content_type == "application/json"
+      assert props.response_topic == "replies/1"
+      assert props.correlation_data == <<1, 2, 3>>
+      assert props.user_properties == @user_properties
+      # MQTT-3.3.2-6: the remaining lifetime, not the original interval
+      assert props.message_expiry_interval in 299..300
+
+      stop(ctx, [sub, pub])
+    end
+  end
 end

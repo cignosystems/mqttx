@@ -173,6 +173,20 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    leaves, its sessions saved while connected start their expiry clock;
    expired ones are swept on every node.
 
+9. **A network split heals.** While apart, each side runs on its own; a
+   client may connect on both. When a member sees another join, it also
+   sends it the sessions it holds with when each began (`began_at` in the
+   session's metadata: the CONNECT's wall clock and node,
+   `SessionStore.began/1`), in chunks. The receiving node compares them
+   with its own: where its copy began earlier, it takes the connection over
+   (0x8E), cancels the timers and deletes the copy, as a `:clean` claim
+   does. Both sides compare, so exactly one copy survives — last connect
+   wins, as for a live CONNECT; what was queued in the losing copy is
+   lost. Retained rows converge by version (phase 3), shared members and
+   routes are re-sent on join, and the replicated backend keeps the newest
+   version of each record. Join syncs (retained rows, sessions, the
+   replicated backend's table) go 500 rows per message.
+
 ## Costs
 
 - Every CONNECT on a clustered listener waits for one round trip to each
@@ -191,6 +205,12 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
   payload is held there for that round trip.
 - A move keeps a forwarding stub for 5 s and message ids for 15 s on the
   nodes involved; cleared retained topics are kept for an hour.
+- A node joining is sent every node's retained table, session list and
+  shared members, 500 rows per message.
+- Measured (`bench/cluster.exs`, two nodes on one machine, 4 publishers,
+  10 subscribers, QoS 1): subscribers on the publishing node or split
+  across both deliver at 95–98% of the single-node rate, all on the other
+  node at 80–86%.
 - With a backend, one ETS insert per session change and one record save per
   changed session per flush interval; with `Replicated`, every node holds
   every persistent session and each save is sent to every node.
@@ -206,6 +226,11 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
 - A shared delivery to a node that leaves after taking it but before
   answering is delivered again elsewhere (at least once). Exactly once
   across a node loss would need the member's session to outlive the node.
+- After a split heals, the losing copy of a session is discarded, not
+  merged: what was queued in it, or delivered to it while apart, is not
+  carried over. Wall clocks decide which copy began last.
+- Splits are tested with two nodes on one machine; not under real network
+  partitions or with more than two nodes.
 - A database backend example (Ecto/Postgres) in the guides.
 
 ## Operational notes

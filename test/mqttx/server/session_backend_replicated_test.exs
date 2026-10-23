@@ -82,4 +82,25 @@ defmodule MqttX.Server.SessionBackend.ReplicatedTest do
     assert {:ok, _} = Replicated.load(state, "x")
     assert Replicated.load(state, "y") == :none
   end
+
+  test "sessions saved while connected on a node that leaves start their expiry clock" do
+    {state, peer} = open()
+    now = System.system_time(:microsecond)
+
+    deliver(peer, {:save, "gone", record(:b@host), {now, :b@host}})
+    deliver(peer, {:save, "other", record(:c@host), {now, :c@host}})
+
+    ref = :sys.get_state(peer).monitor
+    deliver(peer, {ref, :leave, {Replicated, :x}, [remote_pid(:b@host)]})
+
+    assert {:ok, %{meta: %{expires_at: expires_at}}} = Replicated.load(state, "gone")
+    assert is_integer(expires_at) and expires_at > System.system_time(:second)
+    assert {:ok, %{meta: %{expires_at: :infinity}}} = Replicated.load(state, "other")
+  end
+
+  # A pid of another node, built from its external term format
+  defp remote_pid(node) do
+    name = Atom.to_string(node)
+    :erlang.binary_to_term(<<131, 88, 119, byte_size(name), name::binary, 1::32, 0::32, 1::32>>)
+  end
 end

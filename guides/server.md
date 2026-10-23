@@ -365,6 +365,13 @@ it matches itself. If that takes longer than five seconds (a node not
 answering), the held messages are delivered anyway, and order is no longer
 guaranteed for them.
 
+A network split between nodes leaves each side working on its own: a
+client may connect on both, and each side keeps its retained writes. When
+the nodes reach each other again, a client with a session on both sides
+keeps the one it began last — the other side disconnects its connection
+there (0x8E) and discards that copy, with what was queued in it — and the
+retained messages settle on the later write of each topic.
+
 A session lives on one node at a time, so a node that goes down takes its
 sessions with it — unless the listener has a durable backend the other
 nodes reach too (next section). `docs/design/clustering.md` in the

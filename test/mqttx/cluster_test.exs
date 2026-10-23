@@ -720,6 +720,27 @@ defmodule MqttX.ClusterTest do
     _ = local_port
   end
 
+  test "a joining node gets a retained table larger than one sync message", ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_retained_big_#{System.unique_integer([:positive])}"
+
+    local_port = start_local(name)
+    table = :"mqttx_retained_#{local_port}"
+
+    for i <- 1..1_201,
+        do: RetainedStore.write(table, "big/#{i}", "v#{i}", 0, nil, nil)
+
+    remote_port = start_remote(ctx, name)
+    remote_table = :"mqttx_retained_#{remote_port}"
+
+    wait_until(fn ->
+      :erpc.call(ctx.peer_node, :ets, :info, [remote_table, :size]) == 1_201
+    end)
+
+    assert [{_, "v1201", _, _, _}] =
+             :erpc.call(ctx.peer_node, RetainedStore, :match, [remote_table, "big/1201"])
+  end
+
   test "with the replicated backend, a session outlives the node that held it", ctx do
     if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
     name = :"cluster_durable_#{System.unique_integer([:positive])}"

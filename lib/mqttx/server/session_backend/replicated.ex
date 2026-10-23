@@ -36,6 +36,7 @@ defmodule MqttX.Server.SessionBackend.Replicated do
 
   @scope MqttX.Server.Cluster
   @sweep_interval 60_000
+  @sync_chunk 500
   # How long (s) a deleted session is remembered, so a save of it from
   # before the delete, arriving late, does not bring it back
   @deleted_ttl 3_600
@@ -132,9 +133,11 @@ defmodule MqttX.Server.SessionBackend.Replicated do
     gone = for pid <- pids, not MapSet.member?(still_there, node(pid)), do: node(pid)
     now = System.system_time(:second)
 
-    for {client_id, %{node: node, meta: %{expires_at: :infinity} = meta} = record, version} <-
-          :ets.tab2list(state.table),
-        node in gone do
+    for node <- gone,
+        {client_id, %{meta: meta} = record, version} <-
+          :ets.select(state.table, [
+            {{:_, %{node: node, meta: %{expires_at: :infinity}}, :_}, [], [:"$_"]}
+          ]) do
       expires_at =
         case Map.get(meta, :lifetime) do
           lifetime when is_integer(lifetime) and lifetime < 0xFFFFFFFF -> now + lifetime
@@ -176,10 +179,18 @@ defmodule MqttX.Server.SessionBackend.Replicated do
         do: send(pid, message)
   end
 
+  # A chunk at a time, so a large table is not copied into one message
   defp sync_to(pid, state) when node(pid) != node(),
-    do: send(pid, {:sync, :ets.tab2list(state.table)})
+    do: send_chunks(pid, :ets.select(state.table, [{:_, [], [:"$_"]}], @sync_chunk))
 
   defp sync_to(_pid, _state), do: :ok
+
+  defp send_chunks(_pid, :"$end_of_table"), do: :ok
+
+  defp send_chunks(pid, {rows, continuation}) do
+    send(pid, {:sync, rows})
+    send_chunks(pid, :ets.select(continuation))
+  end
 
   # Later than the clock and than the version this node has for the session
   defp next_version(table, client_id) do

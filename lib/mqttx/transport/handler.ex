@@ -2183,7 +2183,9 @@ defmodule MqttX.Transport.Handler do
       protocol_version: protocol_version,
       expires_at: :infinity,
       persistent: lifetime > 0,
-      lifetime: lifetime
+      lifetime: lifetime,
+      # Which of two copies made on both sides of a network split is newer
+      began_at: {System.system_time(:microsecond), node()}
     }
 
     # A session just claimed from another node keeps dropping the copies of

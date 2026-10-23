@@ -27,7 +27,8 @@ Notes for humans and AI assistants modifying this library itself. If you are
   the TLS tests' private CA and `localhost` certificate into
   `test/fixtures/tls/` when the suite starts — the directory is gitignored,
   so no private key is ever committed
-- `bench/` — Benchee suites (`codec.exs`, `server.exs`, `e2e.exs`);
+- `bench/` — Benchee suites (`codec.exs`, `server.exs`, `e2e.exs`) and a
+  cluster throughput run (`cluster.exs`);
   `test/mqttx/load_test.exs` — end-to-end load validation (`--include load`)
 
 ## Running tests
@@ -58,13 +59,16 @@ Notes for humans and AI assistants modifying this library itself. If you are
 
 `bench/` holds [Benchee](https://hex.pm/packages/benchee) suites (dev
 dependency). Each takes `BENCH_TIME` (seconds per scenario) and prints a
-Benchee table; `e2e.exs` adds a messages-per-second summary.
+Benchee table; `e2e.exs` adds a messages-per-second summary. `cluster.exs`
+is a plain timed run (deliveries per second), configured by the variables
+at its top.
 
 ```sh
 mix run bench/codec.exs      # encode/decode per packet type
 mix run bench/server.exs     # Router.match, RetainedStore.match, receive-buffer reassembly
 mix run bench/e2e.exs        # client <-> broker over loopback: uplink QoS 0/1, fan-out 1 -> N
 BENCH_TRANSPORT=ws BENCH_SUBSCRIBERS=20 mix run bench/e2e.exs
+mix run bench/cluster.exs    # deliver throughput across two nodes vs one (needs epmd)
 ```
 
 When a change moves a hot path, refresh the numbers in
@@ -91,8 +95,9 @@ ordered roughly by ratio of impact to effort.
 
 - **Clustering follow-ups.** The phases in `docs/design/clustering.md` are
   done; its "Later" list has what remains (exactly-once shared delivery
-  across a node loss, a database backend example).
-  `test/mqttx/cluster_test.exs` runs real nodes with `:peer` (needs epmd).
+  across a node loss, merging session copies after a split, a database
+  backend example). `test/mqttx/cluster_test.exs` and
+  `cluster_split_test.exs` run real nodes with `:peer` (needs epmd).
 
 ### Smaller polish (low risk, do whenever)
 

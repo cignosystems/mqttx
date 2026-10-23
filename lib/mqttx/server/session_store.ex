@@ -104,8 +104,10 @@ defmodule MqttX.Server.SessionStore do
   # hold/3, mark_moved/4) carries `:placeholder` (claimed here, not arrived
   # yet), `:moved_to`/`:move_ref` (left here, forwarding to its new node)
   # and `:handoff_until` (wall-clock ms until which duplicates are dropped).
+  # `:began_at` is when the connection's CONNECT began it, and where.
   @type meta :: %{
           optional(:lifetime) => non_neg_integer(),
+          optional(:began_at) => {integer(), node()},
           optional(:placeholder) => true,
           optional(:moved_to) => node(),
           optional(:move_ref) => reference(),
@@ -231,6 +233,21 @@ defmodule MqttX.Server.SessionStore do
       _ -> true
     end
   end
+
+  @doc false
+  # When each session here began (its connection's CONNECT), for a node
+  # joining after a network split: `[{client_id, {microseconds, node}}]`
+  def began(store) do
+    for {client_id, meta} <-
+          :ets.select(store.sessions, [{{:"$1", :_}, [{:is_binary, :"$1"}], [:"$_"]}]),
+        not Map.has_key?(meta, :placeholder),
+        not Map.has_key?(meta, :moved_to),
+        do: {client_id, began_at(meta)}
+  end
+
+  @doc false
+  # Sessions from before `began_at` was kept count as the oldest
+  def began_at(meta), do: Map.get(meta, :began_at, {0, nil})
 
   @doc "Set when the session ends (`:infinity` while it is connected or never expires)."
   @spec set_expiry(t(), client_id(), :infinity | integer()) :: :ok

@@ -34,6 +34,10 @@ All notable changes to this project will be documented in this file.
     session is gone, or the node leaves before answering, the next member is
     picked, a connected one first (a message the leaving node took just
     before can then arrive twice).
+  - After a network split heals, a client that connected on both sides
+    keeps the session it began last; the other copy's connection is
+    disconnected with 0x8E and the copy discarded. Retained messages
+    converge on the later write.
 - **Durable broker sessions.** A `:session_backend` option
   (`MqttX.Server.SessionBackend` behaviour) saves sessions behind ETS every
   `:session_flush_interval` ms (default 1000) and loads them back when the

@@ -49,6 +49,7 @@ defmodule MqttX.Server.Cluster do
   alias MqttX.Server.SessionStore
   alias MqttX.Server.WillDelay
 
+  @sync_chunk 500
   @scope __MODULE__
 
   # How long a CONNECT waits for the other nodes to release a session. A
@@ -442,6 +443,16 @@ defmodule MqttX.Server.Cluster do
     {:noreply, state}
   end
 
+  # Sessions another node holds, sent when it joined. A client that connected
+  # on both sides of a network split keeps the session it began last: the
+  # older copy's connection is taken over and the copy dropped, here or
+  # there, whichever holds it
+  def handle_info({:sessions, _node, began}, state) do
+    ctx = state.ctx
+    spawn(fn -> drop_older(ctx, began) end)
+    {:noreply, state}
+  end
+
   def handle_info({ref, :join, _group, pids}, %{monitor: ref} = state) do
     Enum.each(pids, &sync_to(&1, state))
     {:noreply, state}
@@ -513,13 +524,20 @@ defmodule MqttX.Server.Cluster do
     guarded(fn -> SessionStore.flush(state.ctx.sessions) end)
   end
 
+  # The shared subscriptions, the sessions held here, then the retained rows
+  # a chunk at a time
   defp sync_to(pid, state) when node(pid) != node() do
     guarded(fn ->
-      send(
-        pid,
-        {:sync, node(), RetainedStore.rows(state.ctx.retained_table),
-         SessionStore.local_shared(state.ctx.sessions)}
-      )
+      send(pid, {:sync, node(), [], SessionStore.local_shared(state.ctx.sessions)})
+
+      state.ctx.sessions
+      |> SessionStore.began()
+      |> Enum.chunk_every(@sync_chunk)
+      |> Enum.each(&send(pid, {:sessions, node(), &1}))
+
+      RetainedStore.each_chunk(state.ctx.retained_table, @sync_chunk, fn rows ->
+        send(pid, {:sync, node(), rows, []})
+      end)
     end)
   end
 
@@ -634,6 +652,22 @@ defmodule MqttX.Server.Cluster do
     e ->
       Logger.debug("[MqttX.Server.Cluster] claim failed: #{Exception.message(e)}")
       :none
+  end
+
+  defp drop_older(ctx, began) do
+    for {client_id, theirs} <- began,
+        %{} = meta <- [SessionStore.get(ctx.sessions, client_id)],
+        not Map.has_key?(meta, :placeholder),
+        not Map.has_key?(meta, :moved_to),
+        SessionStore.began_at(meta) < theirs do
+      take_over_connections(ctx, client_id)
+      scope = {ctx.retained_table, client_id}
+      WillDelay.cancel(scope)
+      SessionExpiry.cancel(scope)
+      SessionStore.delete(ctx.sessions, client_id)
+    end
+  rescue
+    e -> Logger.debug("[MqttX.Server.Cluster] sessions not compared: #{Exception.message(e)}")
   end
 
   # Forward for a while, then hand over what a fan-out that read the session

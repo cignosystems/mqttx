@@ -174,9 +174,20 @@ defmodule MqttX.Server.RetainedStore do
     ])
   end
 
-  @doc "Every row, cleared ones included, for a node joining the cluster."
-  @spec rows(table()) :: [tuple()]
-  def rows(table), do: :ets.tab2list(table)
+  @doc """
+  Every row, cleared ones included, for a node joining the cluster: `fun` is
+  called with lists of at most `size` rows, so a large table is not copied
+  into one message.
+  """
+  @spec each_chunk(table(), pos_integer(), ([tuple()] -> any())) :: :ok
+  def each_chunk(table, size, fun), do: chunks(:ets.select(table, [{:_, [], [:"$_"]}], size), fun)
+
+  defp chunks(:"$end_of_table", _fun), do: :ok
+
+  defp chunks({rows, continuation}, fun) do
+    fun.(rows)
+    chunks(:ets.select(continuation), fun)
+  end
 
   @doc """
   Return the non-expired retained messages matching a subscription filter, as

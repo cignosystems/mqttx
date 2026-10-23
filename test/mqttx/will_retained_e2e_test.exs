@@ -107,5 +107,32 @@ defmodule MqttX.WillRetainedE2ETest do
 
       stop(ctx, [sub])
     end
+
+    test "a delayed Will is delivered when its Will Delay Interval passes (MQTT-3.1.3-9)", ctx do
+      sub = connect(ctx.port, "delay-sub")
+      {:ok, [1]} = MqttX.Client.subscribe(sub, "will/delayed", qos: 1)
+
+      dying =
+        connect(ctx.port, "will-delayed",
+          # The session must outlive the connection for the delay to apply
+          connect_properties: %{session_expiry_interval: 30},
+          will_topic: "will/delayed",
+          will_payload: "late goodbye",
+          will_qos: 1,
+          will_properties: %{will_delay_interval: 1, user_properties: @user_properties}
+        )
+
+      drop(dying)
+
+      refute_receive {:mqtt_event, :message, {["will", "delayed"], _, _}}, 500
+
+      assert_receive {:mqtt_event, :message, {["will", "delayed"], "late goodbye", packet}},
+                     2_000
+
+      assert packet.properties.user_properties == @user_properties
+      refute Map.has_key?(packet.properties, :will_delay_interval)
+
+      stop(ctx, [sub])
+    end
   end
 end

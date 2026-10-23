@@ -10,14 +10,14 @@ defmodule MqttX.Server.RetainedStoreTest do
   end
 
   defp topics(matches),
-    do: matches |> Enum.map(fn {topic, _, _, _, _} -> topic end) |> Enum.sort()
+    do: matches |> Enum.map(fn {topic, _, _, _, _, _} -> topic end) |> Enum.sort()
 
   describe "store/6" do
     test "stores and overwrites by topic", %{table: table} do
       :ok = RetainedStore.store(table, "sensors/room1/temp", "21.5", 0, %{}, nil)
       :ok = RetainedStore.store(table, "sensors/room1/temp", "22.0", 1, %{}, nil)
 
-      assert [{"sensors/room1/temp", "22.0", 1, _, nil}] =
+      assert [{"sensors/room1/temp", "22.0", 1, _, nil, _}] =
                RetainedStore.match(table, "sensors/room1/temp")
     end
 
@@ -32,7 +32,7 @@ defmodule MqttX.Server.RetainedStoreTest do
     test "accepts a topic as a segment list", %{table: table} do
       :ok = RetainedStore.store(table, ["a", "b"], "x", 0, %{}, nil)
 
-      assert [{"a/b", "x", 0, _, _}] = RetainedStore.match(table, "a/b")
+      assert [{"a/b", "x", 0, _, _, _}] = RetainedStore.match(table, "a/b")
     end
 
     test "caps distinct topics at max but always allows overwrite", %{table: table} do
@@ -49,14 +49,39 @@ defmodule MqttX.Server.RetainedStoreTest do
 
       # Existing topic can still be overwritten at the cap
       :ok = RetainedStore.store(table, "t/1", "a2", 0, %{}, 2)
-      assert [{"t/1", "a2", 0, _, _}] = RetainedStore.match(table, "t/1")
+      assert [{"t/1", "a2", 0, _, _, _}] = RetainedStore.match(table, "t/1")
     end
 
     test "records message_expiry_interval from the properties", %{table: table} do
       :ok = RetainedStore.store(table, "e/t", "x", 0, %{message_expiry_interval: 60}, nil)
 
-      assert [{"e/t", "x", 0, ts, 60}] = RetainedStore.match(table, "e/t")
+      assert [{"e/t", "x", 0, ts, 60, %{}}] = RetainedStore.match(table, "e/t")
       assert is_integer(ts)
+    end
+
+    test "keeps the properties a subscriber receives, not the connection- or subscription-bound ones",
+         %{table: table} do
+      properties = %{
+        payload_format_indicator: true,
+        content_type: "text/plain",
+        response_topic: "r",
+        correlation_data: "c",
+        user_properties: [{"a", "1"}, {"a", "2"}],
+        message_expiry_interval: 60,
+        topic_alias: 3,
+        subscription_identifier: 7
+      }
+
+      :ok = RetainedStore.store(table, "p/t", "x", 0, properties, nil)
+
+      assert [{"p/t", "x", 0, _, 60, stored}] = RetainedStore.match(table, "p/t")
+
+      assert stored ==
+               Map.drop(properties, [
+                 :message_expiry_interval,
+                 :topic_alias,
+                 :subscription_identifier
+               ])
     end
   end
 
@@ -120,7 +145,8 @@ defmodule MqttX.Server.RetainedStoreTest do
       # Insert a row whose timestamp is already past its expiry interval
       :ets.insert(
         table,
-        {["old", "t"], "old/t", "x", 0, System.system_time(:second) - 120, 60, {0, node(), 0}}
+        {["old", "t"], "old/t", "x", 0, System.system_time(:second) - 120, 60, %{},
+         {0, node(), 0}}
       )
 
       :ok = RetainedStore.store(table, "old/live", "y", 0, %{message_expiry_interval: 600}, nil)
@@ -130,9 +156,9 @@ defmodule MqttX.Server.RetainedStoreTest do
     end
 
     test "entries without an expiry never expire", %{table: table} do
-      :ets.insert(table, {["keep", "t"], "keep/t", "x", 0, 0, nil, {0, node(), 0}})
+      :ets.insert(table, {["keep", "t"], "keep/t", "x", 0, 0, nil, %{}, {0, node(), 0}})
 
-      assert [{"keep/t", "x", 0, 0, nil}] = RetainedStore.match(table, "keep/t")
+      assert [{"keep/t", "x", 0, 0, nil, %{}}] = RetainedStore.match(table, "keep/t")
     end
 
     test "expired $-prefixed rows are deleted even by wildcard filters that exclude them",
@@ -141,7 +167,7 @@ defmodule MqttX.Server.RetainedStoreTest do
       # this is the store's only expiry sweep
       :ets.insert(
         table,
-        {["$SYS", "old"], "$SYS/old", "x", 0, System.system_time(:second) - 120, 60,
+        {["$SYS", "old"], "$SYS/old", "x", 0, System.system_time(:second) - 120, 60, %{},
          {0, node(), 0}}
       )
 
@@ -151,11 +177,11 @@ defmodule MqttX.Server.RetainedStoreTest do
   end
 
   describe "replicas from other nodes" do
-    defp older({segments, topic, _payload, qos, ts, exp, {time, node, n}}, new_payload),
-      do: {segments, topic, new_payload, qos, ts, exp, {time - 1, node, n}}
+    defp older({segments, topic, _payload, qos, ts, exp, props, {time, node, n}}, new_payload),
+      do: {segments, topic, new_payload, qos, ts, exp, props, {time - 1, node, n}}
 
-    defp newer({segments, topic, _payload, qos, ts, exp, {time, node, n}}, new_payload),
-      do: {segments, topic, new_payload, qos, ts, exp, {time + 1, node, n}}
+    defp newer({segments, topic, _payload, qos, ts, exp, props, {time, node, n}}, new_payload),
+      do: {segments, topic, new_payload, qos, ts, exp, props, {time + 1, node, n}}
 
     test "the newer write wins, and the cap applies to new topics" do
       table = RetainedStore.new_table()
@@ -163,15 +189,15 @@ defmodule MqttX.Server.RetainedStoreTest do
 
       # Older than what is here: ignored
       :ok = RetainedStore.apply_replica(table, older(row, "old"), nil)
-      assert [{"r/1", "local", _, _, _}] = RetainedStore.match(table, "r/1")
+      assert [{"r/1", "local", _, _, _, _}] = RetainedStore.match(table, "r/1")
 
       # The same write again: ignored
       :ok = RetainedStore.apply_replica(table, row, nil)
-      assert [{"r/1", "local", _, _, _}] = RetainedStore.match(table, "r/1")
+      assert [{"r/1", "local", _, _, _, _}] = RetainedStore.match(table, "r/1")
 
       # Newer: replaces
       :ok = RetainedStore.apply_replica(table, newer(row, "new"), nil)
-      assert [{"r/1", "new", _, _, _}] = RetainedStore.match(table, "r/1")
+      assert [{"r/1", "new", _, _, _, _}] = RetainedStore.match(table, "r/1")
 
       # At the cap, a new topic from elsewhere is not added
       other = put_elem(newer(row, "x"), 0, ["r", "2"]) |> put_elem(1, "r/2")
@@ -182,12 +208,14 @@ defmodule MqttX.Server.RetainedStoreTest do
     test "a write here wins over what it replaces, even from a clock ahead of this one" do
       table = RetainedStore.new_table()
       {:ok, row} = RetainedStore.write(table, "k/1", "a", 0, %{}, nil)
-      {_, _, _, _, _, _, {time, _, _}} = ahead = newer(row, "from the future")
-      ahead = put_elem(ahead, 6, {time + 60_000_000, :other@host, 0})
+      {_, _, _, _, _, _, _, {time, _, _}} = ahead = newer(row, "from the future")
+      ahead = put_elem(ahead, 7, {time + 60_000_000, :other@host, 0})
       :ok = RetainedStore.apply_replica(table, ahead, nil)
 
-      {:ok, {_, _, "b", _, _, _, version}} = RetainedStore.write(table, "k/1", "b", 0, %{}, nil)
-      assert version > elem(ahead, 6)
+      {:ok, {_, _, "b", _, _, _, _, version}} =
+        RetainedStore.write(table, "k/1", "b", 0, %{}, nil)
+
+      assert version > elem(ahead, 7)
     end
 
     test "a clear outranks the message it cleared, wherever it arrives first" do
@@ -212,15 +240,15 @@ defmodule MqttX.Server.RetainedStoreTest do
 
       # A later message on the topic is stored as usual
       {:ok, _} = RetainedStore.write(table, "c/1", "again", 0, %{}, nil)
-      assert [{"c/1", "again", _, _, _}] = RetainedStore.match(table, "c/1")
+      assert [{"c/1", "again", _, _, _, _}] = RetainedStore.match(table, "c/1")
     end
 
     test "cleared topics are forgotten after their time" do
       table = RetainedStore.new_table()
       {:ok, row} = RetainedStore.write(table, "c/1", "x", 0, %{}, nil)
-      {segments, topic, _, qos, ts, exp, {_, node, n}} = row
+      {segments, topic, _, qos, ts, exp, props, {_, node, n}} = row
       hour_ago = System.system_time(:microsecond) - 3_601_000_000
-      :ets.insert(table, {segments, topic, nil, qos, ts, exp, {hour_ago, node, n}})
+      :ets.insert(table, {segments, topic, nil, qos, ts, exp, props, {hour_ago, node, n}})
       {:ok, _} = RetainedStore.write(table, "c/2", "y", 0, %{}, nil)
 
       assert RetainedStore.sweep_cleared(table, 3_600) == 1

@@ -67,6 +67,23 @@ All notable changes to this project will be documented in this file.
   connection down. A successful CONNACK naming a different method is
   refused the same way; one that leaves the method out is still accepted.
   Previously the client handed any method to `handle_auth/3`.
+- **A v5 Will with Will Properties reaches its subscribers.** The broker
+  copied the Will Delay Interval into the Will's PUBLISH, which the encoder
+  now refuses (§2.2.2.2), so a Will that set a Will Delay Interval (even 0)
+  was dropped at every subscriber with "Failed to encode publish". The
+  other Will Properties are sent as before, User Properties in their order
+  (MQTT-3.1.3-10).
+- **A delayed Will can be delivered with `MqttX.Server.deliver/3`.** A Will
+  with a Will Delay Interval is published from `MqttX.Server.WillDelay`,
+  where `deliver/3` found no listener and returned `{:error, :no_listener}`,
+  so a handler routing as the server guide shows never delivered it. The
+  connection's listener is now set for that `handle_publish/4` call.
+- **Retained messages keep their properties.** Only the Message Expiry
+  Interval was stored; a retained message sent on SUBSCRIBE now carries the
+  Payload Format Indicator, Content Type, Response Topic, Correlation Data
+  and User Properties it was published with (MQTT-3.3.2-4, -15, -16, -17,
+  -20). Retained rows (and the rows replicated between cluster nodes) gain
+  a `properties` field before `version`.
 
 ## [0.12.0] - 2026-10-19
 

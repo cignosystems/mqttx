@@ -48,6 +48,16 @@ All notable changes to this project will be documented in this file.
   database does both — the server guide has a worked Ecto/Postgres one. A
   save that fails (the database is down) is retried at the next flush.
 
+### Changed
+
+- **`:server_keep_alive` is a cap, not an override.** It lowers a v5
+  client's Keep Alive to the value when the client asked for more, or for
+  none (0); a client asking for less keeps its own, and CONNACK carries
+  Server Keep Alive only when the value changed. Before, every v5 client was
+  told the configured value, so one that asked for 20 s was made to use 60.
+  Mosquitto's `max_keepalive` behaves the same way. (#9, from
+  @danielschnee's Paho run)
+
 ### Fixed
 
 - **Properties are checked against the packet that carries them

@@ -240,6 +240,15 @@ The keepalive timer resets on every received packet (not just PINGREQ). Clients 
 
 When a keepalive timeout fires, your `handle_disconnect/2` callback receives `:keepalive_timeout` as the reason.
 
+### Capping the Keep Alive (MQTT 5.0)
+
+`server_keep_alive: 30` in `transport_opts` lowers a Keep Alive above 30 s —
+or a client's 0, meaning none — to 30: the CONNACK carries Server Keep Alive
+(§3.2.2.3.14) and the client must use it (MQTT-3.1.2-21). A client asking
+for less keeps its own value. Use it behind a cloud proxy whose idle timeout
+would otherwise cut silent connections. A 3.1.1 client cannot be told, so it
+keeps what it asked for.
+
 ### Idle ceiling
 
 Because MQTT keepalive does not apply when a client connects with

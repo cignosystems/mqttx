@@ -56,7 +56,10 @@ if Code.ensure_loaded?(ThousandIsland) do
       value in CONNACK (§3.2.2.3.2); a 3.1.1 client with CleanSession 0 is
       kept exactly this long (default: 86_400, `:infinity` lifts the cap)
     - `:topic_alias_maximum` - Topic aliases the server accepts (default: 100)
-    - `:server_keep_alive` - Override the client's Keep Alive (MQTT 5.0 only)
+    - `:server_keep_alive` - Cap on the Keep Alive, in seconds: a v5 client
+      asking for more, or for none (0), is told this value in CONNACK
+      (§3.2.2.3.14) and must use it; one asking for less keeps its own. A
+      3.1.1 client cannot be told, so it is not capped
     - `:supported_versions` - Accepted protocol levels (default: `[3, 4, 5]`)
     - `:qos2_retry_interval` / `:qos2_max_retries` - Deprecated and ignored
       since 0.12.0: the broker never re-sends QoS 1/2 packets on a live

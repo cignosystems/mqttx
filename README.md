@@ -377,9 +377,10 @@ if you are running MqttX as the broker.
 - **`clean_session: false` does nothing without `:session_store`.** The flag
   tells the broker to keep state — but for the *client* to resume QoS 1/2
   in-flight on reconnect, you must also pass a `:session_store` module.
-- **Server's `:server_keep_alive` overrides the client.** When set in
-  `transport_opts`, MQTT 5.0 clients use the broker's value regardless of what
-  they sent in CONNECT. Useful for surviving cloud-proxy idle timeouts.
+- **Server's `:server_keep_alive` caps the client.** When set in
+  `transport_opts`, an MQTT 5.0 client asking for a longer Keep Alive (or
+  none) is told the cap in CONNACK and must use it; a shorter one stands.
+  Useful for surviving cloud-proxy idle timeouts.
 - **`:max_packet_size` is enforced both ways.** A client that sends a packet
   larger than the broker's limit gets DISCONNECT 0x95; the reverse is also
   true if the client advertises one in CONNECT properties.

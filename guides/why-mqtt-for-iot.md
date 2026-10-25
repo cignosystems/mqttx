@@ -88,7 +88,7 @@ CONFIG_MQTT_CLEAN_SESSION=1     # Or use MQTT 5.0 session_expiry
 Important notes:
 
 - Zephyr's MQTT library supports MQTT 3.1.1 and 5.0
-- For MQTT 5.0: `server_keep_alive` in CONNACK overrides the client's `CONFIG_MQTT_KEEPALIVE` — set it server-side for fleet control
+- For MQTT 5.0: a `server_keep_alive` cap on the broker lowers a too-long `CONFIG_MQTT_KEEPALIVE` through CONNACK — set it server-side for fleet control
 - For cellular (LTE-M/NB-IoT): use keepalive ≤ 30s to survive cloud proxy idle timeouts (Fly.io, AWS IoT, Azure)
 - Protobuf payloads recommended for cellular bandwidth savings
 
@@ -97,7 +97,7 @@ Important notes:
 When deploying behind a TLS-terminating proxy (Fly.io, AWS NLB, Azure Front Door), ensure:
 
 - Client keepalive < proxy idle timeout (usually 60s)
-- Use `server_keep_alive` transport opt to enforce this server-side for all clients
+- Set the `server_keep_alive` transport option to cap it server-side for v5 clients
 - Fly.io: `internal_port` 8883, TLS terminated by Fly proxy
 
 ---

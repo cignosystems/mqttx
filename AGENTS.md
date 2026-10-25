@@ -349,8 +349,8 @@ Full list in MQTT 5.0 §2.4.
   inter-process messaging is Phoenix.PubSub or `:pg`.
 - **Setting `keepalive` higher than the cloud-proxy idle timeout.** Fly.io,
   AWS NLB, Azure Front Door all idle TCP at ~60s. Use ≤ 30s for cellular IoT
-  or set `server_keep_alive: 30` in `transport_opts` to enforce it server-side
-  for v5 clients.
+  or set `server_keep_alive: 30` in `transport_opts` to cap it server-side
+  for v5 clients (a client asking for less keeps its own).
 - **Assuming retained = "all past messages".** Retain stores the **last**
   message per topic only — it's a "current state" mechanism, not a history.
 - **Ignoring CONNACK reason codes.** By default `connect/1` returns

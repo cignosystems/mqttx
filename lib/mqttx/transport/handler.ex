@@ -174,7 +174,7 @@ defmodule MqttX.Transport.Handler do
           size when is_integer(size) and size > 0 -> size
         end,
       client_max_packet_size: nil,
-      # Server keepalive override (MQTT 5.0) — must be positive integer or nil
+      # Cap on the Keep Alive (MQTT 5.0, §3.2.2.3.14) — a positive integer or nil
       server_keep_alive:
         case Map.get(transport_opts, :server_keep_alive) do
           val when is_integer(val) and val > 0 -> val
@@ -1366,6 +1366,14 @@ defmodule MqttX.Transport.Handler do
     lifetime = session_lifetime(state, protocol_version, requested_sei, packet.clean_session)
     resumed = begin_session(state, packet, protocol_version, lifetime)
 
+    # §3.1.2.10, §3.2.2.3.14: a Keep Alive above the listener's cap, or none
+    # (0), is lowered to the cap and the client is told so; one at or below
+    # it stands. A 3.1.1 client cannot be told, so it is not capped.
+    requested_keep_alive = Map.get(packet, :keep_alive, 0) || 0
+
+    keep_alive =
+      granted_keep_alive(requested_keep_alive, state.server_keep_alive, protocol_version)
+
     # MQTT-4.12.0-5: a successful CONNACK repeats the Authentication Method
     # (and may carry the mechanism's final data); MQTT-4.12.0-6: never
     # otherwise.
@@ -1375,6 +1383,11 @@ defmodule MqttX.Transport.Handler do
         state.auth_method,
         final_auth_data
       )
+
+    connack_props =
+      if keep_alive != requested_keep_alive,
+        do: Map.put(connack_props, :server_keep_alive, keep_alive),
+        else: connack_props
 
     connack_props =
       if protocol_version >= 5 and state.assigned_client_id,
@@ -1397,16 +1410,6 @@ defmodule MqttX.Transport.Handler do
     }
 
     send_packet(state, connack, protocol_version)
-
-    keep_alive = Map.get(packet, :keep_alive, 0) || 0
-
-    # If server overrides keepalive (MQTT 5.0), use that for the timer
-    keep_alive =
-      if state.server_keep_alive && protocol_version >= 5 do
-        state.server_keep_alive
-      else
-        keep_alive
-      end
 
     new_state = %{
       state
@@ -2055,15 +2058,13 @@ defmodule MqttX.Transport.Handler do
         props
       end
 
-    props =
-      if state.server_keep_alive do
-        Map.put(props, :server_keep_alive, state.server_keep_alive)
-      else
-        props
-      end
-
     props
   end
+
+  defp granted_keep_alive(requested, nil, _version), do: requested
+  defp granted_keep_alive(requested, _cap, version) when version < 5, do: requested
+  defp granted_keep_alive(0, cap, _version), do: cap
+  defp granted_keep_alive(requested, cap, _version), do: min(requested, cap)
 
   # Resolve topic alias from PUBLISH properties (MQTT 5.0)
   defp resolve_topic_alias(packet, state) do

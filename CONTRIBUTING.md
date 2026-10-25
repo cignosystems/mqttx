@@ -55,6 +55,16 @@ Notes for humans and AI assistants modifying this library itself. If you are
   mix test --include load
   ```
 
+### As a bare dependency
+
+`scripts/check_bare_dependency.sh` creates a throwaway project that depends
+on mqttx with none of its optional packages and compiles it; a warning or
+error fails it. CI runs it on every matrix pair. The transports and the
+Protobuf codec are compiled only when their package is present
+(`if Code.ensure_loaded?(...)` around the module or the calls), which is what
+keeps it clean — follow that pattern for anything new that calls an optional
+package.
+
 ## Benchmarks
 
 `bench/` holds [Benchee](https://hex.pm/packages/benchee) suites (dev

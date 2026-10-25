@@ -53,6 +53,11 @@ jobs:
       - name: Run tests
         run: mix test
 
+      # A project that depends on mqttx without any of its optional packages
+      # must get no warnings (and no compile error) from it
+      - name: Compile as a bare dependency
+        run: scripts/check_bare_dependency.sh
+
       # Excluded from `mix test` by tag (see test/test_helper.exs): many
       # clients and messages over real sockets, asserting completeness. Runs
       # on every matrix pair because socket behaviour is where OTP versions

@@ -339,7 +339,10 @@ defmodule MqttX.Server do
   """
   @callback handle_session_expired(client_id(), state()) :: :ok
 
+  # handle_connect/3 and handle_connect/4 are alternatives: `use MqttX.Server`
+  # checks that one of them is defined (__before_compile__/1)
   @optional_callbacks [
+    handle_connect: 3,
     handle_connect: 4,
     handle_unsubscribe: 2,
     handle_puback: 2,
@@ -354,6 +357,7 @@ defmodule MqttX.Server do
   defmacro __using__(_opts) do
     quote do
       @behaviour MqttX.Server
+      @before_compile MqttX.Server
 
       @impl true
       def handle_unsubscribe(_topics, state) do
@@ -387,6 +391,24 @@ defmodule MqttX.Server do
                      handle_auth: 3,
                      handle_session_expired: 2
     end
+  end
+
+  @doc false
+  # One of the two handle_connect arities is required; the behaviour cannot
+  # say "one of", so it is checked here, with the same weight as a missing
+  # required callback (a warning)
+  defmacro __before_compile__(env) do
+    defined? = &Module.defines?(env.module, {:handle_connect, &1})
+
+    unless defined?.(3) or defined?.(4) do
+      IO.warn(
+        "#{inspect(env.module)} uses MqttX.Server but defines neither " <>
+          "handle_connect/4 nor handle_connect/3 (one of them is required)",
+        Macro.Env.stacktrace(env)
+      )
+    end
+
+    nil
   end
 
   @doc """

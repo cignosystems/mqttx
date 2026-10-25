@@ -78,6 +78,19 @@ All notable changes to this project will be documented in this file.
   where `deliver/3` found no listener and returned `{:error, :no_listener}`,
   so a handler routing as the server guide shows never delivered it. The
   connection's listener is now set for that `handle_publish/4` call.
+- **mqttx compiles as a dependency without its optional packages.** A
+  project without `thousand_island` could not compile mqttx at all
+  (`use ThousandIsland.Handler`), and one without `ranch` or `protox` got
+  undefined-function warnings from it. The ThousandIsland and Ranch
+  transports, and the Protox calls of `MqttX.Payload.Protobuf`, are now
+  compiled only when their package is present; starting a transport whose
+  package is missing still fails with an undefined-module error naming it,
+  and the codec still answers `:protox_not_available`. A handler defining
+  `handle_connect/4` no longer gets a "required callback handle_connect/3"
+  warning: both arities are optional callbacks of the behaviour, and
+  `use MqttX.Server` warns when a module defines neither. CI compiles mqttx
+  as a bare dependency (`scripts/check_bare_dependency.sh`). (#8, reported
+  by @danielschnee)
 - **Retained messages keep their properties.** Only the Message Expiry
   Interval was stored; a retained message sent on SUBSCRIBE now carries the
   Payload Format Indicator, Content Type, Response Topic, Correlation Data

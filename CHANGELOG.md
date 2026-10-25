@@ -78,6 +78,14 @@ All notable changes to this project will be documented in this file.
   where `deliver/3` found no listener and returned `{:error, :no_listener}`,
   so a handler routing as the server guide shows never delivered it. The
   connection's listener is now set for that `handle_publish/4` call.
+- **A DISCONNECT from the broker reaches the client.** The ThousandIsland
+  and Ranch transports closed the socket right after writing it; with data
+  from the client still unread, Linux turns that close into a TCP reset,
+  and the client could lose the packet and its reason code (0x8E on a
+  takeover, 0x93 on a Receive Maximum overrun). The transports now shut
+  down their write side first, read and drop what the client still sends
+  for up to 100 ms, and close then. (#7, found by @danielschnee with the
+  Paho suite)
 - **mqttx compiles as a dependency without its optional packages.** A
   project without `thousand_island` could not compile mqttx at all
   (`use ThousandIsland.Handler`), and one without `ranch` or `protox` got

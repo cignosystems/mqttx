@@ -593,6 +593,10 @@ end
 
 DISCONNECT packets are only sent for MQTT 5.0 connections. For MQTT 3.1.1, the connection is simply closed.
 
+The packet is made to arrive: the broker half-closes the socket and keeps
+reading for up to 100 ms before closing it, so a client that is still
+sending reads the DISCONNECT and then sees an orderly close, not a reset.
+
 ## MQTT 5.0 Protocol Features
 
 The server automatically handles these MQTT 5.0 features when clients connect with protocol version 5:

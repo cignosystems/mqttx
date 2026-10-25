@@ -265,7 +265,9 @@ defmodule MqttX.Transport.Handler do
     connected = Map.get(state, :connected, false)
     graceful = Map.get(state, :graceful_disconnect, false)
 
-    if connected and not graceful do
+    # Not after a close this side decided on (the transport drains the socket,
+    # then reports the close): that one has been reported
+    if connected and not graceful and not Map.get(state, :session_finished, false) do
       Telemetry.server_client_disconnect(%{client_id: state.client_id, reason: :closed})
     end
 

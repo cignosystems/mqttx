@@ -193,6 +193,14 @@ if Code.ensure_loaded?(ThousandIsland) do
 
       alias MqttX.Transport.Handler, as: Proto
 
+      # After a close this side decided on (a DISCONNECT was just written):
+      # shut down the write side, so the FIN follows the packet, then read and
+      # drop what the client still sends until it closes or this long has
+      # passed. A close with unread data is a TCP reset on Linux, which can
+      # discard the DISCONNECT before the client reads it (#7). The protocol
+      # handler's close work runs when the drain ends (handle_close, once).
+      @drain_ms 100
+
       @impl ThousandIsland.Handler
       def handle_connection(socket, state) do
         send_fn = fn data -> ThousandIsland.Socket.send(socket, data) end
@@ -211,11 +219,13 @@ if Code.ensure_loaded?(ThousandIsland) do
       end
 
       @impl ThousandIsland.Handler
-      def handle_data(data, _socket, state) do
+      def handle_data(_data, _socket, %{draining: _} = state), do: {:continue, state}
+
+      def handle_data(data, socket, state) do
         case Proto.handle_data(data, state) do
           {:ok, s} -> {:continue, s}
-          {:close, _, s} -> {:close, s}
-          {:error, _, s} -> {:close, s}
+          {:close, _, s} -> {:continue, drain(socket, s)}
+          {:error, _, s} -> {:continue, drain(socket, s)}
         end
       end
 
@@ -224,22 +234,37 @@ if Code.ensure_loaded?(ThousandIsland) do
         Proto.handle_close(state)
       end
 
+      # A drain ended by a socket error or by Thousand Island's own read
+      # timeout: a close this side chose, so the protocol's close work, not
+      # its error path
       @impl ThousandIsland.Handler
-      def handle_error(reason, _socket, state) do
-        Proto.handle_error(reason, state)
-      end
+      def handle_error(_reason, _socket, %{draining: _} = state), do: Proto.handle_close(state)
+      def handle_error(reason, _socket, state), do: Proto.handle_error(reason, state)
 
       @impl ThousandIsland.Handler
-      def handle_timeout(_socket, state) do
-        Proto.handle_timeout(state)
-      end
+      def handle_timeout(_socket, %{draining: _} = state), do: Proto.handle_close(state)
+      def handle_timeout(_socket, state), do: Proto.handle_timeout(state)
 
+      # Drained: Thousand Island calls handle_close and closes the socket
       @impl GenServer
+      def handle_info({:mqttx_drained, ref}, {socket, %{draining: ref} = state}),
+        do: {:stop, {:shutdown, :drained}, {socket, state}}
+
+      # Deliveries meanwhile are dropped: the session has been ended
+      def handle_info(_msg, {socket, %{draining: _} = state}), do: {:noreply, {socket, state}}
+
       def handle_info(msg, {socket, state}) do
         case Proto.handle_info(msg, state) do
           {:noreply, s} -> {:noreply, {socket, s}}
-          {:stop, r, s} -> {:stop, r, {socket, s}}
+          {:stop, _reason, s} -> {:noreply, {socket, drain(socket, s)}}
         end
+      end
+
+      defp drain(socket, state) do
+        ThousandIsland.Socket.shutdown(socket, :write)
+        ref = make_ref()
+        Process.send_after(self(), {:mqttx_drained, ref}, @drain_ms)
+        Map.put(state, :draining, ref)
       end
     end
   end

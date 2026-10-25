@@ -190,7 +190,7 @@ if Code.ensure_loaded?(:ranch) do
                opts.sessions
              ) do
           {:ok, proto} ->
-            state = %{proto: proto, socket: socket, transport: transport}
+            state = %{proto: proto, socket: socket, transport: transport, draining: false}
             :gen_server.enter_loop(__MODULE__, [], state)
 
           {:error, :rate_limited} ->
@@ -205,7 +205,30 @@ if Code.ensure_loaded?(:ranch) do
         {:stop, {:not_supported, arg}}
       end
 
+      # After a close this side decided on (see MqttX.Transport.ThousandIsland):
+      # the write side is shut down, what the client still sends is read and
+      # dropped, and the socket is closed when the client closes or after this
+      # long. Deliveries meanwhile are dropped: the session has been ended.
+      @drain_ms 100
+
       @impl GenServer
+      def handle_info({proto_tag, _sock, _data}, %{draining: true} = state)
+          when proto_tag in [:tcp, :ssl] do
+        state.transport.setopts(state.socket, [{:active, :once}])
+        {:noreply, state}
+      end
+
+      def handle_info({closed_tag, _}, %{draining: true} = state)
+          when closed_tag in [:tcp_closed, :ssl_closed],
+          do: finish(state)
+
+      def handle_info({error_tag, _, _reason}, %{draining: true} = state)
+          when error_tag in [:tcp_error, :ssl_error],
+          do: finish(state)
+
+      def handle_info(:drain_timeout, %{draining: true} = state), do: finish(state)
+      def handle_info(_msg, %{draining: true} = state), do: {:noreply, state}
+
       def handle_info({proto_tag, _sock, data}, state) when proto_tag in [:tcp, :ssl] do
         case Proto.handle_data(data, state.proto) do
           {:ok, p} ->
@@ -244,14 +267,24 @@ if Code.ensure_loaded?(:ranch) do
       # the connected/graceful_disconnect flags.
       defp stop_with_close(state) do
         {:shutdown, p} = Proto.handle_close(state.proto)
-        state.transport.close(state.socket)
-        {:stop, :normal, %{state | proto: p}}
+        drain(%{state | proto: p})
       end
 
       defp stop_with_error(reason, state) do
         {:shutdown, p} = Proto.handle_error(reason, state.proto)
+        drain(%{state | proto: p})
+      end
+
+      defp drain(state) do
+        state.transport.shutdown(state.socket, :write)
+        state.transport.setopts(state.socket, [{:active, :once}])
+        Process.send_after(self(), :drain_timeout, @drain_ms)
+        {:noreply, %{state | draining: true}}
+      end
+
+      defp finish(state) do
         state.transport.close(state.socket)
-        {:stop, :normal, %{state | proto: p}}
+        {:stop, :normal, state}
       end
     end
   end

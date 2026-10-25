@@ -616,6 +616,10 @@ Clients can use topic aliases to reduce bandwidth by replacing repeated topic st
 
 - Advertises `topic_alias_maximum: 100` in CONNACK (configurable via `transport_opts`)
 - Resolves incoming topic aliases: first publish with alias + topic stores the mapping, subsequent publishes with alias only use the stored topic
+- Uses aliases on the PUBLISHes it sends to a client that set Topic Alias
+  Maximum in its CONNECT: the first message on a topic carries topic and
+  alias, later ones the alias alone, up to the client's maximum
+  (`outbound_topic_aliases: false` in `transport_opts` turns this off)
 - No application code needed — alias resolution is transparent to your handler callbacks
 
 ### Flow Control (Receive Maximum)

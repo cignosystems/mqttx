@@ -48,6 +48,13 @@ All notable changes to this project will be documented in this file.
   database does both — the server guide has a worked Ecto/Postgres one. A
   save that fails (the database is down) is retried at the next flush.
 
+- **Topic Aliases from the broker.** A PUBLISH to a v5 client that set a
+  Topic Alias Maximum carries an alias (§3.3.2.3.4): the first message on a
+  topic the topic and its alias, later ones the alias alone, up to the
+  client's maximum. The alias is put on at send time only, so a stored or
+  re-sent message always has its topic. `outbound_topic_aliases: false` in
+  `transport_opts` turns it off. (#10, from @danielschnee's Paho run)
+
 ### Changed
 
 - **`:server_keep_alive` is a cap, not an override.** It lowers a v5

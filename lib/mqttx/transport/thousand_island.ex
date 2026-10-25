@@ -56,6 +56,9 @@ if Code.ensure_loaded?(ThousandIsland) do
       value in CONNACK (§3.2.2.3.2); a 3.1.1 client with CleanSession 0 is
       kept exactly this long (default: 86_400, `:infinity` lifts the cap)
     - `:topic_alias_maximum` - Topic aliases the server accepts (default: 100)
+    - `:outbound_topic_aliases` - Put Topic Aliases on the PUBLISHes sent to a
+      v5 client that allows them, up to its Topic Alias Maximum (§3.3.2.3.4;
+      default: `true`)
     - `:server_keep_alive` - Cap on the Keep Alive, in seconds: a v5 client
       asking for more, or for none (0), is told this value in CONNACK
       (§3.2.2.3.14) and must use it; one asking for less keeps its own. A

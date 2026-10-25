@@ -156,10 +156,13 @@ defmodule MqttX.Transport.Handler do
           n when is_integer(n) and n > 0 -> n
           _ -> @default_max_retained
         end,
-      # Topic aliases (MQTT 5.0)
+      # Topic aliases (MQTT 5.0): the client's, resolved on its PUBLISHes, and
+      # this side's, put on PUBLISHes to a client that allows them
       topic_alias_to_topic: %{},
       server_topic_alias_maximum: Map.get(transport_opts, :topic_alias_maximum, 100),
       client_topic_alias_maximum: 0,
+      outbound_topic_aliases: Map.get(transport_opts, :outbound_topic_aliases, true),
+      topic_to_alias: %{},
       # Flow control
       server_receive_maximum: Map.get(transport_opts, :receive_maximum, 65535),
       client_receive_maximum: 65535,
@@ -2001,7 +2004,11 @@ defmodule MqttX.Transport.Handler do
     # Check client max packet size before sending
     version = state.protocol_version || 4
 
-    case Codec.encode_iodata(version, packet) do
+    # On the wire with a Topic Alias when the client allows them; `packet`
+    # keeps its topic, so a re-send on a later connection (§4.4) is whole
+    {wire, aliases} = outbound_alias(packet, state)
+
+    case Codec.encode_iodata(version, wire) do
       {:ok, data} ->
         encoded_size = IO.iodata_length(data)
 
@@ -2012,6 +2019,8 @@ defmodule MqttX.Transport.Handler do
           if qos > 0, do: %{state | next_packet_id: packet_id}, else: state
         else
           state.send_fn.(data)
+          # The client has learned a new alias only now that it was sent
+          state = %{state | topic_to_alias: aliases}
 
           # Track outgoing QoS > 0 publishes until the client acknowledges
           # them: they hold Receive Maximum capacity (§3.3.4) and are what a
@@ -2037,6 +2046,38 @@ defmodule MqttX.Transport.Handler do
         state
     end
   end
+
+  # §3.3.2.3.4: a v5 client's Topic Alias Maximum lets this side put aliases
+  # on the PUBLISHes it sends. The first PUBLISH on a topic carries the topic
+  # and its alias, later ones the alias alone; aliases are handed out in
+  # order up to the maximum and never reused, which keeps the hot topics
+  # short. The map is connection state: gone with the connection, never in a
+  # stored message. Returns the packet to send and the map after it.
+  defp outbound_alias(
+         %{topic: topic, properties: properties} = packet,
+         %{protocol_version: 5, outbound_topic_aliases: true, client_topic_alias_maximum: max} =
+           state
+       )
+       when max > 0 do
+    key = if is_list(topic), do: MqttX.Topic.flatten(topic), else: topic
+    aliases = state.topic_to_alias
+
+    case Map.fetch(aliases, key) do
+      {:ok, alias} ->
+        {%{packet | topic: "", properties: Map.put(properties, :topic_alias, alias)}, aliases}
+
+      :error when map_size(aliases) < max ->
+        alias = map_size(aliases) + 1
+
+        {%{packet | properties: Map.put(properties, :topic_alias, alias)},
+         Map.put(aliases, key, alias)}
+
+      :error ->
+        {packet, aliases}
+    end
+  end
+
+  defp outbound_alias(packet, state), do: {packet, state.topic_to_alias}
 
   # Build CONNACK properties for MQTT 5.0
   defp build_connack_properties(version, _state) when version < 5, do: %{}

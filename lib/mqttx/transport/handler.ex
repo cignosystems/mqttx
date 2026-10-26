@@ -789,8 +789,6 @@ defmodule MqttX.Transport.Handler do
           properties: %{}
         }
 
-        send_packet(state, suback, state.protocol_version)
-
         # A rejected filter is not established: it gets no retained delivery
         # and is not added to the routing index. (A rejected RE-subscribe
         # leaves any existing subscription for that filter intact, matching
@@ -841,6 +839,11 @@ defmodule MqttX.Transport.Handler do
             SessionStore.subscribe(state.sessions, state.client_id, filter, Map.new(opts))
             Router.subscribe(router, filter, state.client_id, opts)
           end)
+
+        # Acknowledged once the subscriptions are live in the listener-wide
+        # index: whoever publishes after seeing the SUBACK reaches them.
+        # Retained messages follow it (§3.3.1.3 allows either order).
+        send_packet(state, suback, state.protocol_version)
 
         state = deliver_retained_messages(%{state | router: router}, enriched_topics)
 
@@ -897,8 +900,6 @@ defmodule MqttX.Transport.Handler do
           properties: %{}
         }
 
-        send_packet(state, unsuback, state.protocol_version)
-
         subscribed =
           Enum.reduce(packet.topics, state.subscribed_filters, fn topic, acc ->
             MapSet.delete(acc, filter_key(topic))
@@ -910,6 +911,10 @@ defmodule MqttX.Transport.Handler do
             SessionStore.unsubscribe(state.sessions, state.client_id, filter)
             Router.unsubscribe(router, filter, state.client_id)
           end)
+
+        # Acknowledged once the subscriptions are gone from the index, as the
+        # SUBACK is sent once they are in it
+        send_packet(state, unsuback, state.protocol_version)
 
         {:ok,
          %{

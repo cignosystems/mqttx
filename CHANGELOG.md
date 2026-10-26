@@ -95,6 +95,11 @@ All notable changes to this project will be documented in this file.
   where `deliver/3` found no listener and returned `{:error, :no_listener}`,
   so a handler routing as the server guide shows never delivered it. The
   connection's listener is now set for that `handle_publish/4` call.
+- **SUBACK and UNSUBACK are sent once the change is live.** The broker
+  acknowledged a SUBSCRIBE before adding the subscriptions to the index
+  `deliver/3` routes through (and an UNSUBSCRIBE before removing them), so
+  a message published right after the SUBACK could miss the new
+  subscription. Retained messages still follow the SUBACK.
 - **A DISCONNECT from the broker reaches the client.** The ThousandIsland
   and Ranch transports closed the socket right after writing it; with data
   from the client still unread, Linux turns that close into a TCP reset,

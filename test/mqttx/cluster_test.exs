@@ -26,17 +26,20 @@ defmodule MqttX.ClusterTest do
   setup_all do
     case ensure_distributed() do
       :ok ->
+        # Not linked: the setup_all process exits before on_exit runs, and a
+        # linked peer would go with it — before its coverage counts are fetched
         {:ok, peer, node} =
-          :peer.start_link(%{name: :"mqttx_peer_#{System.unique_integer([:positive])}"})
+          :peer.start(%{name: :"mqttx_peer_#{System.unique_integer([:positive])}"})
 
         :ok = :erpc.call(node, :code, :add_paths, [:code.get_path()])
         :ok = :erpc.call(node, Logger, :configure, [[level: :warning]])
+        MqttX.Test.Cover.start(node)
         {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:mqttx])
         {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:thousand_island])
 
-        # The peer is linked to the setup_all process, which may have taken it
-        # down already (it has on Elixir 1.18)
         on_exit(fn ->
+          MqttX.Test.Cover.flush(node)
+
           try do
             :peer.stop(peer)
           catch
@@ -752,6 +755,7 @@ defmodule MqttX.ClusterTest do
 
     :ok = :erpc.call(doomed, :code, :add_paths, [:code.get_path()])
     :ok = :erpc.call(doomed, Logger, :configure, [[level: :warning]])
+    MqttX.Test.Cover.start(doomed)
     {:ok, _} = :erpc.call(doomed, Application, :ensure_all_started, [:mqttx])
     {:ok, _} = :erpc.call(doomed, Application, :ensure_all_started, [:thousand_island])
 
@@ -788,6 +792,7 @@ defmodule MqttX.ClusterTest do
       match?(%{queue: [_]}, SessionStore.load(sessions, "cl-durable"))
     end)
 
+    MqttX.Test.Cover.flush(doomed)
     :peer.stop(peer)
     wait_until(fn -> length(Cluster.members(name)) == 1 end)
 

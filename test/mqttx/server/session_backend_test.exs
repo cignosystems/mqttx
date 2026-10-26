@@ -19,8 +19,11 @@ defmodule MqttX.Server.SessionBackendTest do
     def init(_listener, opts), do: {:ok, Keyword.fetch!(opts, :agent)}
 
     def save(agent, client_id, record) do
-      if Agent.get(agent, & &1.down), do: raise("database down")
-      Agent.update(agent, &put_in(&1.saved[client_id], record))
+      case Agent.get(agent, & &1.down) do
+        :raise -> raise("database down")
+        :exit -> exit(:database_down)
+        false -> Agent.update(agent, &put_in(&1.saved[client_id], record))
+      end
     end
 
     def load(agent, client_id) do
@@ -142,21 +145,23 @@ defmodule MqttX.Server.SessionBackendTest do
       assert DETS.load(table, "arriving") == :none
     end
 
-    test "a save that fails leaves the session marked, and the flush goes on next time" do
-      {:ok, agent} = Agent.start_link(fn -> %{down: false, saved: %{}} end)
-      store = SessionStore.new(nil, {Flaky, agent: agent})
-      :ok = SessionStore.put(store, "a", meta())
-      :ok = SessionStore.put(store, "b", meta())
+    for failure <- [:raise, :exit] do
+      test "a save that fails (#{failure}) leaves the session marked, and the flush goes on next time" do
+        {:ok, agent} = Agent.start_link(fn -> %{down: false, saved: %{}} end)
+        store = SessionStore.new(nil, {Flaky, agent: agent})
+        :ok = SessionStore.put(store, "a", meta())
+        :ok = SessionStore.put(store, "b", meta())
 
-      Agent.update(agent, &%{&1 | down: true})
-      assert :ok = SessionStore.flush(store)
-      assert :ets.info(store.dirty, :size) == 2
-      assert Agent.get(agent, & &1.saved) == %{}
+        Agent.update(agent, &%{&1 | down: unquote(failure)})
+        assert :ok = SessionStore.flush(store)
+        assert :ets.info(store.dirty, :size) == 2
+        assert Agent.get(agent, & &1.saved) == %{}
 
-      Agent.update(agent, &%{&1 | down: false})
-      assert :ok = SessionStore.flush(store)
-      assert :ets.info(store.dirty, :size) == 0
-      assert Agent.get(agent, & &1.saved) |> Map.keys() |> Enum.sort() == ["a", "b"]
+        Agent.update(agent, &%{&1 | down: false})
+        assert :ok = SessionStore.flush(store)
+        assert :ets.info(store.dirty, :size) == 0
+        assert Agent.get(agent, & &1.saved) |> Map.keys() |> Enum.sort() == ["a", "b"]
+      end
     end
 
     test "without a backend nothing is tracked or saved" do

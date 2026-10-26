@@ -55,6 +55,13 @@ Notes for humans and AI assistants modifying this library itself. If you are
   mix test --include load
   ```
 
+### Coverage
+
+`mix test --cover --include cluster` prints per-module line coverage
+(threshold 80%, `mix.exs`). The cluster tests' peer nodes are covered too
+(`MqttX.Test.Cover` starts cover on each peer and fetches its counts before
+it stops), so the halves of a scenario that run on the other node count.
+
 ### As a bare dependency
 
 `scripts/check_bare_dependency.sh` creates a throwaway project that depends

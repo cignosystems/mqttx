@@ -1364,8 +1364,21 @@ defmodule MqttX.Transport.Handler do
     # waits for it to let go before reading what it left in the store. The
     # other nodes of the cluster do the same for their connections and
     # timers, and hand over (or discard) a session they hold.
+    # Registered first, so a CONNECT for the same id that is in flight at the
+    # same time — here or on another node — finds this one and takes it over,
+    # rather than both keeping the session
+    register_session(packet.client_id, state)
     take_over_existing_sessions(packet.client_id, state)
     claim_session(state, packet)
+
+    # The connection taken over ends its session only now: the timers it
+    # starts doing so are cancelled too, or one would end the session this
+    # connection resumes
+    if packet.client_id not in [nil, ""] do
+      scope = timer_scope(state, packet.client_id)
+      MqttX.Server.WillDelay.cancel(scope)
+      MqttX.Server.SessionExpiry.cancel(scope)
+    end
 
     # §3.1.2.4 Clean Start and §3.1.2.11 Session Expiry Interval: whether an
     # existing session is resumed, and how long this one outlives the
@@ -1435,8 +1448,6 @@ defmodule MqttX.Transport.Handler do
         client_receive_maximum: Map.get(connect_props, :receive_maximum, 65535),
         client_max_packet_size: Map.get(connect_props, :maximum_packet_size)
     }
-
-    register_session(packet.client_id, state)
 
     # After CONNACK (MQTT-3.2.0-1): re-send what the resumed session had in
     # flight — the one case re-sending is allowed (MQTT-4.4.0-1) — then what

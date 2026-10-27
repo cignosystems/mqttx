@@ -256,6 +256,14 @@ if Code.ensure_loaded?(ThousandIsland) do
       def handle_info({:mqttx_drained, ref}, {socket, %{draining: ref} = state}),
         do: {:stop, {:shutdown, :drained}, {socket, state}}
 
+      # A new connection for the client is taking the session over: answered
+      # now, not after the drain, so it neither waits out the takeover
+      # deadline nor inherits an expiry timer this side would start later
+      def handle_info({:session_takeover, _} = msg, {socket, %{draining: _} = state}) do
+        {:stop, _reason, state} = Proto.handle_info(msg, state)
+        {:noreply, {socket, state}}
+      end
+
       # Deliveries meanwhile are dropped: the session has been ended
       def handle_info(_msg, {socket, %{draining: _} = state}), do: {:noreply, {socket, state}}
 

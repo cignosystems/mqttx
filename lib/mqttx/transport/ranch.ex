@@ -227,6 +227,13 @@ if Code.ensure_loaded?(:ranch) do
           do: finish(state)
 
       def handle_info(:drain_timeout, %{draining: true} = state), do: finish(state)
+
+      # A takeover is answered during the drain (see MqttX.Transport.ThousandIsland)
+      def handle_info({:session_takeover, _} = msg, %{draining: true} = state) do
+        {:stop, _reason, p} = Proto.handle_info(msg, state.proto)
+        {:noreply, %{state | proto: p}}
+      end
+
       def handle_info(_msg, %{draining: true} = state), do: {:noreply, state}
 
       def handle_info({proto_tag, _sock, data}, state) when proto_tag in [:tcp, :ssl] do

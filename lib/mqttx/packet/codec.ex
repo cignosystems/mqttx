@@ -128,6 +128,16 @@ defmodule MqttX.Packet.Codec do
   # Optimized remaining length decoder
   defp decode_remaining_length(<<0::1, len::7, rest::binary>>), do: {:ok, len, rest}
 
+  # MQTT-1.5.5-1: the shortest encoding only
+  defp decode_remaining_length(<<1::1, _::7, 0::1, 0::7, _::binary>>),
+    do: {:error, :malformed_header}
+
+  defp decode_remaining_length(<<1::1, _::7, 1::1, _::7, 0::1, 0::7, _::binary>>),
+    do: {:error, :malformed_header}
+
+  defp decode_remaining_length(<<1::1, _::7, 1::1, _::7, 1::1, _::7, 0::1, 0::7, _::binary>>),
+    do: {:error, :malformed_header}
+
   defp decode_remaining_length(<<1::1, b1::7, 0::1, b2::7, rest::binary>>),
     do: {:ok, b1 + (b2 <<< 7), rest}
 

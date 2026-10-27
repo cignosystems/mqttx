@@ -55,8 +55,39 @@ All notable changes to this project will be documented in this file.
   re-sent message always has its topic. `outbound_topic_aliases: false` in
   `transport_opts` turns it off. (#10, from @danielschnee's Paho run)
 
+- **Caps on what one client can hold** (from the security review).
+  `:max_subscriptions` (default 10 000) refuses a session's filters past the
+  cap with 0x97; `:max_sessions` (default none) refuses a CONNECT that needs
+  a new session past the cap with 0x97. A topic or filter has at most 128
+  levels (`MqttX.Topic.max_levels/0`): a deeper one does not decode — the
+  subscription index is walked level by level, so a 65 000-level topic was
+  a way to burn CPU on every node with one publish.
+- **WebSocket listener: `:check_origin`** (a list of allowed origins; a
+  browser from another origin gets 403) and a **frame cap** of the packet
+  cap plus the frame header by default. The adapter's own default —
+  unlimited on websock_adapter 0.5, 10 MB on 0.6 — let a frame far past
+  the MQTT cap be buffered before MqttX saw the packet. `scheme: :https`
+  starts from the same TLS baseline as the TCP listeners.
+- **The client tells the broker its limits.** A v5 CONNECT advertises
+  Receive Maximum 100 and the client's Maximum Packet Size unless the
+  caller set them, so a broker drops an oversized message instead of
+  sending one the client would tear the connection down for — and
+  reconnect to receive again, forever.
+
 ### Changed
 
+- **Receive Maximum defaults to 100 on both sides** (was 65 535, the
+  protocol's "no limit"). A QoS 2 message is held whole until PUBREL, so
+  the window times the packet cap is what a peer can make the other side
+  hold: 64 GiB before, 100 MiB now with the default packet cap.
+  `receive_maximum` in `transport_opts` (broker) and `connect_properties`
+  (client) set it.
+- **The client's reconnect backoff starts over only after a connection
+  that held for 30 s.** A broker dropping the client right after CONNACK,
+  or a message the client refuses on every delivery, got a retry every
+  second; the delay now keeps growing to the 30 s maximum.
+- **Decode errors are logged at debug level.** Anyone with a socket can
+  produce them.
 - **`:server_keep_alive` is a cap, not an override.** It lowers a v5
   client's Keep Alive to the value when the client asked for more, or for
   none (0); a client asking for less keeps its own, and CONNACK carries
@@ -67,6 +98,52 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Ranch: a raising handler callback left the session alive forever and
+  dropped the Will.** The adapter neither trapped exits nor had a
+  `terminate/2`, so an exception in `handle_publish` killed the connection
+  with none of its close work: the session kept `expires_at: :infinity`
+  and was never swept, and the Will — the device-offline signal — was
+  lost. On every transport, a `handle_disconnect` or a Will's
+  `handle_publish` that raises no longer stops the session from ending.
+- **A client reconnecting while its previous connection was being drained
+  lost its session.** The adapters dropped the takeover message; the old
+  connection ended the session after the new one had resumed it, and its
+  expiry timer later deleted the live session. Takeovers are answered
+  during the drain, a connection registers itself before taking over (so
+  a concurrent CONNECT for the same id, here or on another node, finds
+  it), and the timers are cancelled again after the takeover.
+- **Clears of retained topics no longer grow the retained table without
+  bound.** An empty retained publish inserted its marker row before the
+  cap check, and markers replicated to every node uncapped: an authorized
+  publisher could fill the table cluster-wide for an hour. Markers count
+  toward the cap like messages.
+- **Before CONNECT, anything but CONNECT or AUTH closes the connection
+  unread.** The packet was decoded first; a 1 MiB SUBSCRIBE from an
+  unauthenticated peer cost tens of MB of heap.
+- **Crash reports show no credentials.** `format_status/1` on the broker's
+  connection processes (the CONNECT, password included, is kept during
+  enhanced authentication; the receive buffer) and on the client
+  (password, proxy credentials, TLS key material, buffer); a socket
+  message shows as its size. A client handler that throws or exits is
+  caught like one that raises, and the failure log no longer prints the
+  message.
+- **The client's WebSocket upgrade and proxy CONNECT have one deadline for
+  the whole response** (5 s), and the upgrade response is capped at 8 KiB;
+  a server dripping bytes held the client process forever.
+- **Cluster housekeeping.** A shared group's round-robin counter goes with
+  its last member (it was kept for the VM's life); a member starting again
+  lowers the fences it finds and releases the messages held for them (a
+  member crash left them held until the session expired); a fence answer
+  for a fence already down keeps no state; a corrupt backend record is
+  logged and dropped instead of stopping the listener's start; a member
+  too busy to import a moved session in time no longer fails the CONNECT;
+  sessions whose expiry passed are swept with or without a backend.
+- **A Remaining Length that is not the shortest encoding is malformed**
+  (MQTT-1.5.5-1).
+- **A broker's strings cannot forge log lines**: reason strings and server
+  references are logged with `inspect/1`.
+- **Docs:** the custom-codec example in `MqttX.Payload` decodes with
+  `binary_to_term/2` and `[:safe]`.
 - **Properties are checked against the packet that carries them
   (§2.2.2.2).** A packet carrying a property its type does not define — a
   Session Expiry Interval on a PUBLISH, a Will Delay Interval on a CONNACK —

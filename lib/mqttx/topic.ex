@@ -57,6 +57,11 @@ defmodule MqttX.Topic do
   """
   # MQTT §1.5.4: 16-bit length-prefixed UTF-8 strings cap at 65535 bytes
   @max_topic_bytes 65_535
+  # Levels per topic. The spec sets none; matching costs grow with the depth
+  # (the subscription index is walked level by level), so a topic of tens of
+  # thousands of levels would be a way to burn CPU on every node. 128 is
+  # what EMQX allows.
+  @max_topic_levels 128
 
   @spec validate(binary() | list()) :: {:ok, normalized_topic()} | {:error, :invalid_topic}
   def validate(topic), do: do_validate(topic, :filter)
@@ -124,6 +129,10 @@ defmodule MqttX.Topic do
       {:error, _} -> false
     end
   end
+
+  @doc "The most levels a topic or filter may have (#{@max_topic_levels})."
+  @spec max_levels() :: pos_integer()
+  def max_levels, do: @max_topic_levels
 
   @doc """
   Normalize a topic to a list.
@@ -262,6 +271,10 @@ defmodule MqttX.Topic do
   # Validation helpers
 
   defp validate_normalized([], _kind) do
+    {:error, :invalid_topic}
+  end
+
+  defp validate_normalized(normalized, _kind) when length(normalized) > @max_topic_levels do
     {:error, :invalid_topic}
   end
 

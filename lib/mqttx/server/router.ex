@@ -111,12 +111,12 @@ defmodule MqttX.Server.Router do
     # Track in by_client index — a resubscribe must not duplicate the entry
     # or inflate the count
     entry = {:normal, normalized}
-    client_entries = Map.get(router.by_client, client, [])
+    client_entries = Map.get(router.by_client, client, MapSet.new())
 
-    if entry in client_entries do
+    if MapSet.member?(client_entries, entry) do
       %{router | trie: trie}
     else
-      by_client = Map.put(router.by_client, client, [entry | client_entries])
+      by_client = Map.put(router.by_client, client, MapSet.put(client_entries, entry))
       %{router | trie: trie, by_client: by_client, count: router.count + 1}
     end
   end
@@ -155,13 +155,13 @@ defmodule MqttX.Server.Router do
 
     # Track in by_client index — a resubscribe must not duplicate the entry
     entry = {:shared, group, normalized}
-    client_entries = Map.get(router.by_client, client, [])
+    client_entries = Map.get(router.by_client, client, MapSet.new())
 
     by_client =
-      if entry in client_entries do
+      if MapSet.member?(client_entries, entry) do
         router.by_client
       else
-        Map.put(router.by_client, client, [entry | client_entries])
+        Map.put(router.by_client, client, MapSet.put(client_entries, entry))
       end
 
     %{router | shared_groups: shared_groups, by_client: by_client}
@@ -192,13 +192,13 @@ defmodule MqttX.Server.Router do
     {trie, removed} = trie_remove(router.trie, normalized, client)
 
     # Update by_client index
-    client_entries = Map.get(router.by_client, client, [])
+    client_entries = Map.get(router.by_client, client, MapSet.new())
 
     new_client_entries =
-      List.delete(client_entries, {:normal, normalized})
+      MapSet.delete(client_entries, {:normal, normalized})
 
     by_client =
-      if new_client_entries == [] do
+      if MapSet.size(new_client_entries) == 0 do
         Map.delete(router.by_client, client)
       else
         Map.put(router.by_client, client, new_client_entries)
@@ -231,13 +231,13 @@ defmodule MqttX.Server.Router do
       end
 
     # Update by_client index
-    client_entries = Map.get(router.by_client, client, [])
+    client_entries = Map.get(router.by_client, client, MapSet.new())
 
     new_client_entries =
-      List.delete(client_entries, {:shared, group, normalized})
+      MapSet.delete(client_entries, {:shared, group, normalized})
 
     by_client =
-      if new_client_entries == [] do
+      if MapSet.size(new_client_entries) == 0 do
         Map.delete(router.by_client, client)
       else
         Map.put(router.by_client, client, new_client_entries)
@@ -251,7 +251,7 @@ defmodule MqttX.Server.Router do
   """
   @spec unsubscribe_all(t(), term()) :: t()
   def unsubscribe_all(router, client) do
-    client_entries = Map.get(router.by_client, client, [])
+    client_entries = Map.get(router.by_client, client, MapSet.new())
 
     # Remove each subscription from its respective structure
     {trie, count_removed, shared_groups} =

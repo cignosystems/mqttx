@@ -191,6 +191,15 @@ defmodule MqttX.Transport.HandlerPathsTest do
     end)
   end
 
+  test "before CONNECT, anything but CONNECT or AUTH closes the connection unread", ctx do
+    # A PUBLISH whose body would not even decode: closed as a protocol
+    # error, not reported as malformed, because it is never decoded
+    assert {:close, :protocol_error, _state} =
+             Proto.handle_data(<<0x30, 2, 0xFF, 0xFF>>, ctx.state)
+
+    assert events(ctx.agent) == []
+  end
+
   test "a Topic Alias the client never mapped is a protocol error (§3.3.2.3.4)", ctx do
     state = connect(ctx.state)
     alias_only = publish("", 0, nil, %{topic_alias: 1})

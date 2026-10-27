@@ -72,4 +72,11 @@ defmodule MqttX.Transport do
   @callback setopts(socket, [:inet.socket_setopt()]) :: :ok | {:error, term()}
 
   @optional_callbacks [getopts: 2, setopts: 2]
+
+  @doc false
+  # TLS options every server listener starts from (TCP and WebSocket alike);
+  # the caller's options are merged over them
+  def tls_baseline do
+    [versions: [:"tlsv1.3", :"tlsv1.2"], secure_renegotiate: true, honor_cipher_order: true]
+  end
 end

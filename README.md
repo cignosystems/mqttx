@@ -530,7 +530,7 @@ Validated against Mosquitto (104 automated protocol tests across TCP and WebSock
 |----------|---------|--------------|
 | `shared_subscription_available` | `1` | No |
 | `topic_alias_maximum` | `100` | Yes (`transport_opts`) |
-| `receive_maximum` | `65535` | Yes (`transport_opts`) |
+| `receive_maximum` | `100` | Yes (`transport_opts`) |
 | `retain_available` | `1` | No |
 | `wildcard_subscription_available` | `1` | No |
 | `subscription_identifier_available` | `1` | No |
@@ -546,7 +546,7 @@ MqttX.Server.start_link(
   [transport_opts: %{
     server_keep_alive: 30,           # override client keepalive (v5)
     topic_alias_maximum: 100,        # max topic aliases
-    receive_maximum: 65535,          # max inflight QoS>0
+    receive_maximum: 100,            # max inflight QoS>0
     max_packet_size: 256_000,        # reject oversized packets
     max_outbound_queue: 10_000,      # publishes queued per session (window + offline)
     max_session_expiry_interval: 86_400  # longest a session outlives its connection

@@ -121,6 +121,11 @@ node holding them, unless the listener has a `:session_backend`
 for a cluster, `MqttX.Server.SessionBackend.Replicated` built in; the
 server guide has an Ecto/Postgres one for a database).
 
+What one client can make the broker hold is bounded by default (1 MiB
+packets, 100 QoS 1/2 messages in flight, 10 000 subscriptions, 10 000 queued
+messages, 128 topic levels); the server guide's "Limits" section lists the
+options. `:max_sessions` is off unless set.
+
 Listeners started with the same `:name` on connected nodes act as one broker
 (`MqttX.Server.Cluster`, unreleased — 0.13): `deliver/3,4` reaches every node,
 a CONNECT on any node takes the client and its session over from the others,

@@ -623,7 +623,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       connack_data = get_last_sent()
       {:ok, {connack, <<>>}} = Codec.decode(5, IO.iodata_to_binary(connack_data))
-      assert connack.properties.receive_maximum == 65535
+      assert connack.properties.receive_maximum == 100
     end
 
     test "advertises maximum_packet_size when configured", ctx do
@@ -2125,7 +2125,7 @@ defmodule MqttX.Transport.HandlerTest do
 
       # 5-byte prefix declaring a ~256 MB body — must be rejected immediately,
       # without waiting for (or accumulating) the body
-      oversized_header = <<3::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
+      oversized_header = <<1::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
 
       assert {:close, :packet_too_large, closed} = Proto.handle_data(oversized_header, state)
       assert closed.buffer == <<>>
@@ -2135,7 +2135,7 @@ defmodule MqttX.Transport.HandlerTest do
       opts = [agent: ctx.agent, transport_opts: %{max_packet_size: 64}]
       {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
 
-      big = <<3::4, 0::4, 200, 1>>
+      big = <<1::4, 0::4, 200, 1>>
       assert {:close, :packet_too_large, _} = Proto.handle_data(big, state)
 
       # a packet under the limit still flows normally
@@ -2164,7 +2164,7 @@ defmodule MqttX.Transport.HandlerTest do
       assert state.server_max_packet_size == nil
 
       # declared-oversize prefix is buffered as incomplete instead of rejected
-      oversized_header = <<3::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
+      oversized_header = <<1::4, 0::4, 0xFF, 0xFF, 0xFF, 0x7F>>
       assert {:ok, buffering} = Proto.handle_data(oversized_header, state)
       assert Buffer.pending?(buffering.buffer)
       assert Buffer.size(buffering.buffer) == byte_size(oversized_header)
@@ -2271,7 +2271,7 @@ defmodule MqttX.Transport.HandlerTest do
       {:ok, state} = Proto.init(TestHandler, opts, ctx.retained_table, nil, ctx.send_fn)
 
       # PUBLISH declaring 200 remaining bytes: type, then a two-byte varint
-      assert {:ok, state} = Proto.handle_data(<<3::4, 0::4>>, state)
+      assert {:ok, state} = Proto.handle_data(<<1::4, 0::4>>, state)
       assert {:ok, state} = Proto.handle_data(<<200>>, state)
       refute Buffer.pending?(state.buffer)
 

@@ -232,6 +232,31 @@ Rate limiting uses ETS with atomic `update_counter` operations, making it lock-f
 
 The server automatically stores retained messages in ETS and delivers them to new subscribers. Publish with an empty payload to clear a retained message.
 
+## Limits
+
+What one client can make the broker hold or do is bounded by default; all
+of it is in `transport_opts`:
+
+| Limit | Option | Default |
+|-------|--------|---------|
+| Packet size, enforced on the declared length before buffering | `:max_packet_size` | 1 MiB |
+| Time to complete CONNECT | `:connect_timeout` | 10 s |
+| Idle socket, whatever the Keep Alive | `:max_idle_timeout` | 15 min |
+| QoS 1/2 messages in flight from the client (held whole until PUBREL at QoS 2) | `:receive_maximum` | 100 |
+| Filters per session (0x97 past it) | `:max_subscriptions` | 10 000 |
+| Sessions per listener, connected or kept (CONNACK 0x97 for a new one past it) | `:max_sessions` | none |
+| Messages queued per session for a client that is away | `:max_outbound_queue` | 10 000 |
+| Retained topics (cleared ones count for an hour) | `:max_retained_messages` | 100 000 |
+| Levels in a topic or filter | — | 128 |
+| Time a session is kept after its connection ends | `:max_session_expiry_interval` | 1 day |
+| Connections per second (all peers together) | `:rate_limit` | none |
+
+`handle_connect/4` decides who may have a session at all and
+`handle_subscribe/2` which filters; the caps above only bound what an
+accepted client can consume. A WebSocket listener also caps a frame at the
+packet size plus its header and can restrict browsers to listed origins
+(`:check_origin`).
+
 ## Keepalive Timeout
 
 The server enforces MQTT keepalive as defined in the spec: if no packet is received from a client within 1.5x the `keep_alive` interval (set in the CONNECT packet), the server disconnects the client and publishes any will message.
@@ -626,7 +651,7 @@ Clients can use topic aliases to reduce bandwidth by replacing repeated topic st
 
 The server enforces `receive_maximum` for incoming QoS 1 and QoS 2 messages:
 
-- Advertises `receive_maximum` in CONNACK (default: 65535, configurable via `transport_opts`)
+- Advertises `receive_maximum` in CONNACK (default: 100, configurable via `transport_opts`; a QoS 2 message is held whole until PUBREL, so the window times the packet cap bounds what a client can make the broker hold)
 - Tracks in-flight QoS 2 messages (between PUBREC and PUBCOMP)
 - A client that sends more QoS > 0 publishes than that is disconnected with
   `0x93` (Receive Maximum exceeded) — the Protocol Error §4.9 prescribes;

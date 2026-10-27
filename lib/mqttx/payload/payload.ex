@@ -42,9 +42,14 @@ defmodule MqttX.Payload do
           {:ok, :erlang.term_to_binary(term)}
         end
 
+        # [:safe]: the bytes come from the network; without it a peer could
+        # fill the atom table or send funs. Even so, External Term Format is
+        # for payloads from peers you trust.
         @impl true
         def decode(binary) do
-          {:ok, :erlang.binary_to_term(binary)}
+          {:ok, :erlang.binary_to_term(binary, [:safe])}
+        rescue
+          ArgumentError -> {:error, :not_a_term}
         end
 
         # Optional: what to tell receivers about the bytes

@@ -284,8 +284,18 @@ defmodule MqttX.Server.Cluster do
     # Whoever is already there learns what this node holds (and tells this
     # node what it holds when it sees the join)
     Enum.each(members, &sync_to(&1, state))
+    release_all_held(ctx)
     Process.send_after(self(), :sweep, @sweep_interval)
     {:ok, schedule_flush(state)}
+  end
+
+  # A member starting again (a restart, a listener restarted under the
+  # name) was waiting on no fence: whatever was held for one goes out now
+  defp release_all_held(ctx) do
+    guarded(fn ->
+      for client_id <- SessionStore.clear_fences(ctx.sessions),
+          do: Delivery.release(ctx, client_id)
+    end)
   end
 
   @impl true
@@ -372,15 +382,21 @@ defmodule MqttX.Server.Cluster do
   end
 
   def handle_info({:fence_done, ref, node, index, count}, state) do
-    fence = Map.get(state.fences, ref, %{done: %{}, counts: %{}, nodes: nil})
+    case Map.fetch(state.fences, ref) do
+      # Answered after the fence came down (a timeout, a node leaving):
+      # nothing to keep
+      :error ->
+        {:noreply, state}
 
-    fence = %{
-      fence
-      | done: Map.update(fence.done, node, MapSet.new([index]), &MapSet.put(&1, index)),
-        counts: Map.put(fence.counts, node, count)
-    }
+      {:ok, fence} ->
+        fence = %{
+          fence
+          | done: Map.update(fence.done, node, MapSet.new([index]), &MapSet.put(&1, index)),
+            counts: Map.put(fence.counts, node, count)
+        }
 
-    {:noreply, check_fence(state, ref, fence)}
+        {:noreply, check_fence(state, ref, fence)}
+    end
   end
 
   # A node that does not answer in time (or the node the session left being
@@ -510,6 +526,9 @@ defmodule MqttX.Server.Cluster do
       guarded(fn ->
         SessionStore.sweep_seen(state.ctx.sessions)
         RetainedStore.sweep_cleared(state.ctx.retained_table, @cleared_ttl)
+        # Sessions whose expiry passed beyond a timer's reach, or that no
+        # timer ever covered (restored ones): with or without a backend
+        SessionStore.sweep(state.ctx.sessions)
       end)
 
       Process.send_after(self(), :sweep, @sweep_interval)

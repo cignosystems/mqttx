@@ -251,6 +251,16 @@ defmodule MqttX.Server.SessionStore do
   # Sessions from before `began_at` was kept count as the oldest
   def began_at(meta), do: Map.get(meta, :began_at, {0, nil})
 
+  @doc false
+  # Sessions here, about: the few bookkeeping keys of the table count too
+  @spec count(t()) :: non_neg_integer()
+  def count(store) do
+    case :ets.info(store.sessions, :size) do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
+  end
+
   @doc "Set when the session ends (`:infinity` while it is connected or never expires)."
   @spec set_expiry(t(), client_id(), :infinity | integer()) :: :ok
   def set_expiry(store, client_id, expires_at) do
@@ -287,10 +297,40 @@ defmodule MqttX.Server.SessionStore do
       :ets.delete(store.subs, {segments, subscriber})
       announce_shared(store, :remove, segments, subscriber, nil)
       announce_route(store, segments, subscriber)
+      drop_shared_counter(store, segments, subscriber)
     end
 
     :ets.select_delete(store.client_subs, [{{{client_id, :_}, :_}, [], [true]}])
     :ets.select_delete(store.inflight, [{{{client_id, :_}, :_, :_}, [], [true]}])
+  end
+
+  # The round-robin counter of a shared group goes with its last member,
+  # here or on another node; a group used once would otherwise leave a row
+  # for the VM's life
+  defp drop_shared_counter(store, segments, {:share, group, _client}) do
+    pattern = {{segments, {:share, group, :_}}, :_}
+
+    if :ets.select_count(store.subs, [{pattern, [], [true]}]) == 0 and
+         :ets.select_count(store.remote, [{pattern, [], [true]}]) == 0 do
+      :ets.delete(store.sessions, {:rr, segments, group})
+    end
+
+    :ok
+  end
+
+  defp drop_shared_counter(_store, _segments, _subscriber), do: :ok
+
+  @doc false
+  # Every fence down and every held message let go: for a member starting
+  # (again) — the fences it was waiting on are no one's now. Returns the
+  # clients that had messages held.
+  @spec clear_fences(t()) :: [client_id()]
+  def clear_fences(store) do
+    :ets.match_delete(store.sessions, {{:fence, :_}, :_})
+
+    store.held
+    |> :ets.select([{{{:"$1", :_}, :_}, [], [:"$1"]}])
+    |> Enum.uniq()
   end
 
   # ---------- Subscriptions ----------
@@ -332,6 +372,7 @@ defmodule MqttX.Server.SessionStore do
         :ets.delete(store.client_subs, {client_id, filter})
         announce_shared(store, :remove, segments, subscriber, nil)
         announce_route(store, segments, subscriber)
+        drop_shared_counter(store, segments, subscriber)
         touch(store, client_id)
 
       [] ->
@@ -1116,23 +1157,49 @@ defmodule MqttX.Server.SessionStore do
 
   def restore(%{backend: {module, state}} = store) do
     Enum.count(module.list(state), fn {client_id, record} ->
-      cond do
-        Map.get(record, :node, node()) != node() ->
-          false
-
-        not live?(record) ->
-          module.delete(state, client_id)
-          false
-
-        :ets.member(store.sessions, client_id) ->
-          false
-
-        true ->
-          import(store, client_id, resumable(record))
-          :ets.delete(store.dirty, client_id)
-          true
-      end
+      restore_record(store, module, state, client_id, record)
     end)
+  end
+
+  # A record that cannot be restored (written by something else, corrupt)
+  # is logged and deleted; the listener still starts
+  defp restore_record(store, module, state, client_id, record) do
+    try do
+      do_restore_record(store, module, state, client_id, record)
+    rescue
+      e ->
+        Logger.warning(
+          "[MqttX.Server.SessionStore] dropping the stored session #{inspect(client_id)}: " <>
+            Exception.message(e)
+        )
+
+        try do
+          module.delete(state, client_id)
+        rescue
+          _ -> :ok
+        end
+
+        false
+    end
+  end
+
+  defp do_restore_record(store, module, state, client_id, record) do
+    cond do
+      Map.get(record, :node, node()) != node() ->
+        false
+
+      not live?(record) ->
+        module.delete(state, client_id)
+        false
+
+      :ets.member(store.sessions, client_id) ->
+        false
+
+      true ->
+        import(store, client_id, resumable(record))
+        :ets.delete(store.dirty, client_id)
+        true
+    end
   end
 
   defp live?(%{meta: %{expires_at: :infinity}}), do: true

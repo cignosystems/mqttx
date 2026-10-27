@@ -404,4 +404,61 @@ defmodule MqttX.Server.SessionStoreTest do
       assert Store.seen?(s, "m", :current, System.system_time(:millisecond) + 10_000)
     end
   end
+
+  describe "housekeeping" do
+    test "a shared group's round-robin counter goes with its last member" do
+      store = Store.new()
+
+      :ok =
+        Store.put(store, "s1", %{
+          protocol_version: 5,
+          expires_at: :infinity,
+          persistent: true
+        })
+
+      :ok =
+        Store.put(store, "s2", %{
+          protocol_version: 5,
+          expires_at: :infinity,
+          persistent: true
+        })
+
+      :ok = Store.subscribe(store, "s1", "$share/g/t", %{qos: 0})
+      :ok = Store.subscribe(store, "s2", "$share/g/t", %{qos: 0})
+
+      # Picking once creates the counter
+      assert [_] = Store.match(store, "t")
+      assert :ets.member(store.sessions, {:rr, ["t"], "g"})
+
+      :ok = Store.unsubscribe(store, "s1", "$share/g/t")
+      assert :ets.member(store.sessions, {:rr, ["t"], "g"})
+
+      :ok = Store.delete(store, "s2")
+      refute :ets.member(store.sessions, {:rr, ["t"], "g"})
+    end
+
+    test "clear_fences lowers every fence and names the clients with held messages" do
+      store = Store.new()
+
+      :ok =
+        Store.put(store, "f1", %{
+          protocol_version: 5,
+          expires_at: :infinity,
+          persistent: true
+        })
+
+      :ets.insert(store.sessions, {{:fence, "f1"}, make_ref()})
+      :ets.insert(store.sessions, {{:fence, "f2"}, make_ref()})
+
+      :ok =
+        Store.hold_message(store, "f1", {make_ref(), "t", "p", %{qos: 0}, 0})
+
+      :ok =
+        Store.hold_message(store, "f1", {make_ref(), "t", "q", %{qos: 0}, 0})
+
+      assert Store.clear_fences(store) == ["f1"]
+      refute Store.fenced?(store, "f1")
+      refute Store.fenced?(store, "f2")
+    end
+  end
 end

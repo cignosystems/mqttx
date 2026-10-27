@@ -134,6 +134,8 @@ defmodule MqttX.Client.Connection do
     pingresp_timer: nil,
     # Pending reconnect timer (avoid stacking timers when several events fire)
     reconnect_timer: nil,
+    # When the current connection got its CONNACK; nil while not connected
+    connected_at: nil,
     # CONNECT sent, CONNACK not yet received (handshake runs through the
     # normal handle_info loop — never a blocking receive)
     connecting: false,
@@ -427,7 +429,13 @@ defmodule MqttX.Client.Connection do
       end
 
     protocol_version = Keyword.get(opts, :protocol_version, 5)
-    connect_properties = Keyword.get(opts, :connect_properties, %{})
+
+    connect_properties =
+      advertised_limits(
+        Keyword.get(opts, :connect_properties, %{}),
+        protocol_version,
+        Keyword.get(opts, :max_packet_size, @default_max_packet_size)
+      )
 
     handler = Keyword.get(opts, :handler)
 
@@ -1128,7 +1136,7 @@ defmodule MqttX.Client.Connection do
         log_reason_string(props)
 
         if server_ref do
-          Logger.info("[MqttX.Client] Server reference: #{server_ref}")
+          Logger.info("[MqttX.Client] Server reference: #{inspect(server_ref)}")
         end
 
         connect_failed(state, {:connack_error, code, %{server_reference: server_ref}})
@@ -1245,7 +1253,7 @@ defmodule MqttX.Client.Connection do
         connack_timer: nil,
         connack_ref: nil,
         connect_telemetry: nil,
-        backoff: Backoff.reset(state.backoff),
+        connected_at: System.monotonic_time(:millisecond),
         keepalive_timer: keepalive_timer,
         pingresp_timer: nil,
         keepalive: keepalive,
@@ -1896,11 +1904,26 @@ defmodule MqttX.Client.Connection do
     # Cancel any pending reconnect so multiple disconnect events (e.g.
     # tcp_closed + tcp_error) don't stack timers.
     if state.reconnect_timer, do: Process.cancel_timer(state.reconnect_timer)
-    {delay, backoff} = Backoff.next(state.backoff)
+
+    # A connection that held for a while starts the backoff over; one that
+    # fell at once — a broker closing right after CONNACK, a message the
+    # client refuses on every delivery — keeps it growing, so a broken pair
+    # does not reconnect in a tight loop
+    backoff =
+      if stable_connection?(state), do: Backoff.reset(state.backoff), else: state.backoff
+
+    {delay, backoff} = Backoff.next(backoff)
     Logger.info("[MqttX.Client] Reconnecting in #{delay}ms")
     timer = Process.send_after(self(), :reconnect, delay)
-    %{state | backoff: backoff, reconnect_timer: timer}
+    %{state | backoff: backoff, reconnect_timer: timer, connected_at: nil}
   end
+
+  @stable_connection_ms 30_000
+
+  defp stable_connection?(%{connected_at: at}) when is_integer(at),
+    do: System.monotonic_time(:millisecond) - at >= @stable_connection_ms
+
+  defp stable_connection?(_state), do: false
 
   defp arm_pingresp_timer(%{keepalive: 0}), do: nil
 
@@ -2035,15 +2058,81 @@ defmodule MqttX.Client.Connection do
     %{state | handler_state: new_hstate}
   rescue
     exception ->
-      Logger.error(
-        "[MqttX.Client] Handler #{inspect(state.handler)} raised on #{inspect(event)}: " <>
-          Exception.format(:error, exception, __STACKTRACE__)
-      )
-
+      log_handler_failure(state, event, :error, exception, __STACKTRACE__)
+      state
+  catch
+    kind, value ->
+      log_handler_failure(state, event, kind, value, __STACKTRACE__)
       state
   end
 
   defp notify_handler(state, _event, _data), do: state
+
+  # Without the callback's arguments: they are the message
+  defp log_handler_failure(state, event, kind, value, stacktrace) do
+    verb =
+      case kind do
+        :error -> "raised"
+        :throw -> "threw"
+        :exit -> "exited"
+      end
+
+    Logger.error(
+      "[MqttX.Client] Handler #{inspect(state.handler)} #{verb} on #{inspect(event)}: " <>
+        "#{Exception.message(Exception.normalize(kind, value))}\n" <>
+        Exception.format_stacktrace(stacktrace)
+    )
+  end
+
+  # Crash reports and :sys.get_status never show credentials, key material
+  # or raw bytes
+  @impl true
+  def format_status(status) do
+    status
+    |> Map.update(:state, nil, &redact/1)
+    |> Map.update(:message, nil, &redact_message/1)
+  end
+
+  defp redact(%__MODULE__{} = state) do
+    %{
+      state
+      | password: redact_secret(state.password),
+        proxy: redact_proxy(state.proxy),
+        ssl_opts: redact_ssl_opts(state.ssl_opts),
+        buffer: redact_bytes(state.buffer)
+    }
+  end
+
+  defp redact(other), do: other
+
+  defp redact_secret(nil), do: nil
+  defp redact_secret(_secret), do: "[redacted]"
+
+  defp redact_proxy(proxy) when is_list(proxy) do
+    case Keyword.get(proxy, :auth) do
+      {user, _password} -> Keyword.put(proxy, :auth, {user, "[redacted]"})
+      _ -> proxy
+    end
+  end
+
+  defp redact_proxy(other), do: other
+
+  defp redact_ssl_opts(opts) when is_list(opts) do
+    Enum.map(opts, fn
+      {key, _value} when key in [:key, :password, :certs_keys] -> {key, "[redacted]"}
+      other -> other
+    end)
+  end
+
+  defp redact_ssl_opts(other), do: other
+
+  defp redact_bytes(data) when is_binary(data), do: {:redacted, byte_size(data)}
+  defp redact_bytes(other), do: other
+
+  defp redact_message({tag, port, data}) when tag in [:tcp, :ssl] and is_binary(data),
+    do: {tag, port, redact_bytes(data)}
+
+  defp redact_message(other), do: other
 
   # Enhanced AUTH callback — handler can return {:continue, auth_data} or :ok
   defp notify_handler_auth(%{handler: handler, handler_state: hstate} = state, reason_code, props)
@@ -2113,6 +2202,27 @@ defmodule MqttX.Client.Connection do
 
   # v5 defaults the Session Expiry Interval to 0 (session ends at network
   # disconnect, §3.1.2.11.2); pre-5 sessions have no expiry of their own.
+  # What this side enforces on inbound traffic is told to the broker in
+  # CONNECT (v5), unless the caller set it: the QoS > 0 window (QoS 2
+  # messages are held whole until PUBREL) and the packet cap, so the broker
+  # drops an oversized message instead of sending one the client would tear
+  # the connection down for
+  @default_receive_maximum 100
+
+  defp advertised_limits(properties, 5, max_packet_size) do
+    properties = Map.put_new(properties, :receive_maximum, @default_receive_maximum)
+
+    case max_packet_size do
+      size when is_integer(size) and size > 0 ->
+        Map.put_new(properties, :maximum_packet_size, size)
+
+      _ ->
+        properties
+    end
+  end
+
+  defp advertised_limits(properties, _version, _max_packet_size), do: properties
+
   defp initial_session_expiry(5, connect_properties),
     do: Map.get(connect_properties || %{}, :session_expiry_interval, 0)
 
@@ -2356,7 +2466,8 @@ defmodule MqttX.Client.Connection do
 
   # Log reason_string from server responses (MQTT 5.0)
   defp log_reason_string(%{reason_string: reason}) when is_binary(reason) and reason != "" do
-    Logger.info("[MqttX.Client] Server reason: #{reason}")
+    # inspect/1: a broker's string must not forge log lines
+    Logger.info("[MqttX.Client] Server reason: #{inspect(reason)}")
   end
 
   defp log_reason_string(_props), do: :ok

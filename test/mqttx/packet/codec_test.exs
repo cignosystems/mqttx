@@ -662,4 +662,14 @@ defmodule MqttX.Packet.CodecTest do
       assert decoded2.type == :pingresp
     end
   end
+
+  describe "strictness the spec asks for" do
+    test "a Remaining Length that is not the shortest encoding is malformed (MQTT-1.5.5-1)" do
+      # PINGREQ with remaining length 0 encoded in two bytes
+      assert {:error, _} = Codec.decode(4, <<0xC0, 0x80, 0x00>>)
+      assert {:ok, {%{type: :pingreq}, <<>>}} = Codec.decode(4, <<0xC0, 0>>)
+      assert {:error, :malformed_varint} = MqttX.Packet.Varint.decode(<<0x80, 0x00>>)
+      assert {:ok, 128, <<>>} = MqttX.Packet.Varint.decode(<<0x80, 0x01>>)
+    end
+  end
 end

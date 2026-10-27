@@ -44,7 +44,9 @@ if Code.ensure_loaded?(ThousandIsland) do
     - `:max_retained_messages` - Cap on distinct retained topics
       (default: 100_000, `:infinity` disables)
     - `:rate_limit` - Options for `MqttX.Server.RateLimiter` (default: none)
-    - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 65535).
+    - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 100;
+      with the packet cap it bounds what a client can make the broker hold
+      before PUBREL).
       A client that exceeds it is disconnected with 0x93 (§4.9)
     - `:max_outbound_queue` - Cap on publishes queued per session: QoS > 0
       publishes waiting for the client's Receive Maximum window, and what
@@ -59,6 +61,11 @@ if Code.ensure_loaded?(ThousandIsland) do
     - `:outbound_topic_aliases` - Put Topic Aliases on the PUBLISHes sent to a
       v5 client that allows them, up to its Topic Alias Maximum (§3.3.2.3.4;
       default: `true`)
+    - `:max_subscriptions` - Filters one session may hold (default: 10_000,
+      `:infinity` lifts it); past it a new filter is refused with 0x97
+    - `:max_sessions` - Sessions this listener keeps, connected or kept for
+      their expiry (default: `:infinity`); a CONNECT needing a new one past
+      it is refused with 0x97
     - `:server_keep_alive` - Cap on the Keep Alive, in seconds: a v5 client
       asking for more, or for none (0), is told this value in CONNACK
       (§3.2.2.3.14) and must use it; one asking for less keeps its own. A
@@ -89,18 +96,9 @@ if Code.ensure_loaded?(ThousandIsland) do
 
       # Secure TLS baseline — user options are merged over it (C1).
       transport_options =
-        if transport_module == ThousandIsland.Transports.SSL do
-          Keyword.merge(
-            [
-              versions: [:"tlsv1.3", :"tlsv1.2"],
-              secure_renegotiate: true,
-              honor_cipher_order: true
-            ],
-            transport_options
-          )
-        else
-          transport_options
-        end
+        if transport_module == ThousandIsland.Transports.SSL,
+          do: Keyword.merge(MqttX.Transport.tls_baseline(), transport_options),
+          else: transport_options
 
       # Create ETS table for retained messages
       retained_table = create_retained_table(port)
@@ -272,6 +270,17 @@ if Code.ensure_loaded?(ThousandIsland) do
           {:noreply, s} -> {:noreply, {socket, s}}
           {:stop, _reason, s} -> {:noreply, {socket, drain(socket, s)}}
         end
+      end
+
+      # Crash reports and :sys.get_status never show a password or raw bytes
+      @impl GenServer
+      def format_status(status) do
+        status
+        |> Map.update(:state, nil, fn
+          {socket, %{} = proto} -> {socket, Proto.redact(proto)}
+          other -> other
+        end)
+        |> Map.update(:message, nil, &Proto.redact_message/1)
       end
 
       defp drain(socket, state) do

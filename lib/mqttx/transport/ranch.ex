@@ -190,7 +190,18 @@ if Code.ensure_loaded?(:ranch) do
                opts.sessions
              ) do
           {:ok, proto} ->
-            state = %{proto: proto, socket: socket, transport: transport, draining: false}
+            # Exits from linked processes arrive as messages (handled as on
+            # ThousandIsland), and terminate/2 runs when this process ends
+            Process.flag(:trap_exit, true)
+
+            state = %{
+              proto: proto,
+              socket: socket,
+              transport: transport,
+              draining: false,
+              closed: false
+            }
+
             :gen_server.enter_loop(__MODULE__, [], state)
 
           {:error, :rate_limited} ->
@@ -252,13 +263,13 @@ if Code.ensure_loaded?(:ranch) do
 
       def handle_info({closed_tag, _}, state) when closed_tag in [:tcp_closed, :ssl_closed] do
         {:shutdown, p} = Proto.handle_close(state.proto)
-        {:stop, :normal, %{state | proto: p}}
+        {:stop, :normal, %{state | proto: p, closed: true}}
       end
 
       def handle_info({error_tag, _, reason}, state)
           when error_tag in [:tcp_error, :ssl_error] do
         {:shutdown, p} = Proto.handle_error(reason, state.proto)
-        {:stop, :normal, %{state | proto: p}}
+        {:stop, :normal, %{state | proto: p, closed: true}}
       end
 
       def handle_info(msg, state) do
@@ -291,7 +302,31 @@ if Code.ensure_loaded?(:ranch) do
 
       defp finish(state) do
         state.transport.close(state.socket)
-        {:stop, :normal, state}
+        {:stop, :normal, %{state | closed: true}}
+      end
+
+      # The process is ending without having closed: an exception in a
+      # handler callback, an exit signal. The protocol handler's close work
+      # runs, so the Will goes out and the session's expiry starts, as it
+      # would on a socket error
+      # Crash reports and :sys.get_status never show a password or raw bytes
+      @impl GenServer
+      def format_status(status) do
+        status
+        |> Map.update(:state, nil, fn
+          %{proto: proto} = state -> %{state | proto: Proto.redact(proto)}
+          other -> other
+        end)
+        |> Map.update(:message, nil, &Proto.redact_message/1)
+      end
+
+      @impl GenServer
+      def terminate(_reason, %{closed: true}), do: :ok
+
+      def terminate(reason, state) do
+        _ = Proto.handle_error(reason, state.proto)
+        state.transport.close(state.socket)
+        :ok
       end
     end
   end

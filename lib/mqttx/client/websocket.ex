@@ -297,21 +297,38 @@ defmodule MqttX.Client.WebSocket do
   defp send_raw(socket, :tcp, data), do: :gen_tcp.send(socket, data)
   defp send_raw(socket, :ssl, data), do: :ssl.send(socket, data)
 
+  # The whole response within one deadline and a size no handshake needs:
+  # a server dripping bytes, or never ending its headers, cannot hold the
+  # connection process here
+  @upgrade_timeout_ms 5_000
+  @max_upgrade_response_bytes 8_192
+
   defp recv_upgrade_response(socket, transport, buffer) do
-    recv_fn =
+    deadline = System.monotonic_time(:millisecond) + @upgrade_timeout_ms
+    recv_upgrade_response(socket, transport, buffer, deadline)
+  end
+
+  defp recv_upgrade_response(_socket, _transport, buffer, _deadline)
+       when byte_size(buffer) > @max_upgrade_response_bytes,
+       do: {:error, :upgrade_response_too_large}
+
+  defp recv_upgrade_response(socket, transport, buffer, deadline) do
+    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    recv =
       case transport do
-        :tcp -> fn -> :gen_tcp.recv(socket, 0, 5000) end
-        :ssl -> fn -> :ssl.recv(socket, 0, 5000) end
+        :tcp -> :gen_tcp.recv(socket, 0, timeout)
+        :ssl -> :ssl.recv(socket, 0, timeout)
       end
 
-    case recv_fn.() do
+    case recv do
       {:ok, data} ->
         buffer = buffer <> data
 
         if String.contains?(buffer, "\r\n\r\n") do
           {:ok, buffer}
         else
-          recv_upgrade_response(socket, transport, buffer)
+          recv_upgrade_response(socket, transport, buffer, deadline)
         end
 
       {:error, _} = err ->

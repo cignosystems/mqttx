@@ -64,7 +64,15 @@ defmodule MqttX.Client.Proxy do
       "\r\n"
   end
 
-  defp await_response(socket, buffer, timeout) when byte_size(buffer) < @max_response_bytes do
+  # `timeout` covers the whole response, not each read: a proxy dripping
+  # bytes cannot hold the connection process here
+  defp await_response(socket, buffer, timeout) when is_integer(timeout) do
+    await_until(socket, buffer, System.monotonic_time(:millisecond) + timeout)
+  end
+
+  defp await_until(socket, buffer, deadline) when byte_size(buffer) < @max_response_bytes do
+    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
     case :gen_tcp.recv(socket, 0, timeout) do
       {:ok, data} ->
         buffer = buffer <> data
@@ -88,7 +96,7 @@ defmodule MqttX.Client.Proxy do
               {:error, :bad_proxy_response}
           end
         else
-          await_response(socket, buffer, timeout)
+          await_until(socket, buffer, deadline)
         end
 
       {:error, _} = err ->
@@ -96,5 +104,5 @@ defmodule MqttX.Client.Proxy do
     end
   end
 
-  defp await_response(_socket, _buffer, _timeout), do: {:error, :bad_proxy_response}
+  defp await_until(_socket, _buffer, _deadline), do: {:error, :bad_proxy_response}
 end

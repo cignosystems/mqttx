@@ -111,8 +111,17 @@ defmodule MqttX.Server.RetainedStore do
       payload in [nil, <<>>] ->
         row = {segments, Topic.flatten(segments), nil, 0, now, nil, %{}, version}
 
-        # Only another node can hold a stale copy to bring back
-        if Node.alive?(), do: :ets.insert(table, row), else: :ets.delete(table, segments)
+        # On a distributed node the cleared row stays as a marker, so a
+        # stale copy from a node that missed the clear loses to it. A marker
+        # for a topic not here counts toward the cap like a message would,
+        # so clears cannot grow the table past it. The clear is sent to the
+        # other nodes either way.
+        cond do
+          not Node.alive?() -> :ets.delete(table, segments)
+          (existing == [] and max) && :ets.info(table, :size) >= max -> :ok
+          true -> :ets.insert(table, row)
+        end
+
         {:ok, row}
 
       max && existing == [] && :ets.info(table, :size) >= max ->
@@ -157,12 +166,13 @@ defmodule MqttX.Server.RetainedStore do
   applies to messages on topics new here.
   """
   @spec apply_replica(table(), tuple(), pos_integer() | nil) :: :ok
-  def apply_replica(table, {segments, _, payload, _, _, _, _, version} = row, max) do
+  def apply_replica(table, {segments, _, _payload, _, _, _, _, version} = row, max) do
     case :ets.lookup(table, segments) do
       [{_, _, _, _, _, _, _, existing}] when existing >= version ->
         :ok
 
-      [] when max != nil and payload != nil ->
+      # New here, a message or a clear's marker alike: only within the cap
+      [] when max != nil ->
         if :ets.info(table, :size) < max, do: :ets.insert(table, row)
         :ok
 

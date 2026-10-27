@@ -33,6 +33,10 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
       same shape `MqttX.Transport.ThousandIsland` takes for `transport_module:
       ThousandIsland.Transports.SSL`
     - `:max_frame_size` - Largest WebSocket frame accepted, in bytes
+      (default: the packet cap plus the 14-byte frame header)
+    - `:check_origin` - Origins a browser may connect from, as a list of
+      `"scheme://host[:port]"`; any other Origin is refused with 403. A
+      request without an Origin header passes (default: `false`, no check)
       (`:infinity` disables). When unset, websock_adapter's own default
       applies — note that changed in websock_adapter 0.6.0 from `:infinity`
       to 10 MB, so set this explicitly if you need behaviour independent of
@@ -90,7 +94,9 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
         rate_limiter: rate_limiter,
         sessions: sessions,
         path: Keyword.get(transport_opts, :path, "/mqtt"),
-        max_frame_size: Keyword.get(transport_opts, :max_frame_size)
+        max_frame_size:
+          Keyword.get(transport_opts, :max_frame_size, default_max_frame_size(handler_opts)),
+        check_origin: Keyword.get(transport_opts, :check_origin, false)
       }
 
       scheme = Keyword.get(transport_opts, :scheme, :http)
@@ -100,8 +106,14 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
       end
 
       # Bandit turns these into the ThousandIsland listener's socket options;
-      # for :https they are the TLS configuration (certfile, keyfile, ...)
+      # for :https they are the TLS configuration (certfile, keyfile, ...),
+      # over the same baseline as the TCP listeners
       transport_options = Keyword.get(transport_opts, :transport_options, [])
+
+      transport_options =
+        if scheme == :https,
+          do: Keyword.merge(MqttX.Transport.tls_baseline(), transport_options),
+          else: transport_options
 
       bandit_opts = [
         plug: {__MODULE__.Plug, plug_opts},
@@ -121,6 +133,24 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
 
     defp create_retained_table(port) do
       MqttX.Server.RetainedStore.create_table(:"mqttx_ws_retained_#{port}")
+    end
+
+    # The MQTT packet cap plus the largest frame header (14 bytes): the
+    # adapter must not buffer a frame far past the cap before MqttX sees the
+    # packet's declared length
+    defp default_max_frame_size(handler_opts) do
+      transport_opts =
+        if is_list(handler_opts), do: Keyword.get(handler_opts, :transport_opts, %{}), else: %{}
+
+      case Map.get(
+             transport_opts,
+             :max_packet_size,
+             MqttX.Transport.Handler.default_max_packet_size()
+           ) do
+        :infinity -> :infinity
+        size when is_integer(size) and size > 0 -> size + 14
+        _ -> MqttX.Transport.Handler.default_max_packet_size() + 14
+      end
     end
 
     @impl MqttX.Transport
@@ -147,15 +177,24 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
     @impl Plug
     def init(opts), do: opts
 
-    # websock_adapter's own default changed in 0.6.0 (:infinity -> 10 MB), so
-    # only pass :max_frame_size when the caller set it explicitly — that keeps
-    # behaviour identical on 0.5.x and 0.6.x for anyone who configures it, and
-    # otherwise defers to whichever adapter version is installed.
+    # Always passed: websock_adapter's own default is :infinity on 0.5 and
+    # 10 MB on 0.6, neither of them the MQTT packet cap
     defp upgrade_opts(%{max_frame_size: size})
          when (is_integer(size) and size > 0) or size == :infinity,
          do: [max_frame_size: size]
 
     defp upgrade_opts(_opts), do: []
+
+    # `:check_origin` is a list of allowed origins; a request without an
+    # Origin header (not a browser) passes
+    defp origin_allowed?(_conn, false), do: true
+
+    defp origin_allowed?(conn, allowed) when is_list(allowed) do
+      case Plug.Conn.get_req_header(conn, "origin") do
+        [] -> true
+        [origin | _] -> origin in allowed
+      end
+    end
 
     @impl Plug
     def call(conn, opts) do
@@ -169,23 +208,27 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
           |> Enum.flat_map(&String.split(&1, ","))
           |> Enum.map(&String.trim/1)
 
-        if "mqtt" in subprotocols do
-          conn
-          |> Plug.Conn.put_resp_header("sec-websocket-protocol", "mqtt")
-          |> WebSockAdapter.upgrade(
-            MqttX.Transport.WebSocket.Handler,
-            %{
-              handler: opts.handler,
-              handler_opts: opts.handler_opts,
-              retained_table: opts.retained_table,
-              rate_limiter: opts.rate_limiter,
-              sessions: opts.sessions
-            },
-            upgrade_opts(opts)
-          )
-        else
-          conn
-          |> Plug.Conn.send_resp(400, "Missing mqtt subprotocol")
+        cond do
+          "mqtt" not in subprotocols ->
+            Plug.Conn.send_resp(conn, 400, "Missing mqtt subprotocol")
+
+          not origin_allowed?(conn, opts.check_origin) ->
+            Plug.Conn.send_resp(conn, 403, "Origin not allowed")
+
+          true ->
+            conn
+            |> Plug.Conn.put_resp_header("sec-websocket-protocol", "mqtt")
+            |> WebSockAdapter.upgrade(
+              MqttX.Transport.WebSocket.Handler,
+              %{
+                handler: opts.handler,
+                handler_opts: opts.handler_opts,
+                retained_table: opts.retained_table,
+                rate_limiter: opts.rate_limiter,
+                sessions: opts.sessions
+              },
+              upgrade_opts(opts)
+            )
         end
       else
         conn

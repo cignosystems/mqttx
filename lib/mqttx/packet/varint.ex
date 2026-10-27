@@ -82,6 +82,16 @@ defmodule MqttX.Packet.Varint do
   end
 
   # Two bytes
+  # MQTT-1.5.5-1: the encoding is the shortest one, so a last byte of 0
+  # after a continuation byte is malformed
+  def decode(<<1::1, _::7, 0::1, 0::7, _rest::binary>>), do: {:error, :malformed_varint}
+
+  def decode(<<1::1, _::7, 1::1, _::7, 0::1, 0::7, _rest::binary>>),
+    do: {:error, :malformed_varint}
+
+  def decode(<<1::1, _::7, 1::1, _::7, 1::1, _::7, 0::1, 0::7, _rest::binary>>),
+    do: {:error, :malformed_varint}
+
   def decode(<<1::1, b1::7, 0::1, b2::7, rest::binary>>) do
     {:ok, b1 + (b2 <<< 7), rest}
   end

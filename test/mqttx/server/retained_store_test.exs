@@ -243,6 +243,19 @@ defmodule MqttX.Server.RetainedStoreTest do
       assert [{"c/1", "again", _, _, _, _}] = RetainedStore.match(table, "c/1")
     end
 
+    test "a clear's marker counts toward the cap: clears of topics not here cannot grow the table past it" do
+      table = RetainedStore.new_table()
+      now = System.system_time(:microsecond)
+
+      marker = fn i ->
+        {["gone", "#{i}"], "gone/#{i}", nil, 0, System.system_time(:second), nil, %{},
+         {now + i, :other@host, 0}}
+      end
+
+      for i <- 1..3, do: :ok = RetainedStore.apply_replica(table, marker.(i), 2)
+      assert :ets.info(table, :size) == 2
+    end
+
     test "cleared topics are forgotten after their time" do
       table = RetainedStore.new_table()
       {:ok, row} = RetainedStore.write(table, "c/1", "x", 0, %{}, nil)

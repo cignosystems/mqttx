@@ -187,11 +187,18 @@ defmodule MqttX.Client do
   `connect/1` will return `{:error, :not_connected}`. Wait for readiness in
   one of these ways:
 
-      # 1. Act on the :connected event (recommended for long-lived clients)
-      def handle_mqtt_event(:connected, _info, state) do
-        MqttX.Client.subscribe(self(), "sensors/#", qos: 1)
+      # 1. Act on the :connected event (recommended for long-lived clients).
+      #    The handler runs inside the connection process, so it must not
+      #    call the client itself: hand the work to your own process, or use
+      #    `use MqttX`, whose callbacks run in a process of their own.
+      def handle_mqtt_event(:connected, _info, %{owner: owner} = state) do
+        send(owner, :mqtt_connected)
         state
       end
+
+      # (Granted subscriptions are replayed by the client itself after a
+      # reconnect that lost the session, so a long-lived client subscribes
+      # once, from its own process.)
 
       # 2. Block until the first attempt resolves (handy in scripts and tests)
       {:ok, client} = MqttX.Client.connect(host: "broker", client_id: "c",
@@ -215,8 +222,14 @@ defmodule MqttX.Client do
 
           {:error, reason} ->
             # Don't leave an orphan retrying in the background when the caller
-            # was told the connection failed.
-            _ = GenServer.stop(pid, :normal, 1_000)
+            # was told the connection failed. A non-retryable CONNACK has the
+            # client stop itself, so it may be gone already.
+            try do
+              GenServer.stop(pid, :normal, 1_000)
+            catch
+              :exit, _ -> :ok
+            end
+
             {:error, reason}
         end
       else

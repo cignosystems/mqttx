@@ -121,6 +121,55 @@ defmodule MqttX.Transport.HandlerPathsTest do
     assert [{:publish, "w/t"}, {:disconnect, {:error, :econnreset}}] = events(ctx.agent)
   end
 
+  describe "the Will on the way out" do
+    @will %{topic: "w/t", payload: "bye", qos: 0, retain: false, properties: %{}}
+
+    defp disconnect_packet(reason_code) do
+      encode(%{type: :disconnect, reason_code: reason_code, properties: %{}})
+    end
+
+    test "DISCONNECT 0x00 discards it; any other reason code publishes it (MQTT-3.14.4-3)", ctx do
+      state = connect(ctx.state, @will)
+      {:close, :disconnect, state} = Proto.handle_data(disconnect_packet(0x00), state)
+      {:shutdown, _} = Proto.handle_close(state)
+      refute {:publish, "w/t"} in events(ctx.agent)
+
+      state = connect(ctx.state, @will)
+      {:close, :disconnect, state} = Proto.handle_data(disconnect_packet(0x80), state)
+      {:shutdown, _} = Proto.handle_close(state)
+      assert {:publish, "w/t"} in events(ctx.agent)
+    end
+
+    test "a takeover publishes the immediate Will before letting the new connection go on", ctx do
+      state = connect(ctx.state, @will)
+      {:stop, :normal, _} = Proto.handle_info({:session_takeover, self()}, state)
+      assert_received {:session_released, _}
+      # Published by the time the release was sent, not later at the close
+      assert {:publish, "w/t"} in events(ctx.agent)
+    end
+  end
+
+  test "a close this side chose and a takeover during its drain tell the handler once", ctx do
+    state = connect(ctx.state)
+    {:shutdown, state} = Proto.handle_close(state)
+    {:stop, :normal, _} = Proto.handle_info({:server_disconnect, 0x8E, %{}}, state)
+    assert Enum.count(events(ctx.agent), &match?({:disconnect, _}, &1)) == 1
+  end
+
+  test "a re-sent QoS 2 PUBLISH gets its PUBREC again even with the window full", ctx do
+    table = MqttX.Server.RetainedStore.new_table()
+    test = self()
+    send_fn = fn data -> send(test, {:sent, data}) end
+    opts = [agent: ctx.agent, transport_opts: %{receive_maximum: 1}]
+    {:ok, state} = Proto.init(Recorder, opts, table, nil, send_fn)
+    state = connect(state)
+
+    {:ok, state} = Proto.handle_data(publish("q/2", 2, 7), state)
+    assert %{type: :pubrec, packet_id: 7} = sent()
+    assert {:ok, _} = Proto.handle_data(publish("q/2", 2, 7), state)
+    assert %{type: :pubrec, packet_id: 7} = sent()
+  end
+
   describe "{:disconnect, code, state} from a callback" do
     # The DISCONNECT the client gets, with the properties of a 4-tuple
     defp assert_kicked(ctx, result, props) do

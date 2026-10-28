@@ -50,7 +50,8 @@ defmodule MqttX.Server do
   The following callbacks are required:
 
   - `init/1` - Initialize handler state
-  - `handle_connect/3` - Handle client connection
+  - `handle_connect/3` or `handle_connect/4` - Handle client connection
+    (one of the two)
   - `handle_publish/4` - Handle incoming PUBLISH messages
   - `handle_subscribe/2` - Handle SUBSCRIBE requests
   - `handle_disconnect/2` - Handle client disconnection
@@ -58,7 +59,7 @@ defmodule MqttX.Server do
   Optional callbacks:
 
   - `handle_connect/4` - Like `handle_connect/3` but also receives connection
-    info (protocol version, keepalive); preferred when defined
+    info (protocol version, keepalive); preferred when both are defined
   - `handle_unsubscribe/2` - Handle UNSUBSCRIBE requests
   - `handle_puback/2` - Handle PUBACK/PUBCOMP for QoS 1/2 messages
   - `handle_info/2` - Handle arbitrary messages sent to the connection process

@@ -252,13 +252,20 @@ defmodule MqttX.Server.SessionStore do
   def began_at(meta), do: Map.get(meta, :began_at, {0, nil})
 
   @doc false
-  # Sessions here, about: the few bookkeeping keys of the table count too
+  # Sessions here: connected or kept, not the placeholders and stubs of ones
+  # moving between nodes, nor the table's bookkeeping rows
   @spec count(t()) :: non_neg_integer()
   def count(store) do
-    case :ets.info(store.sessions, :size) do
-      n when is_integer(n) -> n
-      _ -> 0
-    end
+    :ets.select_count(store.sessions, [
+      {{:"$1", :"$2"},
+       [
+         {:is_binary, :"$1"},
+         {:not, {:is_map_key, :placeholder, :"$2"}},
+         {:not, {:is_map_key, :moved_to, :"$2"}}
+       ], [true]}
+    ])
+  rescue
+    ArgumentError -> 0
   end
 
   @doc "Set when the session ends (`:infinity` while it is connected or never expires)."
@@ -639,8 +646,12 @@ defmodule MqttX.Server.SessionStore do
     key = {segments, {:share, group, client_id}}
 
     case :ets.lookup(store.remote, key) do
-      [{_, {^node, _opts}}] -> :ets.delete(store.remote, key)
-      _ -> :ok
+      [{_, {^node, _opts}}] ->
+        :ets.delete(store.remote, key)
+        drop_shared_counter(store, segments, {:share, group, client_id})
+
+      _ ->
+        :ok
     end
 
     :ok
@@ -649,7 +660,9 @@ defmodule MqttX.Server.SessionStore do
   @doc false
   # Every shared subscription held on `node` (it left the cluster)
   def drop_remote_node(store, node) do
+    gone = :ets.select(store.remote, [{{:"$1", {node, :_}}, [], [:"$1"]}])
     :ets.select_delete(store.remote, [{{:_, {node, :_}}, [], [true]}])
+    for {segments, subscriber} <- gone, do: drop_shared_counter(store, segments, subscriber)
     :ok
   end
 
@@ -841,8 +854,15 @@ defmodule MqttX.Server.SessionStore do
           for {_key, {topic, payload, opts, queued_at}} <- queued(store, client_id),
               do: {topic, payload, opts, queued_at + offset}
 
+        # A moved session's stub keeps a short expiry of its own (mark_moved);
+        # the session carries its lifetime's, as if its client had just left
+        exported_meta =
+          if Map.has_key?(meta, :moved_to),
+            do: %{meta | expires_at: lifetime_expiry(meta)},
+            else: meta
+
         %{
-          meta: Map.drop(meta, [:placeholder, :moved_to, :move_ref, :handoff_until]),
+          meta: Map.drop(exported_meta, [:placeholder, :moved_to, :move_ref, :handoff_until]),
           subscriptions: subscriptions(store, client_id),
           inflight: inflight(store, client_id),
           queue: queue
@@ -1012,22 +1032,50 @@ defmodule MqttX.Server.SessionStore do
   def unmove(store, client_id, ref) do
     case :ets.lookup(store.sessions, client_id) do
       [{_, %{move_ref: ^ref} = meta}] ->
-        now = System.system_time(:second)
+        meta =
+          meta |> Map.drop([:moved_to, :move_ref]) |> Map.put(:expires_at, lifetime_expiry(meta))
 
-        expires_at =
-          case Map.get(meta, :lifetime) do
-            lifetime when is_integer(lifetime) and lifetime < 0xFFFFFFFF -> now + lifetime
-            lifetime when is_integer(lifetime) -> :infinity
-            _ -> now + 60
-          end
-
-        meta = meta |> Map.drop([:moved_to, :move_ref]) |> Map.put(:expires_at, expires_at)
         :ets.insert(store.sessions, {client_id, meta})
         touch(store, client_id)
         true
 
       _ ->
         false
+    end
+  end
+
+  # When a session whose client has just left ends: its Session Expiry
+  # Interval from now; never, for the protocol's "never"; a minute when the
+  # record does not say (it cannot be a session of this broker's making)
+  defp lifetime_expiry(meta) do
+    case Map.get(meta, :lifetime) do
+      lifetime when is_integer(lifetime) and lifetime < 0xFFFFFFFF ->
+        System.system_time(:second) + lifetime
+
+      lifetime when is_integer(lifetime) ->
+        :infinity
+
+      _ ->
+        System.system_time(:second) + 60
+    end
+  end
+
+  @doc false
+  # A session arrived here from another node: remembered for a minute, so
+  # the node it came from can tell "imported, then ended or moved on" from
+  # "never arrived" before letting its own copy go (Cluster.finish_move)
+  @spec mark_imported(t(), client_id()) :: :ok
+  def mark_imported(store, client_id) do
+    :ets.insert(store.seen, {{:imported, client_id}, System.system_time(:millisecond) + 60_000})
+    :ok
+  end
+
+  @doc false
+  @spec imported_recently?(t(), client_id()) :: boolean()
+  def imported_recently?(store, client_id) do
+    case :ets.lookup(store.seen, {:imported, client_id}) do
+      [{_, until}] -> until > System.system_time(:millisecond)
+      [] -> false
     end
   end
 
@@ -1202,6 +1250,7 @@ defmodule MqttX.Server.SessionStore do
 
         try do
           module.delete(state, client_id)
+          delete(store, client_id)
         rescue
           _ -> :ok
         end

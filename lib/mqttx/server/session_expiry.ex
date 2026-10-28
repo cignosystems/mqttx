@@ -69,8 +69,23 @@ defmodule MqttX.Server.SessionExpiry do
 
         # The map is keyed by the scoped {retained_table, client_id} tuple,
         # but the callback contract is the bare client_id.
-        if handler,
-          do: handler.handle_session_expired(callback_client_id(client_id), handler_state)
+        # Shared by every client: one handler raising must not lose the others' timers
+        if handler do
+          try do
+            handler.handle_session_expired(callback_client_id(client_id), handler_state)
+          rescue
+            e ->
+              Logger.error(
+                "[MqttX.Server.SessionExpiry] handle_session_expired failed: " <>
+                  Exception.message(e) <> "\n" <> Exception.format_stacktrace(__STACKTRACE__)
+              )
+          catch
+            kind, value ->
+              Logger.error(
+                "[MqttX.Server.SessionExpiry] handle_session_expired failed: #{kind} #{inspect(value)}"
+              )
+          end
+        end
 
         {:noreply, Map.delete(pending, client_id)}
 

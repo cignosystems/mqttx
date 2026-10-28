@@ -17,15 +17,24 @@ defmodule MqttX do
         use MqttX.Server
 
         @impl true
-        def handle_connect(client_id, credentials, state) do
+        def init(_opts), do: %{}
+
+        @impl true
+        def handle_connect(client_id, _credentials, state) do
           {:ok, Map.put(state, :client_id, client_id)}
         end
 
         @impl true
-        def handle_publish(topic, payload, opts, state) do
+        def handle_publish(topic, payload, _opts, state) do
           IO.inspect({topic, payload}, label: "Received")
           {:ok, state}
         end
+
+        @impl true
+        def handle_subscribe(topics, state), do: {:ok, Enum.map(topics, & &1.qos), state}
+
+        @impl true
+        def handle_disconnect(_reason, _state), do: :ok
       end
 
       # Start server

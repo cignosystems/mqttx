@@ -2,7 +2,7 @@ defmodule MqttX.Packet.Properties do
   @moduledoc """
   MQTT 5.0 Properties encoding and decoding.
 
-  Supports all 28 MQTT 5.0 property types, each checked against the packet
+  Supports all 27 MQTT 5.0 property types, each checked against the packet
   that carries it (§2.2.2.2).
 
   ## Shapes
@@ -96,7 +96,8 @@ defmodule MqttX.Packet.Properties do
   @doc """
   Encode properties map to binary with length prefix.
 
-  Only encodes properties for MQTT 5.0. Returns empty varint (0) for other versions.
+  Only encodes properties for MQTT 5.0 (a zero length when there are none);
+  other versions get no bytes at all.
   """
   @spec encode(integer(), map()) :: iodata()
   def encode(5, properties) when is_map(properties) and map_size(properties) > 0 do
@@ -154,6 +155,12 @@ defmodule MqttX.Packet.Properties do
   """
   @spec encode(integer(), map(), packet_type()) :: iodata()
   def encode(5, properties, packet_type) when is_map(properties) do
+    # §3.8.2.1.2: a SUBSCRIBE carries one Subscription Identifier at most
+    if packet_type == :subscribe and is_list(Map.get(properties, :subscription_identifier)) and
+         length(Map.get(properties, :subscription_identifier)) > 1 do
+      throw({:mqttx_invalid_property, :subscription_identifier})
+    end
+
     case disallowed(properties, packet_type) do
       nil -> encode(5, properties)
       name -> throw({:mqttx_property_not_allowed, name, packet_type})
@@ -301,8 +308,9 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_reason_string>>, encode_utf8(val)]
   end
 
+  # §3.1.2.11.3: 0 is a Protocol Error, so never sent
   defp encode_property({:receive_maximum, val})
-       when is_integer(val) and val >= 0 and val <= 0xFFFF do
+       when is_integer(val) and val >= 1 and val <= 0xFFFF do
     [<<@prop_receive_maximum, val::16-big>>]
   end
 
@@ -311,7 +319,8 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_topic_alias_maximum, val::16-big>>]
   end
 
-  defp encode_property({:topic_alias, val}) when is_integer(val) and val >= 0 and val <= 0xFFFF do
+  # §3.3.2.3.4: 0 is a Protocol Error, so never sent
+  defp encode_property({:topic_alias, val}) when is_integer(val) and val >= 1 and val <= 0xFFFF do
     [<<@prop_topic_alias, val::16-big>>]
   end
 
@@ -325,8 +334,12 @@ defmodule MqttX.Packet.Properties do
 
   # User properties - stored as {:user_properties, [{key, val}, ...]}
   defp encode_property({:user_properties, pairs}) when is_list(pairs) do
-    Enum.map(pairs, fn {key, val} ->
-      [<<@prop_user_property>>, encode_utf8(key), encode_utf8(val)]
+    Enum.map(pairs, fn
+      {key, val} when is_binary(key) and is_binary(val) ->
+        [<<@prop_user_property>>, encode_utf8(key), encode_utf8(val)]
+
+      _ ->
+        throw({:mqttx_invalid_property, :user_properties})
     end)
   end
 
@@ -335,8 +348,9 @@ defmodule MqttX.Packet.Properties do
     [<<@prop_user_property>>, encode_utf8(key), encode_utf8(val)]
   end
 
+  # §3.1.2.11.4: 0 is a Protocol Error, so never sent
   defp encode_property({:maximum_packet_size, val})
-       when is_integer(val) and val >= 0 and val <= 0xFFFFFFFF do
+       when is_integer(val) and val >= 1 and val <= 0xFFFFFFFF do
     [<<@prop_maximum_packet_size, val::32-big>>]
   end
 
@@ -649,6 +663,7 @@ defmodule MqttX.Packet.Properties do
   defp bool_byte(false), do: 0
   defp bool_byte(1), do: 1
   defp bool_byte(0), do: 0
+  defp bool_byte(_), do: throw(:mqttx_value_out_of_range)
 
   # §1.5.4/§1.5.6: the 2-byte length prefix caps strings and binaries at
   # 65,535 bytes; larger values would silently wrap modulo 65536 and corrupt

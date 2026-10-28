@@ -100,6 +100,9 @@ All notable changes to this project will be documented in this file.
   told the configured value, so one that asked for 20 s was made to use 60.
   Mosquitto's `max_keepalive` behaves the same way. (#9, from
   @danielschnee's Paho run)
+- **`MqttX.Server.Router` keeps a client's filters in a `MapSet`.**
+  Subscribing, unsubscribing and the duplicate check no longer walk a list
+  of the client's filters; the public functions are unchanged.
 
 ### Fixed
 
@@ -126,12 +129,12 @@ All notable changes to this project will be documented in this file.
   unread.** The packet was decoded first; a 1 MiB SUBSCRIBE from an
   unauthenticated peer cost tens of MB of heap.
 - **Crash reports show no credentials.** `format_status/1` on the broker's
-  connection processes (the CONNECT, password included, is kept during
-  enhanced authentication; the receive buffer) and on the client
-  (password, proxy credentials, TLS key material, buffer); a socket
-  message shows as its size. A client handler that throws or exits is
-  caught like one that raises, and the failure log no longer prints the
-  message.
+  TCP connection processes (ThousandIsland and Ranch — the CONNECT,
+  password included, is kept during enhanced authentication; the receive
+  buffer) and on the client (password, proxy credentials, TLS key
+  material, buffer); a socket message shows as its size. A client handler
+  that throws or exits is caught like one that raises, and the failure log
+  no longer prints the message.
 - **The client's WebSocket upgrade and proxy CONNECT have one deadline for
   the whole response** (5 s), and the upgrade response is capped at 8 KiB;
   a server dripping bytes held the client process forever.
@@ -242,6 +245,59 @@ All notable changes to this project will be documented in this file.
   and User Properties it was published with (MQTT-3.3.2-4, -15, -16, -17,
   -20). Retained rows (and the rows replicated between cluster nodes) gain
   a `properties` field before `version`.
+
+- **Encoding an invalid packet returns an error instead of raising.**
+  `MqttX.Packet.Codec.encode/2` answers `{:error, :invalid_packet}` for a
+  term it cannot encode — a topic segment that is not a binary, a missing
+  client id, a reason code or property value out of range (Receive
+  Maximum, Topic Alias and Maximum Packet Size must be at least 1), a user
+  property that is not a pair of binaries, more than one Subscription
+  Identifier on a SUBSCRIBE — and `{:error, :empty_acks}` or
+  `{:error, :invalid_ack}` for a SUBACK/UNSUBACK with no or invalid acks,
+  where a `FunctionClauseError` or `ArgumentError` escaped before. A v5
+  CONNACK in the 3.1.1 shape decodes with its return code mapped to the
+  matching reason code; a pre-5 DISCONNECT with a body is malformed; a
+  pre-5 DISCONNECT encodes as its two bytes.
+- **Broker: the Will on the way out, once.** A takeover publishes the old
+  connection's immediate Will before releasing the session; a Will Delay
+  still pending when the client returns with Clean Start 1 fires
+  (MQTT-3.1.2-10) and is cancelled on Clean Start 0; a v5 DISCONNECT with
+  reason code 0x04 publishes the Will (§3.14.2.1); `handle_disconnect/2` is
+  called once per connection; a `handle_session_expired/2` or a Will's
+  `handle_publish/4` that raises is logged and does not take the sweeper
+  with it. A duplicate QoS 2 PUBLISH is answered with PUBREC again instead
+  of counting against the Receive Maximum.
+- **Broker: session accounting.** `SessionStore.count/1` — the
+  `:max_sessions` check — no longer counts placeholders and moved stubs; a
+  remote shared subscriber or a node leaving drops its round-robin
+  counter; a session exported for a move keeps its expiry; a node that
+  moved a session out cannot take it back on a stale `unmove` once the new
+  node has imported it, and leaves the stub to expire when that node
+  cannot be asked; a backend record that fails to restore is deleted
+  locally as well.
+- **Client: the connection process is never held by its socket.** The TCP
+  connect, proxy CONNECT, TLS handshake and WebSocket upgrade run in a
+  helper process; `publish`, `subscribe` and `:sys` calls are answered
+  (`{:error, :not_connected}`) while an attempt is under way.
+- **Client: a resumed session re-sends within the broker's Receive
+  Maximum** (§4.9). In-flight messages beyond the window follow as
+  acknowledgements come in, in order, instead of all at once; new
+  publishes wait behind them with `{:error, :flow_control}`.
+- **Client: smaller fixes.** A handler that throws or exits is logged (the
+  failure log itself raised); a payload that is neither a binary nor
+  iodata returns `{:error, :invalid_payload}` instead of crashing the
+  connection; a topic alias is kept only once the PUBLISH carrying it went
+  out; a WebSocket closed during the handshake ends the attempt at once
+  rather than at the CONNACK deadline; an UNSUBACK refusing a filter
+  returns `{:error, {:unsubscribe_failed, codes}}`; a `handle_auth/3` that
+  raises ends the connection with a protocol error instead of the process;
+  `disconnect/2` answers callers waiting for a SUBACK, and a server
+  DISCONNECT saves the session like every other way out; the HTTP proxy
+  socket is closed when the tunnel is refused; `connect/1` with
+  `await_connect: true` no longer exits when the client already stopped
+  itself on a non-retryable CONNACK; the advertised `maximum_packet_size`
+  never exceeds the enforced `:max_packet_size`;
+  `MqttX.SimpleClient.disconnect/2` works from inside a callback.
 
 ## [0.12.0] - 2026-10-19
 

@@ -73,7 +73,7 @@ your code  ──MqttX.Client.publish───▶  broker
   `:connected` handler.
 - The handler module implements **`handle_mqtt_event/3`**, which receives:
   - `(:connected, %{properties: props, session_present: bool}, state)` — after CONNACK success
-  - `(:disconnected, reason, state)` — `reason` is `:closed`, `:pingresp_timeout`, `{:error, posix}`, `{:protocol_error, reason}`, `{:server_disconnect, code, props}`, or `{:connack_error, code, info}`
+  - `(:disconnected, reason, state)` — `reason` is `:closed`, `:pingresp_timeout`, `{:error, posix}`, `{:protocol_error, reason}`, `{:server_disconnect, code, %{server_reference: ref_or_nil}}`, or `{:connack_error, code, info}`
   - `(:message, {topic, payload, full_packet}, state)` — for each PUBLISH
   - `(:publish_error, {topic, packet_id, reason_code}, state)` — the broker
     rejected one of your QoS 1/2 publishes (e.g. `0x87` not authorized)
@@ -362,10 +362,12 @@ Full list in MQTT 5.0 §2.4.
   `{:ok, pid}` before the handshake completes, so a rejection arrives at the
   handler as
   `(:disconnected, {:connack_error, reason_code, %{server_reference: ref_or_nil}})`
-  — handle it there (e.g. `0x84` unsupported version, `0x86` bad credentials,
-  `0x9C` use the server reference to redirect). With `await_connect: true`
-  the same tuple is returned from `connect/1` instead. Non-retryable codes
-  stop the client rather than reconnecting forever.
+  — handle it there (e.g. `0x84` unsupported version, `0x86` bad credentials;
+  on `0x9C`/`0x9D` the server reference names where to connect instead —
+  start a client there and stop this one, which otherwise keeps retrying
+  the configured host). With `await_connect: true` the same tuple is
+  returned from `connect/1` instead. Non-retryable codes stop the client
+  rather than reconnecting forever.
 
 ## Decision helpers
 

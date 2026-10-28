@@ -118,7 +118,7 @@ ordered roughly by ratio of impact to effort.
 
 ### Smaller polish (low risk, do whenever)
 
-- `connection.ex` (~2000 lines): the proxy tunnel and topic-alias logic are
+- `connection.ex` (~2600 lines): the proxy tunnel and topic-alias logic are
   extracted (`MqttX.Client.Proxy`, `MqttX.Client.TopicAlias`); the in-flight
   tracking and the session-resume re-send are still inline because they are
   entangled with `send_packet/2` socket I/O — extracting them means threading

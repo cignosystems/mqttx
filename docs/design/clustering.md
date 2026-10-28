@@ -53,7 +53,15 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    single-node one. Replies go to an `:erlang.alias/0` that is dropped after
    the deadline (5 s), so a late reply cannot reach the connection's
    mailbox; a node that answers late has deleted its copy and the client
-   gets a fresh session.
+   gets a fresh session. Two CONNECTs for the same client id at once on
+   different nodes each claim from the other; a connection registers
+   itself (as `:connecting`) before it claims, so each node sees the
+   other's connection in flight. The node receiving a claim decides: if its
+   own connection for the id is still connecting, the one on the lower node
+   gives way — the claimer, told so in the answer (`:yield`), or the local
+   connection, which is sent the takeover and yields to it. One side
+   decides, so it is never both or neither; the one that yields hands its
+   copy over instead of taking.
 
    Messages published during the move: every `deliver` carries an id
    (`make_ref/0`) that all nodes see. Before claiming, the new node puts a
@@ -65,7 +73,11 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
    them after the exported queue. The old node keeps forwarding for 5 s
    after the hand-over, then sends on whatever a fan-out that read the
    session just before the mark queued after the export, and deletes its
-   copy (`finish_move/3`, only if the copy is still the one it moved). For
+   copy (`finish_move/3`, only if the copy is still the one it moved and
+   the new node confirms it has imported — `imported?/4`, asked up to three
+   times; a node that cannot be asked leaves the stub to expire, and a
+   stale `unmove` cannot take the session back from a node that imported
+   it, `SessionStore.mark_imported/2`). For
    15 s from the claim, the new node drops a message whose id it has
    already queued or sent for the client (`seen` table, swept by the
    member). The new node's member imports the session

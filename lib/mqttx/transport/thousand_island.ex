@@ -30,6 +30,9 @@ if Code.ensure_loaded?(ThousandIsland) do
       spec-compliant clients whose Keep Alive exceeds it.
     - `:name` - The handle `MqttX.Server.deliver/4` finds this listener by
       (default: the port number)
+    - `:rate_limit` - Options for `MqttX.Server.RateLimiter`: `:max_connections`
+      (all peers), `:max_connections_per_ip`, `:max_messages`, `:interval`
+      (default: none)
 
     Everything below is passed through `transport_opts` to the protocol handler
     and applies to all adapters:
@@ -43,9 +46,6 @@ if Code.ensure_loaded?(ThousandIsland) do
       this window (default: 10_000 ms, `:infinity` disables)
     - `:max_retained_messages` - Cap on distinct retained topics
       (default: 100_000, `:infinity` disables)
-    - `:rate_limit` - Options for `MqttX.Server.RateLimiter`: `:max_connections`
-      (all peers), `:max_connections_per_ip`, `:max_messages`, `:interval`
-      (default: none)
     - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 100;
       with the packet cap it bounds what a client can make the broker hold
       before PUBREL).

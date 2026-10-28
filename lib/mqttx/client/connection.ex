@@ -141,6 +141,12 @@ defmodule MqttX.Client.Connection do
     connecting: false,
     # Total-handshake deadline timer (not reset by AUTH rounds)
     connack_timer: nil,
+    # {pid, generation} of the process opening the socket (TCP, proxy, TLS,
+    # WebSocket upgrade), so this one keeps answering calls meanwhile
+    opener: nil,
+    # In-flight QoS 1/2 messages of a resumed session still to re-send, in
+    # order, once the broker's Receive Maximum has room for them
+    resend_backlog: [],
     # Generation ref pairing a :connack_timeout with the handshake that armed it
     connack_ref: nil,
     # Telemetry span carried across the async handshake
@@ -513,6 +519,8 @@ defmodule MqttX.Client.Connection do
 
   @impl true
   def terminate(_reason, state) do
+    stop_opener(state)
+
     if state.connected and state.socket do
       send_packet(state, %{type: :disconnect, reason_code: 0x00, properties: %{}})
     end
@@ -529,7 +537,14 @@ defmodule MqttX.Client.Connection do
       retain = Keyword.get(opts, :retain, false)
       properties = Keyword.get(opts, :properties, %{})
 
+      # Bytes, or iodata made bytes; anything else is a term that needed a
+      # :codec (MqttX.Client.publish/4), not a crash of this process
+      payload = normalize_payload(payload)
+
       cond do
+        payload == :invalid ->
+          {:reply, {:error, :invalid_payload}, state}
+
         # An invalid QoS used to encode a malformed packet and then crash
         # the whole connection with a CaseClauseError.
         qos not in 0..2 ->
@@ -562,7 +577,11 @@ defmodule MqttX.Client.Connection do
               {nil, state}
             end
 
-          # Apply outgoing topic alias (MQTT 5.0)
+          # Apply outgoing topic alias (MQTT 5.0). The alias is the
+          # connection's only once the packet carrying it went out: a send
+          # that fails must not leave one the broker never learned.
+          state_before_alias = state
+
           {publish_topic, publish_properties, state} =
             MqttX.Client.TopicAlias.apply_outgoing(topic, properties, state)
 
@@ -626,7 +645,12 @@ defmodule MqttX.Client.Connection do
               {:reply, :ok, state}
 
             {:error, _} = err ->
-              {:reply, err, state}
+              {:reply, err,
+               %{
+                 state
+                 | topic_to_alias: state_before_alias.topic_to_alias,
+                   next_alias: state_before_alias.next_alias
+               }}
           end
       end
     else
@@ -749,6 +773,9 @@ defmodule MqttX.Client.Connection do
   def handle_cast({:disconnect, opts}, state) do
     reason_code = Keyword.get(opts, :reason_code, 0)
     properties = Keyword.get(opts, :properties, %{})
+    # Whoever waits for a SUBACK gets :not_connected, not a crash of its call
+    state = fail_pending_subs(state)
+    state = stop_opener(state)
 
     Telemetry.client_disconnect(%{client_id: state.client_id, reason: :normal})
 
@@ -791,28 +818,51 @@ defmodule MqttX.Client.Connection do
     Telemetry.client_connect_start(metadata)
     state = %{state | connect_telemetry: %{start_time: start_time, metadata: metadata}}
 
-    # do_connect opens the socket (and performs the WS upgrade) and sends
-    # CONNECT; the CONNACK/AUTH handshake is completed asynchronously via
-    # handle_info so the GenServer keeps serving calls while connecting.
-    case do_connect(state) do
+    # The socket is opened by a helper process — the TCP connect, the proxy
+    # CONNECT, the TLS handshake and the WebSocket upgrade can each take
+    # seconds — so this process keeps answering calls (with :not_connected)
+    # meanwhile. The CONNACK/AUTH handshake then runs here, asynchronously.
+    gen = make_ref()
+    parent = self()
+    opener = spawn_link(fn -> open_socket_for(parent, gen, state) end)
+
+    {:noreply, %{state | connecting: true, opener: {opener, gen}, buffer: <<>>}}
+  end
+
+  # The helper has the socket open and handed over: CONNECT goes out and the
+  # handshake deadline starts
+  def handle_info({:socket_opened, gen, socket}, %{opener: {_pid, gen}} = state) do
+    state = reset_ws_state(%{state | opener: nil, socket: socket})
+    set_socket_active(state)
+
+    case send_connect(state) do
       {:ok, state} ->
         # Ref-tag the deadline: a late :connack_timeout from a previous
         # connection generation must not tear down this handshake.
         ref = make_ref()
         connack_timer = Process.send_after(self(), {:connack_timeout, ref}, @connect_timeout)
-
-        {:noreply,
-         %{
-           state
-           | connecting: true,
-             connack_timer: connack_timer,
-             connack_ref: ref,
-             buffer: <<>>
-         }}
+        {:noreply, %{state | connack_timer: connack_timer, connack_ref: ref}}
 
       {:error, reason} ->
-        {:noreply, connect_failed(state, reason)}
+        {:noreply, connect_failed(%{state | socket: nil}, reason)}
     end
+  end
+
+  def handle_info({:socket_failed, gen, reason}, %{opener: {_pid, gen}} = state) do
+    {:noreply, connect_failed(%{state | opener: nil}, reason)}
+  end
+
+  # From an opener of an earlier generation: its socket is not wanted
+  def handle_info({:socket_opened, _gen, socket}, state) do
+    close_raw_socket(socket, state.transport)
+    {:noreply, state}
+  end
+
+  def handle_info({:socket_failed, _gen, _reason}, state), do: {:noreply, state}
+
+  # The opener crashed: the attempt failed
+  def handle_info({:EXIT, pid, reason}, %{opener: {pid, _gen}} = state) when reason != :normal do
+    {:noreply, connect_failed(%{state | opener: nil}, {:opener, reason})}
   end
 
   def handle_info(:reconnect, state) do
@@ -913,8 +963,15 @@ defmodule MqttX.Client.Connection do
         close_socket(%{state | connected: false})
         state = %{state | connected: false, socket: nil, buffer: <<>>, ws_close_pending: false}
         state = cancel_conn_timers(state)
-        state = notify_handler(state, :disconnected, :closed)
-        schedule_reconnect(state)
+
+        # Closed mid-handshake: the attempt is over now, not at the CONNACK
+        # deadline, and whoever awaits the connect hears :closed
+        if state.connecting do
+          connect_failed(state, :closed)
+        else
+          state = notify_handler(state, :disconnected, :closed)
+          schedule_reconnect(state)
+        end
       else
         %{state | ws_close_pending: false}
       end
@@ -979,59 +1036,85 @@ defmodule MqttX.Client.Connection do
   # HTTP CONNECT proxy when `:proxy` is configured), then layer TLS and/or
   # the WebSocket upgrade on top.
 
-  defp do_connect(%{transport: :tcp} = state) do
-    case open_tcp(state) do
+  # In the opener process: everything up to a usable, passive socket. Its
+  # result goes to the connection process, with the socket's control.
+  defp open_socket_for(parent, gen, state) do
+    case open_socket(state) do
       {:ok, socket} ->
-        :inet.setopts(socket, active: :once)
-        send_connect(%{state | socket: socket})
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp do_connect(%{transport: :ssl} = state) do
-    ssl_opts = [{:active, :once} | secure_ssl_opts(state.host, state.ssl_opts)]
-
-    with {:ok, tcp_socket} <- open_tcp(state),
-         {:ok, socket} <- ssl_upgrade(tcp_socket, ssl_opts) do
-      send_connect(%{state | socket: socket})
-    end
-  end
-
-  defp do_connect(%{transport: :ws} = state) do
-    case open_tcp(state) do
-      {:ok, socket} ->
-        case MqttX.Client.WebSocket.upgrade(socket, :tcp, state.host, state.port, state.ws_path) do
+        case controlling_process(socket, state.transport, parent) do
           :ok ->
-            :inet.setopts(socket, active: :once)
-            send_connect(reset_ws_state(%{state | socket: socket}))
+            send(parent, {:socket_opened, gen, socket})
 
-          {:error, _} = err ->
-            :gen_tcp.close(socket)
-            err
+          {:error, reason} ->
+            close_raw_socket(socket, state.transport)
+            send(parent, {:socket_failed, gen, reason})
         end
 
-      {:error, _} = err ->
-        err
+      {:error, reason} ->
+        send(parent, {:socket_failed, gen, reason})
     end
   end
 
-  defp do_connect(%{transport: :wss} = state) do
+  defp open_socket(%{transport: :tcp} = state), do: open_tcp(state)
+
+  defp open_socket(%{transport: :ssl} = state) do
+    ssl_opts = [{:active, false} | secure_ssl_opts(state.host, state.ssl_opts)]
+
+    with {:ok, tcp_socket} <- open_tcp(state) do
+      ssl_upgrade(tcp_socket, ssl_opts)
+    end
+  end
+
+  defp open_socket(%{transport: :ws} = state) do
+    with {:ok, socket} <- open_tcp(state) do
+      case MqttX.Client.WebSocket.upgrade(socket, :tcp, state.host, state.port, state.ws_path) do
+        :ok ->
+          {:ok, socket}
+
+        {:error, _} = err ->
+          :gen_tcp.close(socket)
+          err
+      end
+    end
+  end
+
+  defp open_socket(%{transport: :wss} = state) do
     ssl_opts = [{:active, false} | secure_ssl_opts(state.host, state.ssl_opts)]
 
     with {:ok, tcp_socket} <- open_tcp(state),
          {:ok, socket} <- ssl_upgrade(tcp_socket, ssl_opts) do
       case MqttX.Client.WebSocket.upgrade(socket, :ssl, state.host, state.port, state.ws_path) do
         :ok ->
-          :ssl.setopts(socket, active: :once)
-          send_connect(reset_ws_state(%{state | socket: socket}))
+          {:ok, socket}
 
         {:error, _} = err ->
           :ssl.close(socket)
           err
       end
     end
+  end
+
+  defp controlling_process(socket, transport, pid) when transport in [:tcp, :ws],
+    do: :gen_tcp.controlling_process(socket, pid)
+
+  defp controlling_process(socket, transport, pid) when transport in [:ssl, :wss],
+    do: :ssl.controlling_process(socket, pid)
+
+  defp close_raw_socket(socket, transport) when transport in [:tcp, :ws],
+    do: :gen_tcp.close(socket)
+
+  defp close_raw_socket(socket, transport) when transport in [:ssl, :wss],
+    do: :ssl.close(socket)
+
+  # An opener still at work when the attempt or the client ends: killed, so a
+  # socket it may open dies with it instead of reaching a process that no
+  # longer wants it
+  defp stop_opener(%{opener: nil} = state), do: state
+
+  defp stop_opener(%{opener: {pid, _gen}} = state) do
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+    %{state | opener: nil}
   end
 
   # A partial fragment from the previous connection must not leak into this
@@ -1188,6 +1271,9 @@ defmodule MqttX.Client.Connection do
         props = Map.get(auth_packet, :properties, %{})
 
         case notify_handler_auth(state, 0x18, props) do
+          {:error, state} ->
+            protocol_error_teardown(%{state | buffer: rest}, :auth_handler_failed)
+
           {:continue, auth_data, state} ->
             send_packet(state, %{
               type: :auth,
@@ -1327,6 +1413,7 @@ defmodule MqttX.Client.Connection do
   # handshake timeout, protocol error before CONNACK).
   defp connect_failed(state, reason) do
     if state.connack_timer, do: Process.cancel_timer(state.connack_timer)
+    state = stop_opener(state)
     close_socket(state)
 
     if telem = state.connect_telemetry do
@@ -1390,10 +1477,14 @@ defmodule MqttX.Client.Connection do
     tx_entries =
       for {{:tx, packet_id}, entry} <- state.pending_acks, do: {packet_id, entry}
 
-    # Resend promptly, in original submission order (§4.4, §4.6)
-    tx_entries
-    |> Enum.sort_by(fn {_id, entry} -> Map.get(entry, :seq, 0) end)
-    |> Enum.each(fn {packet_id, entry} ->
+    # Resend promptly, in original submission order (§4.4, §4.6) — but no
+    # more at once than the broker's Receive Maximum (§4.9); the rest follow
+    # as acknowledgements come in (drain_resend_backlog/1)
+    ordered = Enum.sort_by(tx_entries, fn {_id, entry} -> Map.get(entry, :seq, 0) end)
+    window = state.receive_maximum || 65535
+    {now_sent, later} = Enum.split(ordered, window)
+
+    Enum.each(now_sent, fn {packet_id, entry} ->
       resend_packet(state, packet_id, entry.packet, entry.phase)
     end)
 
@@ -1405,10 +1496,16 @@ defmodule MqttX.Client.Connection do
         other -> other
       end)
 
-    %{state | pending_acks: pending, inflight_tx_count: length(tx_entries)}
+    %{
+      state
+      | pending_acks: pending,
+        inflight_tx_count: length(now_sent),
+        resend_backlog: Enum.map(later, fn {packet_id, _entry} -> packet_id end)
+    }
   end
 
   defp sync_inflight_after_connect(state, false = _session_present) do
+    state = %{state | resend_backlog: []}
     dropped = map_size(state.pending_acks)
 
     if dropped > 0 do
@@ -1418,6 +1515,21 @@ defmodule MqttX.Client.Connection do
     end
 
     %{state | pending_acks: %{}, inflight_tx_count: 0}
+  end
+
+  # An acknowledgement made room in the window: the next message of a resumed
+  # session still waiting to be re-sent goes out
+  defp drain_resend_backlog(%{resend_backlog: []} = state), do: state
+
+  defp drain_resend_backlog(%{resend_backlog: [packet_id | rest]} = state) do
+    case Map.get(state.pending_acks, {:tx, packet_id}) do
+      nil ->
+        drain_resend_backlog(%{state | resend_backlog: rest})
+
+      entry ->
+        resend_packet(state, packet_id, entry.packet, entry.phase)
+        %{state | resend_backlog: rest, inflight_tx_count: state.inflight_tx_count + 1}
+    end
   end
 
   defp process_buffer(state) do
@@ -1555,7 +1667,9 @@ defmodule MqttX.Client.Connection do
 
         state = notify_publish_error(state, entry, reason_code)
         pending = Map.delete(state.pending_acks, {:tx, packet.packet_id})
+
         %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
+        |> drain_resend_backlog()
 
       %{phase: :pubrec_pending} = entry ->
         # Send PUBREL and wait for PUBCOMP
@@ -1690,7 +1804,15 @@ defmodule MqttX.Client.Connection do
     case Map.pop(state.pending_subs, packet_id) do
       {{:unsubscribe, from, monitor, topics}, pending} ->
         if monitor, do: Process.demonitor(monitor, [:flush])
-        if from, do: GenServer.reply(from, :ok)
+
+        # v5 says per filter whether it worked (§3.11.3); a refusal is told
+        reply =
+          case Enum.filter(Map.get(packet, :acks, []), &match?({:error, _}, &1)) do
+            [] -> :ok
+            errors -> {:error, {:unsubscribe_failed, Enum.map(errors, &elem(&1, 1))}}
+          end
+
+        if from, do: GenServer.reply(from, reply)
         subscriptions = Map.drop(state.subscriptions, topics)
         %{state | pending_subs: pending, subscriptions: subscriptions}
 
@@ -1729,7 +1851,7 @@ defmodule MqttX.Client.Connection do
     log_reason_string(props)
 
     if server_ref do
-      Logger.info("[MqttX.Client] Server reference on disconnect: #{server_ref}")
+      Logger.info("[MqttX.Client] Server reference on disconnect: #{inspect(server_ref)}")
     end
 
     state =
@@ -1740,7 +1862,9 @@ defmodule MqttX.Client.Connection do
       )
 
     # §4.13: server-initiated DISCONNECT — tear the socket down and reconnect
-    # rather than wait for {:tcp_closed, _} to land separately.
+    # rather than wait for {:tcp_closed, _} to land separately. The session
+    # is saved as on every other way out.
+    save_session(state)
     close_socket(state)
     state = %{state | connected: false, socket: nil}
     state = cancel_conn_timers(state)
@@ -1762,6 +1886,7 @@ defmodule MqttX.Client.Connection do
 
       {_entry, pending} ->
         %{state | pending_acks: pending, inflight_tx_count: max(0, state.inflight_tx_count - 1)}
+        |> drain_resend_backlog()
     end
   end
 
@@ -1786,6 +1911,9 @@ defmodule MqttX.Client.Connection do
 
       {:ok, state} ->
         state
+
+      {:error, state} ->
+        protocol_error_teardown(state, :auth_handler_failed)
     end
   end
 
@@ -2089,10 +2217,15 @@ defmodule MqttX.Client.Connection do
         :exit -> "exited"
       end
 
+    message =
+      case kind do
+        :error -> Exception.message(Exception.normalize(:error, value))
+        _ -> inspect(value)
+      end
+
     Logger.error(
       "[MqttX.Client] Handler #{inspect(state.handler)} #{verb} on #{inspect(event)}: " <>
-        "#{Exception.message(Exception.normalize(kind, value))}\n" <>
-        Exception.format_stacktrace(stacktrace)
+        message <> "\n" <> Exception.format_stacktrace(stacktrace)
     )
   end
 
@@ -2150,12 +2283,26 @@ defmodule MqttX.Client.Connection do
   defp notify_handler_auth(%{handler: handler, handler_state: hstate} = state, reason_code, props)
        when not is_nil(handler) do
     if function_exported?(handler, :handle_auth, 3) do
-      case handler.handle_auth(reason_code, props, hstate) do
-        {:continue, auth_data, new_hstate} ->
-          {:continue, auth_data, %{state | handler_state: new_hstate}}
+      try do
+        case handler.handle_auth(reason_code, props, hstate) do
+          {:continue, auth_data, new_hstate} ->
+            {:continue, auth_data, %{state | handler_state: new_hstate}}
 
-        {:ok, new_hstate} ->
-          {:ok, %{state | handler_state: new_hstate}}
+          {:ok, new_hstate} ->
+            {:ok, %{state | handler_state: new_hstate}}
+
+          other ->
+            Logger.error("[MqttX.Client] handle_auth/3 returned #{inspect(other)}")
+            {:error, state}
+        end
+      rescue
+        e ->
+          log_handler_failure(state, :auth, :error, e, __STACKTRACE__)
+          {:error, state}
+      catch
+        kind, value ->
+          log_handler_failure(state, :auth, kind, value, __STACKTRACE__)
+          {:error, state}
       end
     else
       {:ok, state}
@@ -2226,7 +2373,9 @@ defmodule MqttX.Client.Connection do
 
     case max_packet_size do
       size when is_integer(size) and size > 0 ->
-        Map.put_new(properties, :maximum_packet_size, size)
+        # The caller's value stands, as long as it is within what this side
+        # enforces: advertising more would invite messages it then refuses
+        Map.update(properties, :maximum_packet_size, size, &min(&1, size))
 
       _ ->
         properties
@@ -2411,8 +2560,18 @@ defmodule MqttX.Client.Connection do
     broker_max = state.receive_maximum || 65535
     local_max = state.max_inflight || @default_max_inflight
     max_allowed = min(broker_max, local_max)
-    state.inflight_tx_count < max_allowed
+    state.resend_backlog == [] and state.inflight_tx_count < max_allowed
   end
+
+  defp normalize_payload(payload) when is_binary(payload), do: payload
+
+  defp normalize_payload(payload) when is_list(payload) do
+    IO.iodata_to_binary(payload)
+  rescue
+    ArgumentError -> :invalid
+  end
+
+  defp normalize_payload(_payload), do: :invalid
 
   # Handle WebSocket framed data — decode frames and append payloads to MQTT
   # buffer. Threads the fragmentation state across reads so a multi-frame

@@ -363,9 +363,9 @@ In MQTT 5.0 the client tells the broker how long to keep its session via
 ```
 
 A spec-compliant broker queues QoS 1/2 messages while the client is offline
-(up to 1 hour in this example) and replays them on reconnect. Note that
-MqttX's *own* broker does not implement offline queueing — see `MqttX.Server`
-if you are running MqttX as the broker.
+(up to 1 hour in this example) and replays them on reconnect. MqttX's own
+broker does the same: `MqttX.Server.deliver/3` queues for a persistent
+session that is away (see Session State in the server guide).
 
 ## Common Pitfalls
 
@@ -382,8 +382,9 @@ if you are running MqttX as the broker.
   none) is told the cap in CONNACK and must use it; a shorter one stands.
   Useful for surviving cloud-proxy idle timeouts.
 - **`:max_packet_size` is enforced both ways.** A client that sends a packet
-  larger than the broker's limit gets DISCONNECT 0x95; the reverse is also
-  true if the client advertises one in CONNECT properties.
+  larger than the broker's limit gets DISCONNECT 0x95; the reverse holds
+  for a v5 client, which advertises its own `:max_packet_size` (1 MiB by
+  default) in CONNECT unless `connect_properties` sets a smaller one.
 - **Topic wildcards in PUBLISH are illegal.** `+` and `#` are subscribe-only —
   use `MqttX.Topic.validate_publish/1` on untrusted input.
 - **`$SYS/...` topics need explicit subscription.** Per MQTT §4.7.2, `#` and
@@ -517,10 +518,10 @@ All 15 packet types are supported:
 
 Fully compliant with MQTT 3.1, 3.1.1, and 5.0 specifications:
 
-- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_as_published, retain_handling, subscription identifiers), server keepalive override, enhanced AUTH (exchange before CONNACK, re-authentication)
-- **Client**: server_keep_alive override, assigned_client_identifier, maximum_packet_size enforcement, server_reference handling, enhanced AUTH (multi-step), flow control (receive_maximum)
+- **Server**: CONNACK capability properties, protocol ordering enforcement, topic alias validation, MQTT 5.0 property forwarding, subscription options (no_local, retain_as_published, retain_handling, subscription identifiers), server keep-alive cap, enhanced AUTH (exchange before CONNACK, re-authentication)
+- **Client**: server_keep_alive honoured, assigned_client_identifier, maximum_packet_size enforcement, server_reference handling, enhanced AUTH (multi-step), flow control (receive_maximum)
 
-Validated against Mosquitto (104 automated protocol tests across TCP and WebSocket) and EMQX Cloud (49 interop tests covering all QoS levels, properties, session persistence, and subscription options).
+Validated against Mosquitto (104 automated protocol tests across TCP and WebSocket) and EMQX Cloud (51 interop tests covering all QoS levels, properties, session persistence, and subscription options).
 
 ### MQTT 5.0 Server Features
 
@@ -544,7 +545,7 @@ Validated against Mosquitto (104 automated protocol tests across TCP and WebSock
 MqttX.Server.start_link(
   MyHandler,
   [transport_opts: %{
-    server_keep_alive: 30,           # override client keepalive (v5)
+    server_keep_alive: 30,           # cap the client keepalive (v5)
     topic_alias_maximum: 100,        # max topic aliases
     receive_maximum: 100,            # max inflight QoS>0
     max_packet_size: 256_000,        # reject oversized packets
@@ -712,7 +713,7 @@ since 0.12.0.
 
 | Function | Description |
 |----------|-------------|
-| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:name`, `:rate_limit`, `:ip`. Protocol options go in `handler_opts` under `:transport_opts` |
+| `start_link(handler, handler_opts, opts)` | Start an MQTT server. Options: `:transport`, `:port`, `:ip` (ThousandIsland and WebSocket), `:name`, `:rate_limit`, `:session_backend`, `:session_flush_interval`. Protocol options go in `handler_opts` under `:transport_opts` |
 | `deliver(topic, payload, opts)` | From a callback: fan a message out to every session subscribed to `topic` on this listener, queueing QoS 1/2 for sessions that are away. Returns `{:ok, n}` |
 | `deliver(listener, topic, payload, opts)` | The same from any process, by the listener's `:name` or port |
 | `disconnect(pid, reason_code, properties)` | Send DISCONNECT to a connection and close it |
@@ -766,7 +767,7 @@ since 0.12.0.
 |---------|--------|-------------|
 | **Full MQTT 5.0 Compliance** | Done | Complete server and client compliance — all CONNACK properties, enhanced AUTH, flow control, server redirect |
 | **WebSocket Transport** | Done | MQTT over WebSocket via Bandit (`ws://` and `wss://`) |
-| **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 49 EMQX Cloud interop tests |
+| **Broker Validation** | Done | 104 Mosquitto tests (TCP + WebSocket) + 51 EMQX Cloud interop tests |
 | **Clustering** | Done | Listeners sharing a `:name` form one broker across nodes via `:pg`: cluster-wide `deliver/3`, takeover and session resumption on any node, replicated retained messages, shared subscriptions delivered once cluster-wide |
 | **Session Persistence (Server)** | Done | Session State per listener in ETS: `session_present`, subscriptions and in-flight QoS 1/2 resume on reconnect, `MqttX.Server.deliver/3` queues for sessions that are away. Optional durable `MqttX.Server.SessionBackend` (DETS and cluster-replicated built in) survives restarts or the loss of a node |
 | **MQTT 5.0 Enhanced Auth** | Done | Challenge–response exchange before CONNACK and re-authentication, on both client and broker, via `handle_auth/3`; the mechanism itself (SCRAM, tokens, …) is the handler's — no built-in providers |

@@ -437,6 +437,20 @@ defmodule MqttX.Server.SessionStoreTest do
       refute :ets.member(store.sessions, {:rr, ["t"], "g"})
     end
 
+    test "count/1 counts sessions, not the table's bookkeeping rows nor placeholders" do
+      store = MqttX.Server.SessionStore.new()
+      meta = %{protocol_version: 5, expires_at: :infinity, persistent: true}
+      :ok = Store.put(store, "a", meta)
+      :ok = Store.put(store, "b", meta)
+      :ok = Store.enqueue(store, "a", {"t", "m", %{qos: 1}, 0}, nil)
+      {:ok, _} = Store.dequeue(store, "a")
+      :ets.insert(store.sessions, {{:fence, "a"}, make_ref()})
+      :ets.insert(store.sessions, {{:rr, ["t"], "g"}, 3})
+      :ok = Store.hold(store, "arriving", System.system_time(:millisecond) + 10_000)
+
+      assert Store.count(store) == 2
+    end
+
     test "clear_fences lowers every fence and names the clients with held messages" do
       store = Store.new()
 

@@ -350,13 +350,24 @@ defmodule MqttX.Server.Cluster do
   def handle_call({:import, client_id, %{from: from} = record}, _from, state) do
     ref = make_ref()
     SessionStore.import(state.ctx.sessions, client_id, record, ref)
+    SessionStore.mark_imported(state.ctx.sessions, client_id)
     send(elem(relays(state.listener), 0), {:fence, ref, client_id, from, self()})
     {:reply, :ok, state}
   end
 
-  # Asked by the node a session moved from, before it lets its copy go
+  # Asked by the node a session moved from, before it lets its copy go: the
+  # session is here, or it arrived and has since ended or moved on — either
+  # way the copy there is not the only one
   def handle_call({:has_session, client_id}, _from, state) do
-    has = guarded_value(fn -> SessionStore.exists?(state.ctx.sessions, client_id) end, false)
+    has =
+      guarded_value(
+        fn ->
+          SessionStore.exists?(state.ctx.sessions, client_id) or
+            SessionStore.imported_recently?(state.ctx.sessions, client_id)
+        end,
+        false
+      )
+
     {:reply, has, state}
   end
 
@@ -725,15 +736,18 @@ defmodule MqttX.Server.Cluster do
 
   defp answer_take(ctx, reply_to, client_id, mode) do
     scope = {ctx.retained_table, client_id}
-    WillDelay.cancel(scope)
+    # Clean Start 1 ends the session: its delayed Will goes out now
+    if mode == :clean, do: WillDelay.fire(scope), else: WillDelay.cancel(scope)
     SessionExpiry.cancel(scope)
 
     cond do
-      not SessionStore.exists?(ctx.sessions, client_id) ->
-        :none
-
+      # The session here, or what is left of one that moved away, is discarded
       mode == :clean ->
         SessionStore.delete(ctx.sessions, client_id)
+        SessionStore.drop_moved(ctx.sessions, client_id)
+        :none
+
+      not SessionStore.exists?(ctx.sessions, client_id) ->
         :none
 
       true ->
@@ -754,11 +768,14 @@ defmodule MqttX.Server.Cluster do
         not Map.has_key?(meta, :placeholder),
         not Map.has_key?(meta, :moved_to),
         SessionStore.began_at(meta) < theirs do
-      take_over_connections(ctx, client_id, from_node)
-      scope = {ctx.retained_table, client_id}
-      WillDelay.cancel(scope)
-      SessionExpiry.cancel(scope)
-      SessionStore.delete(ctx.sessions, client_id)
+      # A CONNECT for the id in flight here settles it as any collision
+      # (take_over_connections): the session is not dropped under it
+      if take_over_connections(ctx, client_id, from_node) == :ok do
+        scope = {ctx.retained_table, client_id}
+        WillDelay.cancel(scope)
+        SessionExpiry.cancel(scope)
+        SessionStore.delete(ctx.sessions, client_id)
+      end
     end
   rescue
     e -> Logger.debug("[MqttX.Server.Cluster] sessions not compared: #{Exception.message(e)}")
@@ -770,34 +787,49 @@ defmodule MqttX.Server.Cluster do
     Process.sleep(@forward_window)
     now = System.monotonic_time(:millisecond)
 
-    # Let go only once the new node has the session: the connection that
+    # Let go only once the new node has had the session: the connection that
     # claimed it may have died before the export reached it, and the copy
-    # here is then the only one
-    if imported?(ctx.listener, to, client_id) do
-      for {topic, payload, opts, queued_at} <-
-            SessionStore.finish_move(ctx.sessions, client_id, ref) do
-        message = {Map.get(opts, :id), topic, payload, Map.delete(opts, :id), now - queued_at}
-        deliver_to(ctx.listener, to, client_id, message)
-      end
-    else
-      if SessionStore.unmove(ctx.sessions, client_id, ref) do
-        Logger.info(
-          "[MqttX.Server.Cluster] session #{inspect(client_id)} never arrived on " <>
-            "#{inspect(to)}: kept here"
+    # here is then the only one. A node that does not answer is asked again;
+    # one that never answers leaves the stub to expire on its own rather
+    # than a copy of a session that may well be live there.
+    case imported?(ctx.listener, to, client_id, 3) do
+      true ->
+        for {topic, payload, opts, queued_at} <-
+              SessionStore.finish_move(ctx.sessions, client_id, ref) do
+          message = {Map.get(opts, :id), topic, payload, Map.delete(opts, :id), now - queued_at}
+          deliver_to(ctx.listener, to, client_id, message)
+        end
+
+      false ->
+        if SessionStore.unmove(ctx.sessions, client_id, ref) do
+          Logger.info(
+            "[MqttX.Server.Cluster] session #{inspect(client_id)} never arrived on " <>
+              "#{inspect(to)}: kept here"
+          )
+        end
+
+      :unknown ->
+        Logger.warning(
+          "[MqttX.Server.Cluster] #{inspect(to)} did not say whether session " <>
+            "#{inspect(client_id)} arrived; the copy here expires on its own"
         )
-      end
     end
   rescue
     e -> Logger.debug("[MqttX.Server.Cluster] move not finished: #{Exception.message(e)}")
   end
 
-  defp imported?(listener, to, client_id) do
+  defp imported?(_listener, _to, _client_id, 0), do: :unknown
+
+  defp imported?(listener, to, client_id, attempts) do
     case Enum.find(members(listener), &(node(&1) == to)) do
+      # The node is gone: nothing there to keep the session
       nil -> false
       pid -> GenServer.call(pid, {:has_session, client_id}, @claim_timeout)
     end
   catch
-    :exit, _ -> false
+    :exit, _ ->
+      Process.sleep(1_000)
+      imported?(listener, to, client_id, attempts - 1)
   end
 
   # The same handshake a local takeover uses (§3.1.4): the connection

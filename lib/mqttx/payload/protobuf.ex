@@ -9,7 +9,7 @@ defmodule MqttX.Payload.Protobuf do
 
   ## Usage
 
-      # Encoding (returns iodata by default)
+      # Encoding (a binary; encode_iodata/1 for iodata)
       {:ok, binary} = MqttX.Payload.Protobuf.encode(my_proto_struct)
 
       # Decoding (requires message module)

@@ -112,8 +112,13 @@ defmodule MqttX.SimpleClient do
     end
   end
 
+  # From inside a callback (the wrapper process) the connection is stopped
+  # directly: a call to the wrapper itself would deadlock
   def disconnect(server, opts \\ []) do
-    GenServer.call(server, {:disconnect, opts})
+    case Process.get(:__mqttx_simple_client__) do
+      client when is_pid(client) -> MqttX.Client.disconnect(client, opts)
+      nil -> GenServer.call(server, {:disconnect, opts})
+    end
   end
 
   # ---------- GenServer ----------

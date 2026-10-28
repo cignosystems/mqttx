@@ -304,9 +304,10 @@ defmodule MqttX.Transport.Handler do
         state
       end
 
-    if connected and not state.disconnect_notified and state.handler != nil do
-      notify_disconnect(state, :closed)
-    end
+    state =
+      if connected and not state.disconnect_notified and state.handler != nil,
+        do: notify_disconnect(state, :closed),
+        else: state
 
     state = if connected, do: end_connection_session(state), else: state
 
@@ -327,9 +328,10 @@ defmodule MqttX.Transport.Handler do
         state
       end
 
-    if state.connected and not state.disconnect_notified and state.handler != nil do
-      notify_disconnect(state, {:error, reason})
-    end
+    state =
+      if state.connected and not state.disconnect_notified and state.handler != nil,
+        do: notify_disconnect(state, {:error, reason}),
+        else: state
 
     state = if state.connected, do: end_connection_session(state), else: state
 
@@ -352,9 +354,10 @@ defmodule MqttX.Transport.Handler do
         state
       end
 
-    if state.connected and not state.disconnect_notified and state.handler != nil do
-      notify_disconnect(state, :timeout)
-    end
+    state =
+      if state.connected and not state.disconnect_notified and state.handler != nil,
+        do: notify_disconnect(state, :timeout),
+        else: state
 
     state = if state.connected, do: end_connection_session(state), else: state
 
@@ -382,7 +385,6 @@ defmodule MqttX.Transport.Handler do
     state =
       if state.connected and not state.disconnect_notified and state.handler != nil do
         notify_disconnect(state, :keepalive_timeout)
-        %{state | disconnect_notified: true}
       else
         state
       end
@@ -392,13 +394,15 @@ defmodule MqttX.Transport.Handler do
     {:stop, :normal, state}
   end
 
+  def handle_info({:server_disconnect, _reason_code, _properties}, %{connected: false} = state),
+    do: {:stop, :normal, state}
+
   def handle_info({:server_disconnect, reason_code, properties}, state) do
     send_disconnect(state, reason_code, properties)
 
     state =
-      if state.connected and not state.disconnect_notified and state.handler != nil do
+      if not state.disconnect_notified and state.handler != nil do
         notify_disconnect(state, {:server_disconnect, reason_code})
-        %{state | disconnect_notified: true}
       else
         state
       end
@@ -418,7 +422,7 @@ defmodule MqttX.Transport.Handler do
         state
       end
 
-    state = if state.connected, do: end_connection_session(state), else: state
+    state = end_connection_session(state)
 
     {:stop, :normal, state}
   end
@@ -490,6 +494,16 @@ defmodule MqttX.Transport.Handler do
   def handle_info({:session_takeover, new_pid}, state) do
     {:stop, :normal, state} =
       handle_info({:server_disconnect, RC.session_taken_over(), %{}}, state)
+
+    # An immediate Will is published before the new connection goes on, so
+    # its own first messages (an "online" state, say) come after it
+    state =
+      if state.will_message do
+        publish_will(state)
+        %{state | will_message: nil}
+      else
+        state
+      end
 
     send(new_pid, {:session_released, self()})
     {:stop, :normal, state}
@@ -580,7 +594,6 @@ defmodule MqttX.Transport.Handler do
     state =
       if state.connected and not state.disconnect_notified and state.handler != nil do
         notify_disconnect(state, reason)
-        %{state | disconnect_notified: true}
       else
         state
       end
@@ -1074,14 +1087,15 @@ defmodule MqttX.Transport.Handler do
         state =
           if not state.disconnect_notified and state.handler != nil do
             notify_disconnect(state, :normal)
-            %{state | disconnect_notified: true}
           else
             state
           end
 
         state = end_connection_session(state)
 
-        {:close, :disconnect, %{state | graceful_disconnect: true}}
+        # §3.14.4-3: only a DISCONNECT with Reason Code 0x00 discards the Will;
+        # with any other code the Will is published as on a lost connection
+        {:close, :disconnect, %{state | graceful_disconnect: reason_code == 0}}
     end
   end
 
@@ -1481,7 +1495,7 @@ defmodule MqttX.Transport.Handler do
     # cancels a pending session expiry (the session resumed in time).
     if packet.client_id not in [nil, ""] do
       scope = timer_scope(state, packet.client_id)
-      MqttX.Server.WillDelay.cancel(scope)
+      end_pending_will(scope, packet.clean_session)
       MqttX.Server.SessionExpiry.cancel(scope)
     end
 
@@ -1511,7 +1525,7 @@ defmodule MqttX.Transport.Handler do
         # this connection resumes
         if packet.client_id not in [nil, ""] do
           scope = timer_scope(state, packet.client_id)
-          MqttX.Server.WillDelay.cancel(scope)
+          end_pending_will(scope, packet.clean_session)
           MqttX.Server.SessionExpiry.cancel(scope)
         end
 
@@ -1753,6 +1767,12 @@ defmodule MqttX.Transport.Handler do
     }
 
     cond do
+      # A re-sent QoS 2 PUBLISH whose id is pending is already in the window:
+      # the PUBREC again, however full the window is
+      packet.qos == 2 and Map.has_key?(state.pending_qos2_rx, packet.packet_id) ->
+        send_packet(state, %{type: :pubrec, packet_id: packet.packet_id}, state.protocol_version)
+        {:ok, state}
+
       # §3.3.4 / §4.9: a client with more QoS > 0 PUBLISH packets in flight
       # than the Receive Maximum we advertised is a Protocol Error, answered
       # with DISCONNECT 0x93 (Receive Maximum exceeded) and the connection
@@ -1903,6 +1923,12 @@ defmodule MqttX.Transport.Handler do
         yield?
     end
   end
+
+  # §3.1.3.2.2: a new connection to the session cancels its pending Will
+  # Delay. Clean Start 1 ends that session instead, so the Will goes out now
+  # (§3.1.2.5: the Will is published when the session ends).
+  defp end_pending_will(scope, true), do: MqttX.Server.WillDelay.fire(scope)
+  defp end_pending_will(scope, _clean_start), do: MqttX.Server.WillDelay.cancel(scope)
 
   # Scope per-client timers to this listener, matching how session takeover
   # scopes its registry key.
@@ -2688,7 +2714,9 @@ defmodule MqttX.Transport.Handler do
             try do
               Cluster.import_moved(listener, client_id, record)
             catch
-              :exit, _ -> SessionStore.import(sessions, client_id, Map.delete(record, :from))
+              :exit, _ ->
+                SessionStore.import(sessions, client_id, Map.delete(record, :from))
+                SessionStore.mark_imported(sessions, client_id)
             end
 
           _ ->
@@ -2738,12 +2766,18 @@ defmodule MqttX.Transport.Handler do
   # Maybe publish will message, respecting will_delay_interval
   # The connection is ending: a callback that raises or exits must not stop
   # the rest of the close work (the Will, the session's end)
+  # Returns the state with `disconnect_notified` set, so no later close path
+  # tells the handler twice
   defp notify_disconnect(state, reason) do
-    state.handler.handle_disconnect(reason, state.handler_state)
-  rescue
-    e -> log_callback_failure("handle_disconnect", :error, e, __STACKTRACE__)
-  catch
-    kind, value -> log_callback_failure("handle_disconnect", kind, value, __STACKTRACE__)
+    try do
+      state.handler.handle_disconnect(reason, state.handler_state)
+    rescue
+      e -> log_callback_failure("handle_disconnect", :error, e, __STACKTRACE__)
+    catch
+      kind, value -> log_callback_failure("handle_disconnect", kind, value, __STACKTRACE__)
+    end
+
+    %{state | disconnect_notified: true}
   end
 
   defp publish_will(state) do
@@ -2757,12 +2791,15 @@ defmodule MqttX.Transport.Handler do
   defp log_callback_failure(what, kind, value, stacktrace) do
     Logger.error(
       "[MqttX.Transport] #{what} failed while the connection closed: " <>
-        "#{kind} #{Exception.message(Exception.normalize(kind, value))}\n" <>
-        Exception.format_stacktrace(stacktrace)
+        "#{kind} #{failure_message(kind, value)}\n" <> Exception.format_stacktrace(stacktrace)
     )
 
     :ok
   end
+
+  # A raised exception has a message; a thrown or exited value is shown as is
+  defp failure_message(:error, value), do: Exception.message(Exception.normalize(:error, value))
+  defp failure_message(_kind, value), do: inspect(value)
 
   defp maybe_publish_will(%{will_message: nil}), do: :ok
 

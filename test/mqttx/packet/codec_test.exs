@@ -664,6 +664,115 @@ defmodule MqttX.Packet.CodecTest do
   end
 
   describe "strictness the spec asks for" do
+    test "a reason code is one byte: anything else is refused, not cut" do
+      for packet <- [
+            %{type: :connack, session_present: false, reason_code: 256, properties: %{}},
+            %{type: :puback, packet_id: 1, reason_code: 300, properties: %{}},
+            %{type: :pubrel, packet_id: 1, reason_code: -1, properties: %{}},
+            %{type: :disconnect, reason_code: 1000, properties: %{}},
+            %{type: :auth, reason_code: 256, properties: %{authentication_method: "m"}}
+          ] do
+        assert {:error, :value_out_of_range} = Codec.encode(5, packet)
+      end
+    end
+
+    test "a 3.1.1 DISCONNECT has no body, whatever the caller passes, and one with a body is malformed" do
+      assert {:ok, <<0xE0, 0>>} =
+               Codec.encode(4, %{type: :disconnect, reason_code: 4, properties: %{}})
+
+      assert {:error, :malformed_packet} = Codec.decode(4, <<0xE0, 1, 4>>)
+      assert {:ok, {%{type: :disconnect, reason_code: 4}, <<>>}} = Codec.decode(5, <<0xE0, 1, 4>>)
+    end
+
+    test "encode/2 answers {:error, _} for input it cannot encode, never raising" do
+      publish = fn props ->
+        %{
+          type: :publish,
+          topic: "t",
+          payload: "p",
+          qos: 0,
+          retain: false,
+          dup: false,
+          packet_id: nil,
+          properties: props
+        }
+      end
+
+      assert {:error, :value_out_of_range} =
+               Codec.encode(5, publish.(%{payload_format_indicator: 2}))
+
+      assert {:error, {:invalid_property, :user_properties}} =
+               Codec.encode(5, publish.(%{user_properties: [{"k", 1}]}))
+
+      assert {:error, :invalid_topic} = Codec.encode(5, %{publish.(%{}) | topic: ["a", 1]})
+      assert {:error, :invalid_topic} = Codec.encode(5, Map.delete(publish.(%{}), :topic))
+
+      assert {:error, :invalid_ack} =
+               Codec.encode(5, %{type: :suback, packet_id: 1, acks: [{:ok, 3}], properties: %{}})
+
+      assert {:error, :empty_acks} =
+               Codec.encode(5, %{type: :suback, packet_id: 1, acks: [], properties: %{}})
+
+      assert {:error, :invalid_packet} =
+               Codec.encode(5, %{type: :publish, topic: "t", payload: :not_a_binary, qos: 0})
+
+      assert {:ok, _} =
+               Codec.encode(5, %{
+                 type: :connect,
+                 protocol_version: 5,
+                 client_id: nil,
+                 clean_session: true,
+                 keep_alive: 60,
+                 properties: %{}
+               })
+    end
+
+    test "the encoder refuses what its decoder would refuse" do
+      publish = fn props ->
+        %{
+          type: :publish,
+          topic: "t",
+          payload: "p",
+          qos: 0,
+          retain: false,
+          dup: false,
+          packet_id: nil,
+          properties: props
+        }
+      end
+
+      assert {:error, _} = Codec.encode(5, publish.(%{topic_alias: 0}))
+
+      assert {:error, _} =
+               Codec.encode(5, %{
+                 type: :connect,
+                 protocol_version: 5,
+                 client_id: "c",
+                 clean_session: true,
+                 keep_alive: 60,
+                 properties: %{receive_maximum: 0}
+               })
+
+      assert {:error, _} =
+               Codec.encode(5, %{
+                 type: :subscribe,
+                 packet_id: 1,
+                 topics: [%{topic: "t", qos: 0}],
+                 properties: %{subscription_identifier: [1, 2]}
+               })
+    end
+
+    test "a v5 client reading a 3.1.1 CONNACK gets the matching v5 reason code" do
+      assert {:ok, {%{type: :connack, reason_code: 0x84, properties: %{}}, <<>>}} =
+               Codec.decode(5, <<0x20, 2, 0, 1>>)
+
+      assert {:ok, {%{type: :connack, reason_code: 0x86}, <<>>}} =
+               Codec.decode(5, <<0x20, 2, 0, 4>>)
+
+      assert {:ok, {%{type: :connack, reason_code: 0, session_present: true}, <<>>}} =
+               Codec.decode(5, <<0x20, 2, 1, 0>>)
+    end
+
     test "a Remaining Length that is not the shortest encoding is malformed (MQTT-1.5.5-1)" do
       # PINGREQ with remaining length 0 encoded in two bytes
       assert {:error, _} = Codec.decode(4, <<0xC0, 0x80, 0x00>>)

@@ -40,10 +40,6 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
     - `:check_origin` - Origins a browser may connect from, as a list of
       `"scheme://host[:port]"`; any other Origin is refused with 403. A
       request without an Origin header passes (default: `false`, no check)
-      (`:infinity` disables). When unset, websock_adapter's own default
-      applies — note that changed in websock_adapter 0.6.0 from `:infinity`
-      to 10 MB, so set this explicitly if you need behaviour independent of
-      which adapter version resolves.
 
     All protocol-level options (`:max_packet_size`, `:max_idle_timeout`,
     `:rate_limit`, …) behave as documented in

@@ -26,10 +26,16 @@ defmodule MqttX.Client.Proxy do
 
     with :ok <- validate_target(host),
          {:ok, socket} <-
-           :gen_tcp.connect(proxy_host, proxy_port, [:binary, active: false], timeout),
-         :ok <- :gen_tcp.send(socket, connect_request(host, port, proxy)),
-         :ok <- await_response(socket, <<>>, timeout) do
-      {:ok, socket}
+           :gen_tcp.connect(proxy_host, proxy_port, [:binary, active: false], timeout) do
+      with :ok <- :gen_tcp.send(socket, connect_request(host, port, proxy)),
+           :ok <- await_response(socket, <<>>, timeout) do
+        {:ok, socket}
+      else
+        # The tunnel was refused or never answered: the socket goes with it
+        {:error, reason} ->
+          :gen_tcp.close(socket)
+          {:error, {:proxy, reason}}
+      end
     else
       {:error, reason} -> {:error, {:proxy, reason}}
     end

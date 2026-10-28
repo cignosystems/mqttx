@@ -215,7 +215,20 @@ defmodule MqttX.Packet.Codec do
     {:error, :malformed_packet}
   end
 
-  # CONNACK
+  # CONNACK. A v5 CONNECT answered by a 3.1.1-only broker gets the 2-byte
+  # 3.1.1 form (return code 1, Unacceptable Protocol Version, as a rule):
+  # read as v5 with the codes mapped, so the client sees 0x84 and stops
+  # instead of a malformed packet and a reconnect loop.
+  defp decode_packet(5, @connack, 0, <<0::7, session_present::1, return_code::8>>) do
+    {:ok,
+     %{
+       type: :connack,
+       session_present: session_present == 1,
+       reason_code: connack_return_to_reason(return_code),
+       properties: %{}
+     }}
+  end
+
   defp decode_packet(
          version,
          @connack,
@@ -383,6 +396,11 @@ defmodule MqttX.Packet.Codec do
     {:ok, %{type: :disconnect, reason_code: 0, properties: %{}}}
   end
 
+  # 3.1.1 §3.14: a DISCONNECT with a payload is malformed
+  defp decode_packet(version, @disconnect, 0, <<_::8, _::binary>>) when version < 5 do
+    {:error, :malformed_packet}
+  end
+
   defp decode_packet(_version, @disconnect, 0, <<reason_code::8>>) do
     {:ok, %{type: :disconnect, reason_code: reason_code, properties: %{}}}
   end
@@ -448,6 +466,9 @@ defmodule MqttX.Packet.Codec do
       {:error, _} = err ->
         err
     end
+  rescue
+    e in [FunctionClauseError, ArgumentError, KeyError, MatchError, CaseClauseError] ->
+      encode_raise_to_error(e)
   catch
     thrown -> encode_throw_to_error(thrown)
   end
@@ -470,8 +491,24 @@ defmodule MqttX.Packet.Codec do
       {:error, _} = err ->
         err
     end
+  rescue
+    e in [FunctionClauseError, ArgumentError, KeyError, MatchError, CaseClauseError] ->
+      encode_raise_to_error(e)
   catch
     thrown -> encode_throw_to_error(thrown)
+  end
+
+  # A packet map the encoder has no clause for (a field of the wrong type,
+  # a value nothing checks for): the documented error, not a crash in the
+  # caller's process
+  defp encode_raise_to_error(_exception), do: {:error, :invalid_packet}
+
+  # Reason codes are one byte (§2.4)
+  defp reason_code!(msg) do
+    case Map.get(msg, :reason_code, 0) do
+      code when is_integer(code) and code >= 0 and code <= 0xFF -> code
+      _ -> throw(:mqttx_value_out_of_range)
+    end
   end
 
   # Shared mapping for the throw-based validation in encode_packet/2 and its
@@ -483,6 +520,8 @@ defmodule MqttX.Packet.Codec do
   defp encode_throw_to_error(:mqttx_invalid_topic), do: {:error, :invalid_topic}
   defp encode_throw_to_error(:mqttx_empty_topic_list), do: {:error, :empty_topic_list}
   defp encode_throw_to_error(:mqttx_value_out_of_range), do: {:error, :value_out_of_range}
+  defp encode_throw_to_error(:mqttx_empty_acks), do: {:error, :empty_acks}
+  defp encode_throw_to_error(:mqttx_invalid_ack), do: {:error, :invalid_ack}
 
   defp encode_throw_to_error(:mqttx_dup_requires_qos), do: {:error, :dup_requires_qos}
 
@@ -528,7 +567,7 @@ defmodule MqttX.Packet.Codec do
       <<version::8, username_flag::1, password_flag::1, will_retain::1, will_qos::2, will_flag::1,
         clean::1, 0::1, keepalive::16-big>>,
       Properties.encode(version, Map.get(msg, :properties, %{}), :connect),
-      encode_utf8(Map.get(msg, :client_id, "")),
+      encode_utf8(Map.get(msg, :client_id) || ""),
       encode_will(version, msg[:will]),
       encode_optional_utf8(msg[:username]),
       # §3.1.3.6: the Password is BINARY data, not a UTF-8 string
@@ -541,7 +580,7 @@ defmodule MqttX.Packet.Codec do
   # CONNACK
   defp encode_packet(version, %{type: :connack} = msg) do
     session_present = if Map.get(msg, :session_present, false), do: 1, else: 0
-    reason_code = Map.get(msg, :reason_code, 0)
+    reason_code = reason_code!(msg)
     props = Properties.encode(version, Map.get(msg, :properties, %{}), :connack)
 
     variable = [<<0::7, session_present::1, reason_code::8>>, props]
@@ -560,9 +599,16 @@ defmodule MqttX.Packet.Codec do
     retain = if Map.get(msg, :retain, false), do: 1, else: 0
 
     topic =
-      case msg.topic do
-        t when is_list(t) -> Topic.flatten(t)
-        t when is_binary(t) -> t
+      case Map.get(msg, :topic) do
+        t when is_list(t) ->
+          unless Enum.all?(t, &is_binary/1), do: throw(:mqttx_invalid_topic)
+          Topic.flatten(t)
+
+        t when is_binary(t) ->
+          t
+
+        _ ->
+          throw(:mqttx_invalid_topic)
       end
 
     # Never emit a PUBLISH the receiver must reject: wildcards (or an empty
@@ -595,7 +641,7 @@ defmodule MqttX.Packet.Codec do
   defp encode_packet(version, %{type: type} = msg) when type in [:puback, :pubrec, :pubcomp] do
     type_code = atom_to_type(type)
     packet_id = require_packet_id(msg)
-    reason_code = Map.get(msg, :reason_code, 0)
+    reason_code = reason_code!(msg)
     props = Map.get(msg, :properties, %{})
 
     variable = encode_ack_response(version, packet_id, reason_code, props)
@@ -605,7 +651,7 @@ defmodule MqttX.Packet.Codec do
   # PUBREL
   defp encode_packet(version, %{type: :pubrel} = msg) do
     packet_id = require_packet_id(msg)
-    reason_code = Map.get(msg, :reason_code, 0)
+    reason_code = reason_code!(msg)
     props = Map.get(msg, :properties, %{})
 
     variable = encode_ack_response(version, packet_id, reason_code, props)
@@ -628,7 +674,10 @@ defmodule MqttX.Packet.Codec do
   defp encode_packet(version, %{type: :suback} = msg) do
     packet_id = require_packet_id(msg)
     props = Properties.encode(version, Map.get(msg, :properties, %{}), :suback)
-    acks = encode_suback_acks(Map.get(msg, :acks, []))
+    ack_list = Map.get(msg, :acks, [])
+    # §3.9.3: one reason code per filter of the SUBSCRIBE, so never none
+    if ack_list == [], do: throw(:mqttx_empty_acks)
+    acks = encode_suback_acks(ack_list)
 
     variable = [<<packet_id::16-big>>, props, acks]
     {:ok, {<<@suback::4, 0::4>>, variable}}
@@ -673,9 +722,14 @@ defmodule MqttX.Packet.Codec do
     {:ok, {<<@pingresp::4, 0::4>>, <<>>}}
   end
 
-  # DISCONNECT
+  # DISCONNECT. Before v5 it has no body: a reason code or properties given
+  # for a 3.1.1 connection are dropped, not sent as a malformed packet.
+  defp encode_packet(version, %{type: :disconnect}) when version < 5 do
+    {:ok, {<<@disconnect::4, 0::4>>, <<>>}}
+  end
+
   defp encode_packet(version, %{type: :disconnect} = msg) do
-    reason_code = Map.get(msg, :reason_code, 0)
+    reason_code = reason_code!(msg)
     props = Map.get(msg, :properties, %{})
 
     variable =
@@ -690,7 +744,7 @@ defmodule MqttX.Packet.Codec do
 
   # AUTH (MQTT 5.0 only)
   defp encode_packet(5, %{type: :auth} = msg) do
-    reason_code = Map.get(msg, :reason_code, 0)
+    reason_code = reason_code!(msg)
     props = Map.get(msg, :properties, %{})
 
     variable =
@@ -762,6 +816,15 @@ defmodule MqttX.Packet.Codec do
   # These functions handle all packet types for completeness, but may only be
   # called with a subset of types in specific contexts. Dialyzer warnings suppressed.
   @dialyzer {:nowarn_function, type_to_atom: 1}
+  # 3.1.1 §3.2.2.3 return codes as the v5 reason codes they stand for
+  defp connack_return_to_reason(0), do: 0x00
+  defp connack_return_to_reason(1), do: 0x84
+  defp connack_return_to_reason(2), do: 0x85
+  defp connack_return_to_reason(3), do: 0x88
+  defp connack_return_to_reason(4), do: 0x86
+  defp connack_return_to_reason(5), do: 0x87
+  defp connack_return_to_reason(_), do: 0x80
+
   defp type_to_atom(@connect), do: :connect
   defp type_to_atom(@connack), do: :connack
   defp type_to_atom(@publish), do: :publish
@@ -1071,8 +1134,14 @@ defmodule MqttX.Packet.Codec do
 
   defp encode_suback_acks(acks) do
     Enum.map(acks, fn
-      {:ok, qos} when qos in [0, 1, 2] -> <<0::6, qos::2>>
-      {:error, reason} when reason >= 0x80 -> <<reason::8>>
+      {:ok, qos} when qos in [0, 1, 2] ->
+        <<0::6, qos::2>>
+
+      {:error, reason} when is_integer(reason) and reason >= 0x80 and reason <= 0xFF ->
+        <<reason::8>>
+
+      _ ->
+        throw(:mqttx_invalid_ack)
     end)
   end
 
@@ -1101,9 +1170,17 @@ defmodule MqttX.Packet.Codec do
 
   defp encode_unsuback_acks(acks) do
     Enum.map(acks, fn
-      {:ok, :found} -> <<0>>
-      {:ok, :notfound} -> <<17>>
-      {:error, reason} when reason >= 0x80 -> <<reason::8>>
+      {:ok, :found} ->
+        <<0>>
+
+      {:ok, :notfound} ->
+        <<17>>
+
+      {:error, reason} when is_integer(reason) and reason >= 0x80 and reason <= 0xFF ->
+        <<reason::8>>
+
+      _ ->
+        throw(:mqttx_invalid_ack)
     end)
   end
 end

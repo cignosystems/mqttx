@@ -25,7 +25,7 @@ defmodule MqttX.Server.RateLimiter do
 
       case MqttX.Server.RateLimiter.allow_message?(limiter, client_id) do
         :ok -> # process message
-        {:error, :rate_limited} -> # reject with 0x96
+        {:error, :rate_limited} -> # refuse with 0x97 Quota exceeded (0x96 is DISCONNECT-only)
       end
   """
 

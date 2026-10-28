@@ -171,30 +171,21 @@ All transports support plain TCP and TLS. See `MqttX.Transport` for implementing
 
 ## Topic Routing
 
-The built-in router uses a trie data structure for efficient topic matching — O(L+K) where L is the topic depth and K is matching subscriptions. It supports MQTT wildcard subscriptions (`+` single-level, `#` multi-level):
-
-```elixir
-alias MqttX.Server.Router
-
-router = Router.new()
-router = Router.subscribe(router, "sensors/+/temp", client_ref, qos: 1)
-router = Router.subscribe(router, "alerts/#", client_ref, qos: 0)
-
-matches = Router.match(router, "sensors/room1/temp")
-# => [{client_ref, %{qos: 1}}]
-```
+Subscriptions are matched with a trie — O(L+K), where L is the topic depth
+and K the number of matching subscriptions, whatever the total — with the
+MQTT wildcards (`+` one level, `#` the rest). The index
+(`MqttX.Server.Router`) is the broker's own, kept per listener; you do not
+drive it yourself: `handle_subscribe/2` grants, and `MqttX.Server.deliver/3`
+or a `{:publish, …}` return from `handle_info/2` matches.
 
 ### Shared Subscriptions
 
-Distribute messages across a group of subscribers with round-robin load balancing:
-
-```elixir
-router = Router.subscribe(router, "$share/workers/jobs/#", worker1, qos: 1)
-router = Router.subscribe(router, "$share/workers/jobs/#", worker2, qos: 1)
-
-# Messages to "jobs/process" alternate between worker1 and worker2
-{matches, router} = Router.match_and_advance(router, "jobs/process")
-```
+A filter of the form `$share/{group}/{filter}` is shared: each message
+matching it goes to one member of the group, round-robin, rather than to
+every subscriber. Clients subscribe to it like any other filter — nothing
+to do on the server side; the broker advertises
+`shared_subscription_available: 1`. Across a cluster a shared subscription
+delivers each message once (see Clustering).
 
 ## Rate Limiting
 
@@ -236,8 +227,9 @@ The server automatically stores retained messages in ETS and delivers them to ne
 
 ## Limits
 
-What one client can make the broker hold or do is bounded by default; all
-of it is in `transport_opts`:
+What one client can make the broker hold or do is bounded by default. All
+of it is in `transport_opts` but the connection rate limit, which is a
+listener option (`start_link/3`, see Rate Limiting):
 
 | Limit | Option | Default |
 |-------|--------|---------|
@@ -248,7 +240,7 @@ of it is in `transport_opts`:
 | Filters per session (0x97 past it) | `:max_subscriptions` | 10 000 |
 | Sessions per listener, connected or kept (CONNACK 0x97 for a new one past it) | `:max_sessions` | none |
 | Messages queued per session for a client that is away | `:max_outbound_queue` | 10 000 |
-| Retained topics (cleared ones count for an hour) | `:max_retained_messages` | 100 000 |
+| Retained topics (a cleared one counts for the hour its clear is remembered) | `:max_retained_messages` | 100 000 |
 | Levels in a topic or filter | — | 128 |
 | Time a session is kept after its connection ends | `:max_session_expiry_interval` | 1 day |
 | Connections per second, all peers together and per peer address | `:rate_limit` | none |
@@ -341,8 +333,10 @@ A connection taking over a client id (§3.1.4) inherits the session: the old
 connection is told to let go and the new one resumes from the store.
 
 The state lives in memory on the node that holds the connection. It survives
-the connection process and a listener restart, not a restart of the BEAM; a
-client reconnecting to another node starts fresh.
+the connection process and a listener restart; a restart of the BEAM takes
+it along unless the listener has a `:session_backend` (below). A client
+reconnecting to another node of a cluster finds its session moved there
+(see Clustering).
 
 ## Clustering
 
@@ -611,7 +605,7 @@ Kick a client from the server with an MQTT 5.0 reason code:
 ```elixir
 # From outside the handler (e.g., admin action)
 MqttX.Server.disconnect(transport_pid, 0x98)
-MqttX.Server.disconnect(transport_pid, 0x89, %{reason_string: "Session taken over"})
+MqttX.Server.disconnect(transport_pid, 0x8E, %{reason_string: "Session taken over"})
 ```
 
 Or return `{:disconnect, reason_code, state}` from any handler callback:
@@ -620,7 +614,7 @@ Or return `{:disconnect, reason_code, state}` from any handler callback:
 @impl true
 def handle_publish(topic, _payload, _opts, state) do
   if forbidden?(topic) do
-    {:disconnect, 0x98, state}  # Use assigned client identifier
+    {:disconnect, 0x98, state}  # Administrative action
   else
     {:ok, state}
   end
@@ -708,8 +702,9 @@ slow or gone, which the keep-alive timeout detects. The broker therefore:
 - Runs no retransmission timer — `qos2_retry_interval` and `qos2_max_retries`
   are deprecated and ignored since 0.12.0
 
-`MqttX.Server` does not persist sessions, so in-flight state ends with the
-connection.
+In-flight state belongs to the session: for a persistent session it is kept
+while the client is away and resumed when it returns (see Session State);
+for a session with no expiry it ends with the connection.
 
 ### Enhanced Authentication
 
@@ -754,7 +749,7 @@ For MQTT 5.0 connections, the server automatically includes these properties in 
 |----------|-------|-------------|
 | `shared_subscription_available` | `1` | Shared subscriptions supported |
 | `topic_alias_maximum` | `100` | Max topic aliases the server accepts |
-| `receive_maximum` | `65535` | Max in-flight QoS 1/2 messages |
+| `receive_maximum` | `100` | Max in-flight QoS 1/2 messages from the client |
 | `maximum_packet_size` | *(if configured)* | Max incoming packet size in bytes |
 | `retain_available` | `1` | Retained messages supported |
 | `wildcard_subscription_available` | `1` | Wildcard subscriptions supported |
@@ -768,7 +763,7 @@ The `opts` map passed to `handle_publish/4` includes a `:properties` key contain
 
 The server supports MQTT 5.0 subscription options:
 
-- **`no_local`**: When set to `true`, messages published by a client are not delivered back to that client's own matching subscriptions. Requires passing the publisher identity to `Router.match/3`.
+- **`no_local`**: When set to `true`, messages published by a client are not delivered back to that client's own matching subscriptions. Honoured when the publisher is named: `MqttX.Server.deliver/3` with `publisher: client_id` in `opts`, or a `{:publish, topic, payload, opts, state}` return carrying the same.
 - **`retain_handling`**: Controls retained message delivery on subscribe:
   - `0` — Send retained messages (default)
   - `1` — Send retained messages if the subscription does not already exist

@@ -53,7 +53,10 @@ process starts — *before* the CONNECT/CONNACK handshake completes — so a
 `subscribe` or `publish` issued immediately afterwards returns
 `{:error, :not_connected}`. That default exists so a client can be started
 before its broker is reachable and keep retrying with backoff, which is the
-normal case for devices and for apps that boot alongside their broker.
+normal case for devices and for apps that boot alongside their broker. The
+delay between attempts doubles up to 30 s and starts over only after a
+connection that held for 30 s, so a broker that drops the client right
+after CONNACK is not retried every second.
 
 For long-lived clients you usually don't need to do anything: subscriptions
 are **replayed automatically** after every reconnect that reports
@@ -378,6 +381,12 @@ The client automatically applies MQTT 5.0 CONNACK properties from the broker:
 
 All of these are per-connection: every CONNACK replaces the previous values,
 so a reconnect to a broker with different limits picks them up.
+
+The client tells the broker its own limits the same way, in CONNECT (v5):
+a Receive Maximum of 100 and its `:max_packet_size` (1 MiB by default),
+unless `connect_properties` sets them — a `maximum_packet_size` above the
+enforced cap is lowered to it, since advertising more would invite packets
+the client then refuses.
 
 ### Publishing with Properties
 

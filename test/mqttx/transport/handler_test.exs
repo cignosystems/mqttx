@@ -1441,18 +1441,9 @@ defmodule MqttX.Transport.HandlerTest do
       state = connect_client_v5(ctx, "ta-zero")
       drain_mailbox()
 
-      publish = %{
-        type: :publish,
-        topic: "some/topic",
-        payload: "msg",
-        qos: 0,
-        retain: false,
-        dup: false,
-        packet_id: nil,
-        properties: %{topic_alias: 0}
-      }
-
-      {:ok, data} = Codec.encode(5, publish)
+      # On the wire by hand: the encoder refuses a Topic Alias of 0 itself
+      body = <<10::16, "some/topic", 3, 0x23, 0::16, "msg">>
+      data = <<0x30, byte_size(body), body::binary>>
       {:close, {:server_disconnect, 0x94}, _state} = Proto.handle_data(data, state)
     end
   end

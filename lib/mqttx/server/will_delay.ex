@@ -15,6 +15,8 @@ defmodule MqttX.Server.WillDelay do
 
   use GenServer
 
+  require Logger
+
   @type ctx :: %{
           required(:retained_table) => :ets.tid(),
           required(:handler) => module(),
@@ -38,6 +40,12 @@ defmodule MqttX.Server.WillDelay do
     GenServer.cast(__MODULE__, {:cancel, client_id})
   end
 
+  @doc "Publish the pending Will now: the session it belongs to has ended."
+  @spec fire(term()) :: :ok
+  def fire(client_id) do
+    GenServer.cast(__MODULE__, {:fire_now, client_id})
+  end
+
   @impl true
   def init(_opts), do: {:ok, %{}}
 
@@ -46,11 +54,22 @@ defmodule MqttX.Server.WillDelay do
     pending = drop_existing(pending, client_id)
     ref = make_ref()
     timer = Process.send_after(self(), {:fire, client_id, ref, will, ctx}, delay_ms)
-    {:noreply, Map.put(pending, client_id, {timer, ref})}
+    {:noreply, Map.put(pending, client_id, {timer, ref, will, ctx})}
   end
 
   def handle_cast({:cancel, client_id}, pending) do
     {:noreply, drop_existing(pending, client_id)}
+  end
+
+  def handle_cast({:fire_now, client_id}, pending) do
+    case Map.get(pending, client_id) do
+      {_timer, _ref, will, ctx} ->
+        publish_safely(will, ctx)
+        {:noreply, drop_existing(pending, client_id)}
+
+      nil ->
+        {:noreply, pending}
+    end
   end
 
   @impl true
@@ -59,8 +78,8 @@ defmodule MqttX.Server.WillDelay do
     # the race where cancel/1 runs after Process.send_after's message is
     # already in our mailbox.
     case Map.get(pending, client_id) do
-      {_timer, ^ref} ->
-        do_publish_will(will, ctx)
+      {_timer, ^ref, _will, _ctx} ->
+        publish_safely(will, ctx)
         {:noreply, Map.delete(pending, client_id)}
 
       _ ->
@@ -73,10 +92,31 @@ defmodule MqttX.Server.WillDelay do
       {nil, p} ->
         p
 
-      {{timer, _ref}, p} ->
+      {{timer, _ref, _will, _ctx}, p} ->
         Process.cancel_timer(timer)
         p
     end
+  end
+
+  # One client's handler raising must not lose every other client's Will:
+  # this server is shared by all of them
+  defp publish_safely(will, ctx) do
+    do_publish_will(will, ctx)
+  rescue
+    e ->
+      Logger.error(
+        "[MqttX.Server.WillDelay] handle_publish failed for a Will: " <>
+          Exception.message(e) <> "\n" <> Exception.format_stacktrace(__STACKTRACE__)
+      )
+
+      :ok
+  catch
+    kind, value ->
+      Logger.error(
+        "[MqttX.Server.WillDelay] handle_publish failed for a Will: #{kind} #{inspect(value)}"
+      )
+
+      :ok
   end
 
   defp do_publish_will(will, ctx) do

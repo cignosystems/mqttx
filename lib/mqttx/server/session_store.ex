@@ -1330,7 +1330,11 @@ defmodule MqttX.Server.SessionStore do
         module.delete(state, client_id)
         false
 
+      # The client connected before its record was restored: the next flush
+      # brings the backend in line with the session it began — saved if it
+      # is persistent, the record deleted if it ends with its connection
       :ets.member(store.sessions, client_id) ->
+        mark(store, client_id)
         false
 
       true ->

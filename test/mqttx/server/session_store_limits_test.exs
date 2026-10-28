@@ -70,6 +70,41 @@ defmodule MqttX.Server.SessionStoreLimitsTest do
       assert :ets.info(store.dirty, :size) == 0
     end
 
+    test "connecting before the restore of its saved record has the record reconciled",
+         %{path: path} do
+      store = SessionStore.new(nil, {DETS, path: path})
+      {DETS, table} = store.backend
+
+      for client <- ["brief", "kept"] do
+        :ok = SessionStore.put(store, client, meta())
+        :ok = SessionStore.subscribe(store, client, "old/#{client}", %{qos: 1})
+      end
+
+      :ok = SessionStore.flush(store)
+
+      # New tables over the same file, and both clients connect before the
+      # restore runs: one with Clean Start 1 (a session that ends with its
+      # connection), one resuming with a new subscription
+      restarted = SessionStore.new(nil, {DETS, path: path})
+      :ok = SessionStore.put(restarted, "brief", meta(%{persistent: false, lifetime: 0}))
+      :ok = SessionStore.put(restarted, "kept", meta())
+      :ok = SessionStore.subscribe(restarted, "kept", "new/kept", %{qos: 1})
+
+      assert SessionStore.restore(restarted) == 0
+      assert SessionStore.subscriptions(restarted, "brief") == []
+      assert [%{filter: "new/kept"}] = SessionStore.subscriptions(restarted, "kept")
+
+      :ok = SessionStore.flush(restarted)
+      assert DETS.load(table, "brief") == :none
+      assert {:ok, %{subscriptions: [%{filter: "new/kept"}]}} = DETS.load(table, "kept")
+
+      # So a third start brings back only what is still a session
+      third = SessionStore.new(nil, {DETS, path: path})
+      assert SessionStore.restore(third) == 1
+      assert SessionStore.get(third, "brief") == nil
+      assert [%{filter: "new/kept"}] = SessionStore.subscriptions(third, "kept")
+    end
+
     test "replacing a saved one has it deleted from the backend", %{path: path} do
       store = SessionStore.new(nil, {DETS, path: path})
       {DETS, table} = store.backend

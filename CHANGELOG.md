@@ -150,6 +150,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A saved session whose client connected again before the listener's
+  restore ran stayed in the backend.** The restore leaves a session that is
+  already there alone, and did not touch its record: if the client had come
+  back with Clean Start 1 (or a Session Expiry Interval of 0), the old
+  persistent record sat in the backend and came back at the next restart.
+  The next flush now brings the record in line with the session that began
+  — saved if it is persistent, deleted if it ends with its connection.
 - **Ranch: a raising handler callback left the session alive forever and
   dropped the Will.** The adapter neither trapped exits nor had a
   `terminate/2`, so an exception in `handle_publish` killed the connection

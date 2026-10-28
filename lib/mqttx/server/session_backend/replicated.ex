@@ -45,9 +45,11 @@ defmodule MqttX.Server.SessionBackend.Replicated do
 
   @impl MqttX.Server.SessionBackend
   def init(listener, _opts) do
+    # Named, so a listener restarting under the same name finds its process
+    # (and table) instead of starting a second one
     spec = %{
       id: {__MODULE__, listener},
-      start: {GenServer, :start_link, [__MODULE__, listener]},
+      start: {GenServer, :start_link, [__MODULE__, listener, [name: table(listener)]]},
       restart: :permanent
     }
 
@@ -117,6 +119,11 @@ defmodule MqttX.Server.SessionBackend.Replicated do
   def handle_info({:sync, rows}, state) do
     for {client_id, record, version} <- rows,
         do: apply_save(state.table, client_id, record, version)
+
+    # A node starting again inside a live cluster: its own sessions arrive
+    # here after the listener's start restored what the table held (nothing)
+    if Enum.any?(rows, &match?({_, %{node: node}, _} when node == node(), &1)),
+      do: MqttX.Server.Cluster.restore_from_backend(state.listener)
 
     {:noreply, state}
   end

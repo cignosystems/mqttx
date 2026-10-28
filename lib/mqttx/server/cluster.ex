@@ -75,6 +75,16 @@ defmodule MqttX.Server.Cluster do
   def scope, do: @scope
 
   @doc false
+  # The backend has records of this node that the listener's start did not
+  # see (they arrived from the other nodes after it): restore again
+  def restore_from_backend(listener) do
+    case GenServer.whereis(via(listener)) do
+      nil -> :ok
+      pid -> GenServer.cast(pid, :restore)
+    end
+  end
+
+  @doc false
   # Called by MqttX.Server.register_listener/2: one member per listener per
   # node, its context replaced when the listener restarts under the same name.
   # A durable backend's sessions are loaded first, before any client can
@@ -224,6 +234,9 @@ defmodule MqttX.Server.Cluster do
   # go of the client (takeover, timers) and of its session — handing it over
   # for Clean Start 0 (`:take`), discarding it for Clean Start 1 (`:clean`).
   @spec claim(term(), binary(), :take | :clean) :: {:ok, SessionStore.session_record()} | :none
+  # `{:yield, result}`: a takeover for the same client id reached this
+  # connection while it waited, from a CONNECT in flight at the same time
+  # that outranks it (`yield_to?/1`); that one keeps the session.
   def claim(listener, client_id, mode) when mode in [:take, :clean] do
     ask(listener, client_id, mode)
   end
@@ -239,24 +252,50 @@ defmodule MqttX.Server.Cluster do
         reply_to = :erlang.alias()
         Enum.each(members, &send(&1, {:claim, reply_to, client_id, mode}))
         deadline = System.monotonic_time(:millisecond) + @claim_timeout
-        result = collect(reply_to, length(members), deadline, :none)
+        result = collect(reply_to, length(members), deadline, :none, false)
         :erlang.unalias(reply_to)
         result
     end
   end
 
-  defp collect(_reply_to, 0, _deadline, result), do: result
+  defp collect(_reply_to, 0, _deadline, result, yield?), do: yielded(result, yield?)
 
-  defp collect(reply_to, pending, deadline, result) do
+  defp collect(reply_to, pending, deadline, result, yield?) do
     timeout = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {^reply_to, {:ok, _} = found} -> collect(reply_to, pending - 1, deadline, found)
-      {^reply_to, :none} -> collect(reply_to, pending - 1, deadline, result)
+      {^reply_to, {:ok, _} = found} ->
+        collect(reply_to, pending - 1, deadline, found, yield?)
+
+      {^reply_to, :none} ->
+        collect(reply_to, pending - 1, deadline, result, yield?)
+
+      # Two CONNECTs for the id at once, this one registered already: the
+      # other side's takeover is answered now (not after this wait, which
+      # it would hold up), and exactly one of the two gives way
+      {:session_takeover, pid} ->
+        send(pid, {:session_released, self()})
+        collect(reply_to, pending, deadline, result, yield? or yield_to?(pid))
+
+      {:session_takeover, pid, from_node} ->
+        send(pid, {:session_released, self()})
+        collect(reply_to, pending, deadline, result, yield? or yield_to_node?(from_node))
     after
-      timeout -> result
+      timeout -> yielded(result, yield?)
     end
   end
+
+  defp yielded(result, true), do: {:yield, result}
+  defp yielded(result, false), do: result
+
+  @doc false
+  # Of two connections taking each other over, the one on the lower node
+  # — or, on one node, with the lower pid — gives way: the same answer from
+  # both sides
+  def yield_to?(pid), do: {node(pid), pid} > {node(), self()}
+
+  @doc false
+  def yield_to_node?(from_node), do: from_node > node()
 
   defp broadcast(listener, message) do
     Enum.each(remote_members(listener), &send(&1, message))
@@ -311,12 +350,32 @@ defmodule MqttX.Server.Cluster do
     {:reply, :ok, state}
   end
 
+  # Asked by the node a session moved from, before it lets its copy go
+  def handle_call({:has_session, client_id}, _from, state) do
+    has = guarded_value(fn -> SessionStore.exists?(state.ctx.sessions, client_id) end, false)
+    {:reply, has, state}
+  end
+
   def handle_call({:release, client_id}, _from, state) do
     guarded(fn -> Delivery.release(state.ctx, client_id) end)
     {:reply, :ok, state}
   end
 
   @impl true
+  def handle_cast(:restore, state) do
+    guarded(fn ->
+      restored = SessionStore.restore(state.ctx.sessions)
+
+      if restored > 0 do
+        Logger.info(
+          "[MqttX.Server] Restored #{restored} session(s) for #{inspect(state.listener)}"
+        )
+      end
+    end)
+
+    {:noreply, state}
+  end
+
   def handle_cast({:shared_out, node, client_id, sub_opts, shared}, state) do
     message = Delivery.shared_message(shared, sub_opts)
     {:noreply, send_shared(state, node, client_id, sub_opts, message, false, shared)}
@@ -463,9 +522,9 @@ defmodule MqttX.Server.Cluster do
   # on both sides of a network split keeps the session it began last: the
   # older copy's connection is taken over and the copy dropped, here or
   # there, whichever holds it
-  def handle_info({:sessions, _node, began}, state) do
+  def handle_info({:sessions, node, began}, state) do
     ctx = state.ctx
-    spawn(fn -> drop_older(ctx, began) end)
+    spawn(fn -> drop_older(ctx, node, began) end)
     {:noreply, state}
   end
 
@@ -562,6 +621,12 @@ defmodule MqttX.Server.Cluster do
 
   defp sync_to(_pid, _state), do: :ok
 
+  defp guarded_value(fun, default) do
+    fun.()
+  rescue
+    _ -> default
+  end
+
   # The listener's tables may be gone if it stopped without this node's member
   # going with it; a stale member must not take the group down
   defp guarded(fun) do
@@ -644,7 +709,7 @@ defmodule MqttX.Server.Cluster do
   end
 
   defp answer_claim(ctx, reply_to, client_id, mode) do
-    take_over_connections(ctx, client_id)
+    take_over_connections(ctx, client_id, node(reply_to))
     scope = {ctx.retained_table, client_id}
     WillDelay.cancel(scope)
     SessionExpiry.cancel(scope)
@@ -673,13 +738,13 @@ defmodule MqttX.Server.Cluster do
       :none
   end
 
-  defp drop_older(ctx, began) do
+  defp drop_older(ctx, from_node, began) do
     for {client_id, theirs} <- began,
         %{} = meta <- [SessionStore.get(ctx.sessions, client_id)],
         not Map.has_key?(meta, :placeholder),
         not Map.has_key?(meta, :moved_to),
         SessionStore.began_at(meta) < theirs do
-      take_over_connections(ctx, client_id)
+      take_over_connections(ctx, client_id, from_node)
       scope = {ctx.retained_table, client_id}
       WillDelay.cancel(scope)
       SessionExpiry.cancel(scope)
@@ -695,23 +760,46 @@ defmodule MqttX.Server.Cluster do
     Process.sleep(@forward_window)
     now = System.monotonic_time(:millisecond)
 
-    for {topic, payload, opts, queued_at} <-
-          SessionStore.finish_move(ctx.sessions, client_id, ref) do
-      message = {Map.get(opts, :id), topic, payload, Map.delete(opts, :id), now - queued_at}
-      deliver_to(ctx.listener, to, client_id, message)
+    # Let go only once the new node has the session: the connection that
+    # claimed it may have died before the export reached it, and the copy
+    # here is then the only one
+    if imported?(ctx.listener, to, client_id) do
+      for {topic, payload, opts, queued_at} <-
+            SessionStore.finish_move(ctx.sessions, client_id, ref) do
+        message = {Map.get(opts, :id), topic, payload, Map.delete(opts, :id), now - queued_at}
+        deliver_to(ctx.listener, to, client_id, message)
+      end
+    else
+      if SessionStore.unmove(ctx.sessions, client_id, ref) do
+        Logger.info(
+          "[MqttX.Server.Cluster] session #{inspect(client_id)} never arrived on " <>
+            "#{inspect(to)}: kept here"
+        )
+      end
     end
   rescue
     e -> Logger.debug("[MqttX.Server.Cluster] move not finished: #{Exception.message(e)}")
   end
 
+  defp imported?(listener, to, client_id) do
+    case Enum.find(members(listener), &(node(&1) == to)) do
+      nil -> false
+      pid -> GenServer.call(pid, {:has_session, client_id}, @claim_timeout)
+    end
+  catch
+    :exit, _ -> false
+  end
+
   # The same handshake a local takeover uses (§3.1.4): the connection
   # disconnects with 0x8E and says when it has stopped writing to the session
-  defp take_over_connections(ctx, client_id) do
+  # The claiming node goes with the takeover: a connection here still in
+  # its own CONNECT decides by node which of the two gives way
+  defp take_over_connections(ctx, client_id, from_node) do
     key = {ctx.retained_table, client_id}
 
     for {pid, _} <- Registry.lookup(MqttX.Server.ConnectionRegistry, key) do
       ref = Process.monitor(pid)
-      send(pid, {:session_takeover, self()})
+      send(pid, {:session_takeover, self(), from_node})
 
       receive do
         {:session_released, ^pid} -> Process.demonitor(ref, [:flush])

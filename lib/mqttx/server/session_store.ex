@@ -1005,6 +1005,33 @@ defmodule MqttX.Server.SessionStore do
   end
 
   @doc false
+  # The session marked as moved stays: the node it was moving to never
+  # imported it (the connection claiming it died first). Its expiry clock
+  # runs from now, as after a disconnect.
+  @spec unmove(t(), client_id(), reference()) :: boolean()
+  def unmove(store, client_id, ref) do
+    case :ets.lookup(store.sessions, client_id) do
+      [{_, %{move_ref: ^ref} = meta}] ->
+        now = System.system_time(:second)
+
+        expires_at =
+          case Map.get(meta, :lifetime) do
+            lifetime when is_integer(lifetime) and lifetime < 0xFFFFFFFF -> now + lifetime
+            lifetime when is_integer(lifetime) -> :infinity
+            _ -> now + 60
+          end
+
+        meta = meta |> Map.drop([:moved_to, :move_ref]) |> Map.put(:expires_at, expires_at)
+        :ets.insert(store.sessions, {client_id, meta})
+        touch(store, client_id)
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  @doc false
   # A message matched here for a session whose fence is up
   @spec hold_message(t(), client_id(), tuple()) :: :ok
   def hold_message(store, client_id, message) do

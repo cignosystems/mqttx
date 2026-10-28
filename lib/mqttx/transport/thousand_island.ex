@@ -257,7 +257,8 @@ if Code.ensure_loaded?(ThousandIsland) do
       # A new connection for the client is taking the session over: answered
       # now, not after the drain, so it neither waits out the takeover
       # deadline nor inherits an expiry timer this side would start later
-      def handle_info({:session_takeover, _} = msg, {socket, %{draining: _} = state}) do
+      def handle_info(msg, {socket, %{draining: _} = state})
+          when elem(msg, 0) == :session_takeover do
         {:stop, _reason, state} = Proto.handle_info(msg, state)
         {:noreply, {socket, state}}
       end

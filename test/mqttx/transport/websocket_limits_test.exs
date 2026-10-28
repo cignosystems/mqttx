@@ -89,6 +89,17 @@ defmodule MqttX.Transport.WebSocketLimitsTest do
     assert status =~ "101"
   end
 
+  test ":read_timeout is the listener's, not the default 60 s: an idle connection lives on" do
+    # A short one proves the option reaches the listener; the default is
+    # :infinity, so a Keep Alive of 60 s or more (or none) is not cut
+    port = start([], read_timeout: 300)
+    {socket, status} = upgrade(port)
+    assert status =~ "101"
+    # A close frame, or the socket closed under us
+    assert match?({:ok, <<0x88, _::binary>>}, :gen_tcp.recv(socket, 0, 2_000)) or
+             match?({:error, _}, :gen_tcp.recv(socket, 0, 2_000))
+  end
+
   test "without :check_origin any origin passes" do
     port = start([], [])
     {_socket, status} = upgrade(port, ["Origin: https://evil.example"])

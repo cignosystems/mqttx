@@ -32,6 +32,9 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
       `:certfile` and `:keyfile`; any `:ssl` server option is accepted — the
       same shape `MqttX.Transport.ThousandIsland` takes for `transport_module:
       ThousandIsland.Transports.SSL`
+    - `:read_timeout` - Socket read timeout of the listener, in ms (default:
+      `:infinity`; the MQTT Keep Alive and `:max_idle_timeout` close idle
+      connections)
     - `:max_frame_size` - Largest WebSocket frame accepted, in bytes
       (default: the packet cap plus the 14-byte frame header)
     - `:check_origin` - Origins a browser may connect from, as a list of
@@ -120,7 +123,13 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
         port: port,
         ip: ip,
         scheme: scheme,
-        thousand_island_options: [transport_options: transport_options]
+        # ThousandIsland's default 60 s read timeout would cut a connection
+        # whose Keep Alive is 60 s or more (or none): idleness is the MQTT
+        # layer's business (Keep Alive, :max_idle_timeout)
+        thousand_island_options: [
+          transport_options: transport_options,
+          read_timeout: Keyword.get(transport_opts, :read_timeout, :infinity)
+        ]
       ]
 
       Logger.info(

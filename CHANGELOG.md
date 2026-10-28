@@ -138,6 +138,33 @@ All notable changes to this project will be documented in this file.
   logged and dropped instead of stopping the listener's start; a member
   too busy to import a moved session in time no longer fails the CONNECT;
   sessions whose expiry passed are swept with or without a backend.
+- **A WebSocket connection idle for 60 s was cut.** The listener's default
+  socket read timeout (ThousandIsland's 60 s) applied to the WebSocket
+  transport, so a client with a Keep Alive of 60 s or more, or none, was
+  disconnected between messages. It is `:infinity` now (`:read_timeout`
+  sets it); the Keep Alive and `:max_idle_timeout` close idle connections.
+- **`SessionBackend.Replicated` survives a listener restart.** Its process
+  was unnamed, so a listener starting again under the same name (a restart
+  by its supervisor, two listeners sharing a `:name`) started a second one
+  that crashed on the table the first owns, taking the listener's start
+  with it; and a node starting again inside a live cluster restored none
+  of its sessions, because the other nodes' copies arrive after the
+  listener's start looked at the (empty) table. The process is named per
+  listener, and sessions of this node arriving from the others are
+  restored when they arrive.
+- **A session claimed by a connection that died mid-claim was lost
+  cluster-wide.** The node it was on exported it, let it go after the
+  forwarding window and deleted the backend record, while the claiming
+  node only ever held a placeholder. The old node now asks the new one
+  whether the session arrived before letting go, and keeps it otherwise.
+- **Two CONNECTs for one client id at the same time, on two nodes, both
+  ended and left two sessions nobody owned.** Each node's connection was
+  mid-claim when the other's takeover reached it, neither answered until
+  the takeover deadline, and both were then disconnected with 0x8E and
+  their sessions kept without expiry. A connection answers a takeover
+  while it waits, and of the two the one on the lower node (or, on one
+  node, with the lower pid) gives way before its CONNACK; a session handed
+  to it meanwhile stays on its node for the other to claim.
 - **A Remaining Length that is not the shortest encoding is malformed**
   (MQTT-1.5.5-1).
 - **A broker's strings cannot forge log lines**: reason strings and server

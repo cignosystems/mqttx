@@ -493,6 +493,10 @@ defmodule MqttX.Transport.Handler do
     {:stop, :normal, state}
   end
 
+  # From another node's claim: the same, the claiming node along
+  def handle_info({:session_takeover, new_pid, _from_node}, state),
+    do: handle_info({:session_takeover, new_pid}, state)
+
   # A reply from a connection we took over, arriving after the wait ended
   def handle_info({:session_released, _pid}, state), do: {:noreply, state}
 
@@ -1467,9 +1471,6 @@ defmodule MqttX.Transport.Handler do
   end
 
   defp do_complete_connect(state, packet, telemetry_meta, start_time, final_auth_data) do
-    protocol_version = packet.protocol_version
-    connect_props = Map.get(packet, :properties, %{}) || %{}
-
     duration = System.monotonic_time() - start_time
     Telemetry.server_client_connect_stop(duration, telemetry_meta)
 
@@ -1491,17 +1492,31 @@ defmodule MqttX.Transport.Handler do
     # same time — here or on another node — finds this one and takes it over,
     # rather than both keeping the session
     register_session(packet.client_id, state)
-    take_over_existing_sessions(packet.client_id, state)
-    claim_session(state, packet)
+    yield? = take_over_existing_sessions(packet.client_id, state)
 
-    # The connection taken over ends its session only now: the timers it
-    # starts doing so are cancelled too, or one would end the session this
-    # connection resumes
-    if packet.client_id not in [nil, ""] do
-      scope = timer_scope(state, packet.client_id)
-      MqttX.Server.WillDelay.cancel(scope)
-      MqttX.Server.SessionExpiry.cancel(scope)
+    case claim_session(state, packet, yield?) do
+      :taken_over ->
+        # Another CONNECT for this id, in flight at the same time, keeps the
+        # session (§3.1.4): this one ends before its CONNACK
+        {:close, :session_taken_over, state}
+
+      :ok ->
+        # The connection taken over ends its session only now: the timers it
+        # starts doing so are cancelled too, or one would end the session
+        # this connection resumes
+        if packet.client_id not in [nil, ""] do
+          scope = timer_scope(state, packet.client_id)
+          MqttX.Server.WillDelay.cancel(scope)
+          MqttX.Server.SessionExpiry.cancel(scope)
+        end
+
+        finish_complete_connect(state, packet, telemetry_meta, start_time, final_auth_data)
     end
+  end
+
+  defp finish_complete_connect(state, packet, _telemetry_meta, _start_time, final_auth_data) do
+    protocol_version = packet.protocol_version
+    connect_props = Map.get(packet, :properties, %{}) || %{}
 
     # §3.1.2.4 Clean Start and §3.1.2.11 Session Expiry Interval: whether an
     # existing session is resumed, and how long this one outlives the
@@ -1820,29 +1835,53 @@ defmodule MqttX.Transport.Handler do
   # {retained_table, client_id} (the retained table identifies the listener,
   # so two brokers in one VM don't take over each other's clients). The
   # registry auto-deregisters on process exit.
+  # Returns whether this connection must give way instead: a takeover from
+  # a CONNECT for the same id in flight at the same time reached it while
+  # it waited, and that one outranks it (Cluster.yield_to?/1)
   defp take_over_existing_sessions(client_id, state) when is_binary(client_id) do
     key = {state.retained_table, client_id}
 
-    for {pid, _} <- Registry.lookup(MqttX.Server.ConnectionRegistry, key), pid != self() do
-      Logger.info("[MqttX.Transport] Session takeover for #{inspect(client_id)}")
-      ref = Process.monitor(pid)
-      send(pid, {:session_takeover, self()})
+    Enum.reduce(Registry.lookup(MqttX.Server.ConnectionRegistry, key), false, fn
+      {pid, _}, yield? when pid != self() ->
+        Logger.info("[MqttX.Transport] Session takeover for #{inspect(client_id)}")
+        ref = Process.monitor(pid)
+        send(pid, {:session_takeover, self()})
 
-      # The session is resumed from the store, so the old connection must have
-      # stopped writing to it first: wait for its word or its exit, but no
-      # longer than the handover deadline
-      receive do
-        {:session_released, ^pid} -> Process.demonitor(ref, [:flush])
-        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
-      after
-        @takeover_timeout -> Process.demonitor(ref, [:flush])
-      end
-    end
+        # The session is resumed from the store, so the old connection must
+        # have stopped writing to it first: wait for its word or its exit,
+        # but no longer than the handover deadline
+        await_release(pid, ref, System.monotonic_time(:millisecond) + @takeover_timeout, yield?)
 
-    :ok
+      _, yield? ->
+        yield?
+    end)
   end
 
-  defp take_over_existing_sessions(_client_id, _state), do: :ok
+  defp take_over_existing_sessions(_client_id, _state), do: false
+
+  defp await_release(pid, ref, deadline, yield?) do
+    receive do
+      {:session_released, ^pid} ->
+        Process.demonitor(ref, [:flush])
+        yield?
+
+      {:DOWN, ^ref, :process, ^pid, _reason} ->
+        yield?
+
+      # The other connection is taking this one over at the same time
+      {:session_takeover, other} ->
+        send(other, {:session_released, self()})
+        await_release(pid, ref, deadline, yield? or Cluster.yield_to?(other))
+
+      {:session_takeover, other, from_node} ->
+        send(other, {:session_released, self()})
+        await_release(pid, ref, deadline, yield? or Cluster.yield_to_node?(from_node))
+    after
+      max(deadline - System.monotonic_time(:millisecond), 0) ->
+        Process.demonitor(ref, [:flush])
+        yield?
+    end
+  end
 
   # Scope per-client timers to this listener, matching how session takeover
   # scopes its registry key.
@@ -2542,7 +2581,7 @@ defmodule MqttX.Transport.Handler do
   # store: another node hands it over (and drops its connection and timers
   # for the client), or — with no node holding it — the durable backend has
   # it. Clean Start 1 has the other nodes discard theirs instead.
-  defp claim_session(state, packet) do
+  defp claim_session(state, packet, yield?) do
     sessions = state.sessions
     client_id = packet.client_id
     listener = sessions.listener
@@ -2567,7 +2606,24 @@ defmodule MqttX.Transport.Handler do
           Cluster.claim(listener, client_id, :take)
       end
 
+    {remote, yield?} =
+      case remote do
+        {:yield, inner} -> {inner, true}
+        other -> {other, yield?}
+      end
+
     cond do
+      # Giving way to the other CONNECT: a session handed to this node
+      # meanwhile stays here, offline, for that one (or a later CONNECT) to
+      # claim — not lost
+      yield? ->
+        case remote do
+          {:ok, record} -> SessionStore.import(sessions, client_id, Map.delete(record, :from))
+          _ -> :ok
+        end
+
+        :taken_over
+
       packet.clean_session or SessionStore.exists?(sessions, client_id) ->
         :ok
 

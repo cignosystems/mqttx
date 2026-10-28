@@ -16,6 +16,7 @@ defmodule MqttX.ClusterTest do
 
   @persistent [clean_session: false, connect_properties: %{session_expiry_interval: 300}]
 
+  alias MqttX.Packet.Codec
   alias MqttX.Server.Cluster
   alias MqttX.Server.Delivery
   alias MqttX.Server.RetainedStore
@@ -803,6 +804,191 @@ defmodule MqttX.ClusterTest do
     # Still subscribed
     {:ok, _} = MqttX.Server.deliver(name, "dur/2", "after", %{qos: 1})
     assert_receive {:mqtt_event, :message, {["dur", "2"], "after", _}}, 3_000
+    MqttX.Client.disconnect(sub)
+  end
+
+  # A raw v5 CONNECT with a persistent session, sent and not waited for
+  defp raw_connect(port, client_id) do
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 2_000)
+
+    {:ok, connect} =
+      Codec.encode(5, %{
+        type: :connect,
+        protocol_version: 5,
+        client_id: client_id,
+        username: nil,
+        password: nil,
+        will: nil,
+        clean_session: false,
+        keep_alive: 60,
+        properties: %{session_expiry_interval: 300}
+      })
+
+    :ok = :gen_tcp.send(socket, connect)
+    socket
+  end
+
+  defp member_on(name, node) do
+    [member] = Enum.filter(Cluster.members(name), &(node(&1) == node))
+    member
+  end
+
+  defp registered?(node, port, client_id) do
+    key = {:"mqttx_retained_#{port}", client_id}
+    :erpc.call(node, Registry, :lookup, [MqttX.Server.ConnectionRegistry, key]) != []
+  end
+
+  test "a session claimed by a connection that dies before the export arrives stays where it was",
+       ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_orphan_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    owner = connect(local_port, "cl-orphan", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(owner, "orphan/#", qos: 1)
+    disconnect_on(node(), local_port, owner, "cl-orphan")
+
+    # The claim from the peer waits while this node's member is suspended;
+    # meanwhile the connection that made it dies
+    member = member_on(name, node())
+    :sys.suspend(member)
+    socket = raw_connect(remote_port, "cl-orphan")
+    # Registered once the peek before handle_connect has waited out the
+    # suspended member (5 s)
+    wait_until(fn -> registered?(ctx.peer_node, remote_port, "cl-orphan") end, 400)
+    key = {:"mqttx_retained_#{remote_port}", "cl-orphan"}
+
+    [{pid, _}] =
+      :erpc.call(ctx.peer_node, Registry, :lookup, [MqttX.Server.ConnectionRegistry, key])
+
+    :erpc.call(ctx.peer_node, Process, :exit, [pid, :kill])
+    :gen_tcp.close(socket)
+    :sys.resume(member)
+
+    # Served, exported to no one, and after the forwarding window kept here
+    sessions = :sys.get_state(member).ctx.sessions
+    Process.sleep(6_500)
+    assert SessionStore.exists?(sessions, "cl-orphan")
+    assert [%{filter: "orphan/#"}] = SessionStore.subscriptions(sessions, "cl-orphan")
+
+    # Resumable from either node
+    back = connect(remote_port, "cl-orphan", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+    MqttX.Client.disconnect(back)
+  end
+
+  test "two CONNECTs for one client id at once, one per node: one keeps the session, the other ends before CONNACK",
+       ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_twin_#{System.unique_integer([:positive])}"
+    {local_port, remote_port} = start_pair(ctx, name)
+
+    local_member = member_on(name, node())
+    peer_member = member_on(name, ctx.peer_node)
+    :sys.suspend(local_member)
+    :sys.suspend(peer_member)
+
+    here = raw_connect(local_port, "cl-twin")
+    there = raw_connect(remote_port, "cl-twin")
+    # Registered once each peek has waited out the other node's suspended
+    # member (5 s)
+    wait_until(fn -> registered?(node(), local_port, "cl-twin") end, 400)
+    wait_until(fn -> registered?(ctx.peer_node, remote_port, "cl-twin") end, 400)
+
+    :sys.resume(local_member)
+    :sys.resume(peer_member)
+
+    results = for socket <- [here, there], do: :gen_tcp.recv(socket, 0, 8_000)
+
+    # One CONNACK, one close with nothing sent — never both kicked
+    assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+    assert Enum.count(results, &match?({:error, :closed}, &1)) == 1
+    [{:ok, connack}] = Enum.filter(results, &match?({:ok, _}, &1))
+    assert {:ok, {%{type: :connack, reason_code: 0}, <<>>}} = Codec.decode(5, connack)
+
+    # The winner stays connected; the loser's node holds no session for the id
+    Process.sleep(200)
+
+    winners =
+      for {node, port} <- [{node(), local_port}, {ctx.peer_node, remote_port}],
+          registered?(node, port, "cl-twin"),
+          do: node
+
+    assert [winner] = winners
+    loser = if winner == node(), do: ctx.peer_node, else: node()
+    loser_sessions = :sys.get_state(member_on(name, loser)).ctx.sessions
+    refute :erpc.call(loser, SessionStore, :exists?, [loser_sessions, "cl-twin"])
+
+    Enum.each([here, there], &:gen_tcp.close/1)
+  end
+
+  test "with the replicated backend, a node starting again under its name gets its sessions back",
+       ctx do
+    if ctx[:skip], do: flunk("distribution unavailable: #{inspect(ctx.skip)}")
+    name = :"cluster_reborn_#{System.unique_integer([:positive])}"
+    opts = [session_backend: MqttX.Server.SessionBackend.Replicated, session_flush_interval: 50]
+    node_name = :"mqttx_reborn_#{System.unique_integer([:positive])}"
+
+    start_node = fn ->
+      {:ok, peer, node} = :peer.start(%{name: node_name})
+      :ok = :erpc.call(node, :code, :add_paths, [:code.get_path()])
+      :ok = :erpc.call(node, Logger, :configure, [[level: :warning]])
+      MqttX.Test.Cover.start(node)
+      {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:mqttx])
+      {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:thousand_island])
+      {peer, node}
+    end
+
+    stop_node = fn {peer, node} ->
+      MqttX.Test.Cover.flush(node)
+
+      try do
+        :peer.stop(peer)
+      catch
+        :exit, _ -> :ok
+      end
+    end
+
+    local_port = free_port()
+    {:ok, server, owner} = ClusterBroker.start_listener(name, local_port, opts)
+
+    on_exit(fn ->
+      ThousandIsland.stop(server)
+      Process.exit(owner, :kill)
+    end)
+
+    {peer, node} = start_node.()
+    peer_port = free_port()
+    {:ok, _, _} = :erpc.call(node, ClusterBroker, :start_listener, [name, peer_port, opts])
+    wait_until(fn -> length(Cluster.members(name)) == 2 end)
+
+    sub = connect(peer_port, "cl-reborn", @persistent)
+    {:ok, [1]} = MqttX.Client.subscribe(sub, "reborn/#", qos: 1)
+    disconnect_on(node, peer_port, sub, "cl-reborn")
+
+    # This node holds the record as the peer saved it
+    sessions = :sys.get_state(member_on(name, node())).ctx.sessions
+    wait_until(fn -> SessionStore.load(sessions, "cl-reborn") != nil end)
+
+    stop_node.({peer, node})
+    wait_until(fn -> length(Cluster.members(name)) == 1 end)
+
+    # The same node again, fresh: its sessions reach it after its listener
+    # started, and are restored then — subscriptions included, no client
+    {peer, node} = start_node.()
+    on_exit(fn -> stop_node.({peer, node}) end)
+    {:ok, _, _} = :erpc.call(node, ClusterBroker, :start_listener, [name, peer_port, opts])
+    wait_until(fn -> length(Cluster.members(name)) == 2 end)
+
+    wait_until(fn ->
+      peer_sessions = :sys.get_state(member_on(name, node)).ctx.sessions
+      :erpc.call(node, SessionStore, :exists?, [peer_sessions, "cl-reborn"])
+    end)
+
+    {:ok, 0} = MqttX.Server.deliver(name, "reborn/1", "kept", %{qos: 1})
+    sub = connect(peer_port, "cl-reborn", @persistent)
+    assert_receive {:mqtt_event, :connected, %{session_present: true}}, 3_000
+    assert_receive {:mqtt_event, :message, {["reborn", "1"], "kept", _}}, 3_000
     MqttX.Client.disconnect(sub)
   end
 end

@@ -240,7 +240,7 @@ if Code.ensure_loaded?(:ranch) do
       def handle_info(:drain_timeout, %{draining: true} = state), do: finish(state)
 
       # A takeover is answered during the drain (see MqttX.Transport.ThousandIsland)
-      def handle_info({:session_takeover, _} = msg, %{draining: true} = state) do
+      def handle_info(msg, %{draining: true} = state) when elem(msg, 0) == :session_takeover do
         {:stop, _reason, p} = Proto.handle_info(msg, state.proto)
         {:noreply, %{state | proto: p}}
       end

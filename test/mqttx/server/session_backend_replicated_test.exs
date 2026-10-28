@@ -26,6 +26,13 @@ defmodule MqttX.Server.SessionBackend.ReplicatedTest do
     :sys.get_state(peer)
   end
 
+  test "init is idempotent: a listener starting again under its name finds its process" do
+    listener = {:replicated_twice, System.unique_integer([:positive])}
+    assert {:ok, state} = Replicated.init(listener, [])
+    assert {:ok, ^state} = Replicated.init(listener, [])
+    assert [_one] = :pg.get_members(MqttX.Server.Cluster, {Replicated, listener})
+  end
+
   test "save, load, list and delete" do
     {state, _peer} = open()
     assert Replicated.load(state, "c") == :none

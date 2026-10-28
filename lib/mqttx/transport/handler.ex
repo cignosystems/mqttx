@@ -1494,7 +1494,10 @@ defmodule MqttX.Transport.Handler do
     register_session(packet.client_id, state)
     yield? = take_over_existing_sessions(packet.client_id, state)
 
-    case claim_session(state, packet, yield?) do
+    claim = claim_session(state, packet, yield?)
+
+    # One that arrived once the claim had returned is answered the same way
+    case if(drain_takeovers(claim == :taken_over), do: :taken_over, else: :ok) do
       :taken_over ->
         # Another CONNECT for this id, in flight at the same time, keeps the
         # session (§3.1.4): this one ends before its CONNACK
@@ -1569,6 +1572,7 @@ defmodule MqttX.Transport.Handler do
     }
 
     send_packet(state, connack, protocol_version)
+    mark_connected(packet.client_id, state)
 
     new_state = %{
       state
@@ -1859,6 +1863,21 @@ defmodule MqttX.Transport.Handler do
 
   defp take_over_existing_sessions(_client_id, _state), do: false
 
+  defp drain_takeovers(yield?) do
+    receive do
+      {:session_takeover, pid} ->
+        send(pid, {:session_released, self()})
+        drain_takeovers(yield? or Cluster.yield_to?(pid))
+
+      # From a claim on another node: sent only to the connection that gives way
+      {:session_takeover, pid, _from_node} ->
+        send(pid, {:session_released, self()})
+        drain_takeovers(true)
+    after
+      0 -> yield?
+    end
+  end
+
   defp await_release(pid, ref, deadline, yield?) do
     receive do
       {:session_released, ^pid} ->
@@ -1873,9 +1892,9 @@ defmodule MqttX.Transport.Handler do
         send(other, {:session_released, self()})
         await_release(pid, ref, deadline, yield? or Cluster.yield_to?(other))
 
-      {:session_takeover, other, from_node} ->
+      {:session_takeover, other, _from_node} ->
         send(other, {:session_released, self()})
-        await_release(pid, ref, deadline, yield? or Cluster.yield_to_node?(from_node))
+        await_release(pid, ref, deadline, true)
     after
       max(deadline - System.monotonic_time(:millisecond), 0) ->
         Process.demonitor(ref, [:flush])
@@ -1887,12 +1906,26 @@ defmodule MqttX.Transport.Handler do
   # scopes its registry key.
   defp timer_scope(state, client_id), do: {state.retained_table, client_id}
 
+  # Under a second key as well until the CONNACK: a claim from another node
+  # for the same id meanwhile is a CONNECT in flight at the same time,
+  # settled by node rank (MqttX.Server.Cluster) rather than by a takeover.
+  # (The registry is :duplicate, whose values cannot be updated in place.)
   defp register_session(client_id, state) when is_binary(client_id) and client_id != "" do
-    Registry.register(MqttX.Server.ConnectionRegistry, {state.retained_table, client_id}, nil)
+    key = {state.retained_table, client_id}
+    Registry.register(MqttX.Server.ConnectionRegistry, key, nil)
+    Registry.register(MqttX.Server.ConnectionRegistry, {key, :connecting}, nil)
     :ok
   end
 
   defp register_session(_client_id, _state), do: :ok
+
+  defp mark_connected(client_id, state) when is_binary(client_id) and client_id != "" do
+    key = {state.retained_table, client_id}
+    Registry.unregister(MqttX.Server.ConnectionRegistry, {key, :connecting})
+    :ok
+  end
+
+  defp mark_connected(_client_id, _state), do: :ok
 
   defp generate_client_id do
     "mqttx-" <> Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
@@ -2465,11 +2498,25 @@ defmodule MqttX.Transport.Handler do
 
   # The connection is over: decide what becomes of the session, once. Nothing
   # to decide if a newer connection took it (§3.1.4) — it is theirs now.
+  defp session_claimed?(state) do
+    key = timer_scope(state, state.client_id)
+
+    Registry.lookup(MqttX.Server.ConnectionRegistry, key) != [] or
+      match?(%{moved_to: _}, SessionStore.get(state.sessions, state.client_id))
+  end
+
   defp end_connection_session(%{session_finished: true} = state), do: state
 
   defp end_connection_session(%{session_handed_over: true} = state) do
     leave_registry(state)
-    %{state | session_finished: true}
+
+    # The session is the new connection's: here (it is registered) or on the
+    # node it moved to (the row here is a stub). Taken over by a claim that
+    # found no session to move yet, it is nobody's: its expiry clock runs as
+    # after any disconnect, rather than the row staying forever
+    if session_claimed?(state),
+      do: %{state | session_finished: true},
+      else: end_connection_session(%{state | session_handed_over: false})
   end
 
   defp end_connection_session(state) do

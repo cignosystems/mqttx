@@ -906,15 +906,16 @@ defmodule MqttX.ClusterTest do
     [{:ok, connack}] = Enum.filter(results, &match?({:ok, _}, &1))
     assert {:ok, {%{type: :connack, reason_code: 0}, <<>>}} = Codec.decode(5, connack)
 
-    # The winner stays connected; the loser's node holds no session for the id
-    Process.sleep(200)
-
-    winners =
+    # The winner stays connected (the loser leaves the registry as it closes);
+    # the loser's node holds no session for the id
+    winners = fn ->
       for {node, port} <- [{node(), local_port}, {ctx.peer_node, remote_port}],
           registered?(node, port, "cl-twin"),
           do: node
+    end
 
-    assert [winner] = winners
+    wait_until(fn -> length(winners.()) == 1 end)
+    [winner] = winners.()
     loser = if winner == node(), do: ctx.peer_node, else: node()
     loser_sessions = :sys.get_state(member_on(name, loser)).ctx.sessions
     refute :erpc.call(loser, SessionStore, :exists?, [loser_sessions, "cl-twin"])

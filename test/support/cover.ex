@@ -8,14 +8,18 @@ defmodule MqttX.Test.Cover do
   """
 
   @doc "Start cover on `node`, before the application starts there."
+  # apply/3: :cover (the tools application) is loaded only under --cover,
+  # and a direct call would be a compile warning otherwise
   def start(node) do
-    if on?(), do: {:ok, [^node]} = :cover.start([node])
+    if on?(), do: {:ok, [^node]} = apply(:cover, :start, [[node]])
     :ok
   end
 
   @doc "Fetch `node`'s counts into this node's, before it stops."
   def flush(node) do
-    if on?() and node in :cover.which_nodes(), do: :ok = :cover.flush([node])
+    if on?() and node in apply(:cover, :which_nodes, []),
+      do: :ok = apply(:cover, :flush, [[node]])
+
     :ok
   end
 

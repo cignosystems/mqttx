@@ -226,6 +226,8 @@ defmodule MqttX.Server.Cluster do
   # What another node knows about a session, without changing anything: its
   # subscriptions if one holds it. For handle_connect/4, before the CONNECT is
   # authorized.
+  @typep claim_result :: {:ok, SessionStore.session_record()} | :none
+
   @spec lookup(term(), binary()) :: {:ok, [map()]} | :none
   def lookup(listener, client_id), do: ask(listener, client_id, :peek)
 
@@ -233,10 +235,10 @@ defmodule MqttX.Server.Cluster do
   # An authorized CONNECT for `client_id` on this node: every other node lets
   # go of the client (takeover, timers) and of its session — handing it over
   # for Clean Start 0 (`:take`), discarding it for Clean Start 1 (`:clean`).
-  @spec claim(term(), binary(), :take | :clean) :: {:ok, SessionStore.session_record()} | :none
   # `{:yield, result}`: a takeover for the same client id reached this
   # connection while it waited, from a CONNECT in flight at the same time
   # that outranks it (`yield_to?/1`); that one keeps the session.
+  @spec claim(term(), binary(), :take | :clean) :: claim_result() | {:yield, claim_result()}
   def claim(listener, client_id, mode) when mode in [:take, :clean] do
     ask(listener, client_id, mode)
   end
@@ -270,6 +272,10 @@ defmodule MqttX.Server.Cluster do
       {^reply_to, :none} ->
         collect(reply_to, pending - 1, deadline, result, yield?)
 
+      # That node has a CONNECT for the id in flight that outranks this one
+      {^reply_to, :yield} ->
+        collect(reply_to, pending - 1, deadline, result, true)
+
       # Two CONNECTs for the id at once, this one registered already: the
       # other side's takeover is answered now (not after this wait, which
       # it would hold up), and exactly one of the two gives way
@@ -277,9 +283,10 @@ defmodule MqttX.Server.Cluster do
         send(pid, {:session_released, self()})
         collect(reply_to, pending, deadline, result, yield? or yield_to?(pid))
 
-      {:session_takeover, pid, from_node} ->
+      # From a claim on another node: sent only to the connection that gives way
+      {:session_takeover, pid, _from_node} ->
         send(pid, {:session_released, self()})
-        collect(reply_to, pending, deadline, result, yield? or yield_to_node?(from_node))
+        collect(reply_to, pending, deadline, result, true)
     after
       timeout -> yielded(result, yield?)
     end
@@ -293,9 +300,6 @@ defmodule MqttX.Server.Cluster do
   # — or, on one node, with the lower pid — gives way: the same answer from
   # both sides
   def yield_to?(pid), do: {node(pid), pid} > {node(), self()}
-
-  @doc false
-  def yield_to_node?(from_node), do: from_node > node()
 
   defp broadcast(listener, message) do
     Enum.each(remote_members(listener), &send(&1, message))
@@ -709,7 +713,17 @@ defmodule MqttX.Server.Cluster do
   end
 
   defp answer_claim(ctx, reply_to, client_id, mode) do
-    take_over_connections(ctx, client_id, node(reply_to))
+    case take_over_connections(ctx, client_id, node(reply_to)) do
+      :yield -> :yield
+      :ok -> answer_take(ctx, reply_to, client_id, mode)
+    end
+  rescue
+    e ->
+      Logger.debug("[MqttX.Server.Cluster] claim failed: #{Exception.message(e)}")
+      :none
+  end
+
+  defp answer_take(ctx, reply_to, client_id, mode) do
     scope = {ctx.retained_table, client_id}
     WillDelay.cancel(scope)
     SessionExpiry.cancel(scope)
@@ -732,10 +746,6 @@ defmodule MqttX.Server.Cluster do
         spawn(fn -> finish_move(ctx, client_id, to, ref) end)
         {:ok, Map.put(record, :from, node())}
     end
-  rescue
-    e ->
-      Logger.debug("[MqttX.Server.Cluster] claim failed: #{Exception.message(e)}")
-      :none
   end
 
   defp drop_older(ctx, from_node, began) do
@@ -792,12 +802,25 @@ defmodule MqttX.Server.Cluster do
 
   # The same handshake a local takeover uses (§3.1.4): the connection
   # disconnects with 0x8E and says when it has stopped writing to the session
-  # The claiming node goes with the takeover: a connection here still in
-  # its own CONNECT decides by node which of the two gives way
+  # A connection here still in its own CONNECT (registered as :connecting,
+  # no CONNACK yet) and the claimer are two CONNECTs for the id at once: the
+  # one on the lower node gives way — the claimer, told so in the answer
+  # (`:yield`), or this one, sent the takeover it then yields to. Decided
+  # here, on one side, so it is never both or neither.
   defp take_over_connections(ctx, client_id, from_node) do
     key = {ctx.retained_table, client_id}
+    registry = MqttX.Server.ConnectionRegistry
+    connecting? = Registry.lookup(registry, {key, :connecting}) != []
 
-    for {pid, _} <- Registry.lookup(MqttX.Server.ConnectionRegistry, key) do
+    if connecting? and not (from_node > node()) do
+      :yield
+    else
+      take_over_each(Registry.lookup(registry, key), from_node)
+    end
+  end
+
+  defp take_over_each(entries, from_node) do
+    for {pid, _} <- entries do
       ref = Process.monitor(pid)
       send(pid, {:session_takeover, self(), from_node})
 

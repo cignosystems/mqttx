@@ -234,7 +234,8 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
                 handler_opts: opts.handler_opts,
                 retained_table: opts.retained_table,
                 rate_limiter: opts.rate_limiter,
-                sessions: opts.sessions
+                sessions: opts.sessions,
+                peer: conn.remote_ip
               },
               upgrade_opts(opts)
             )
@@ -263,7 +264,8 @@ if Code.ensure_loaded?(Bandit) and Code.ensure_loaded?(WebSockAdapter) do
              opts.retained_table,
              opts.rate_limiter,
              send_fn,
-             opts.sessions
+             opts.sessions,
+             Map.get(opts, :peer)
            ) do
         {:ok, proto} ->
           {:ok, proto}

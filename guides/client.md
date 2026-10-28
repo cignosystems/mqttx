@@ -237,7 +237,7 @@ The handler receives four event types:
 
 | Event | Data | Description |
 |-------|------|-------------|
-| `:message` | `{topic, payload, packet}` | Incoming PUBLISH message. `topic` is a list of segments |
+| `:message` | `{topic, payload, packet}` | Incoming PUBLISH message. `topic` is a list of segments; `packet.properties.subscription_identifier` is an integer for one matching subscription, a list for several |
 | `:connected` | `%{properties: props, session_present: bool}` | Connection established (props contains CONNACK properties) |
 | `:disconnected` | reason | Connection lost — `:closed`, `:pingresp_timeout`, `{:error, posix}`, `{:protocol_error, reason}`, `{:server_disconnect, code, %{server_reference: ref}}`, or `{:connack_error, code, info}` for a non-retryable rejection |
 | `:publish_error` | `{topic, packet_id, reason_code}` | The broker rejected one of your QoS 1/2 publishes (e.g. `0x87` not authorized, `0x97` quota exceeded) |

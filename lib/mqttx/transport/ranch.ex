@@ -181,13 +181,20 @@ if Code.ensure_loaded?(:ranch) do
 
         send_fn = fn data -> transport.send(socket, data) end
 
+        peer =
+          case transport.peername(socket) do
+            {:ok, {ip, _port}} -> ip
+            _ -> nil
+          end
+
         case Proto.init(
                opts.handler,
                opts.handler_opts,
                opts.retained_table,
                opts.rate_limiter,
                send_fn,
-               opts.sessions
+               opts.sessions,
+               peer
              ) do
           {:ok, proto} ->
             # Exits from linked processes arrive as messages (handled as on

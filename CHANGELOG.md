@@ -68,6 +68,11 @@ All notable changes to this project will be documented in this file.
   unlimited on websock_adapter 0.5, 10 MB on 0.6 — let a frame far past
   the MQTT cap be buffered before MqttX saw the packet. `scheme: :https`
   starts from the same TLS baseline as the TCP listeners.
+- **Connection rate limiting per peer address.** `max_connections_per_ip`
+  in `:rate_limit` caps the new connections per interval from one address,
+  so one source cannot use up the shared `:max_connections` budget or hold
+  the listener on its own. The transports pass the peer's address to the
+  limiter.
 - **The client tells the broker its limits.** A v5 CONNECT advertises
   Receive Maximum 100 and the client's Maximum Packet Size unless the
   caller set them, so a broker drops an oversized message instead of
@@ -165,6 +170,12 @@ All notable changes to this project will be documented in this file.
   while it waits, and of the two the one on the lower node (or, on one
   node, with the lower pid) gives way before its CONNACK; a session handed
   to it meanwhile stays on its node for the other to claim.
+- **The WebSocket client's `Host` header carries the port** unless it is
+  the scheme's default (RFC 7230 §5.4); a gateway routing on it refused the
+  upgrade.
+- **A second client with the same client id in one VM is logged** instead
+  of registering silently (`MqttX.Client.whereis/1` keeps finding the
+  first; the broker disconnects one of the two).
 - **A Remaining Length that is not the shortest encoding is malformed**
   (MQTT-1.5.5-1).
 - **A broker's strings cannot forge log lines**: reason strings and server

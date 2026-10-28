@@ -2,7 +2,17 @@ defmodule MqttX.Packet.Properties do
   @moduledoc """
   MQTT 5.0 Properties encoding and decoding.
 
-  Supports all 28 MQTT 5.0 property types.
+  Supports all 28 MQTT 5.0 property types, each checked against the packet
+  that carries it (§2.2.2.2).
+
+  ## Shapes
+
+  Properties decode to a map keyed by name. `:user_properties` is a list of
+  `{key, value}` pairs in wire order. `:subscription_identifier` is an
+  integer when a packet carries one — a SUBSCRIBE always, a PUBLISH matching
+  one subscription — and a list of integers when a PUBLISH matches several
+  subscriptions (one identifier per subscription, §3.3.2.3.8). Every other
+  property is a single value.
   """
 
   alias MqttX.Packet.Varint

@@ -73,9 +73,11 @@ defmodule MqttX.Transport.Handler do
     init(handler, handler_opts, retained_table, rate_limiter, send_fn, SessionStore.new())
   end
 
-  def init(handler, handler_opts, retained_table, rate_limiter, send_fn, sessions) do
+  # `peer` is the client's address, for the limiter's per-address budget; nil
+  # when the transport does not know it
+  def init(handler, handler_opts, retained_table, rate_limiter, send_fn, sessions, peer \\ nil) do
     if rate_limiter do
-      case MqttX.Server.RateLimiter.allow_connection?(rate_limiter) do
+      case MqttX.Server.RateLimiter.allow_connection?(rate_limiter, peer) do
         :ok -> :ok
         {:error, :rate_limited} -> throw(:connection_rate_limited)
       end

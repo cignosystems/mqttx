@@ -43,7 +43,9 @@ if Code.ensure_loaded?(ThousandIsland) do
       this window (default: 10_000 ms, `:infinity` disables)
     - `:max_retained_messages` - Cap on distinct retained topics
       (default: 100_000, `:infinity` disables)
-    - `:rate_limit` - Options for `MqttX.Server.RateLimiter` (default: none)
+    - `:rate_limit` - Options for `MqttX.Server.RateLimiter`: `:max_connections`
+      (all peers), `:max_connections_per_ip`, `:max_messages`, `:interval`
+      (default: none)
     - `:receive_maximum` - Inbound QoS > 0 flow-control window (default: 100;
       with the packet cap it bounds what a client can make the broker hold
       before PUBREL).
@@ -215,7 +217,8 @@ if Code.ensure_loaded?(ThousandIsland) do
                state.retained_table,
                state.rate_limiter,
                send_fn,
-               state.sessions
+               state.sessions,
+               peer_ip(ThousandIsland.Socket.peername(socket))
              ) do
           {:ok, proto} -> {:continue, proto}
           {:error, :rate_limited} -> {:close, state}
@@ -283,6 +286,9 @@ if Code.ensure_loaded?(ThousandIsland) do
         end)
         |> Map.update(:message, nil, &Proto.redact_message/1)
       end
+
+      defp peer_ip({:ok, {ip, _port}}), do: ip
+      defp peer_ip(_other), do: nil
 
       defp drain(socket, state) do
         ThousandIsland.Socket.shutdown(socket, :write)

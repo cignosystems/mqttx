@@ -205,16 +205,18 @@ MqttX.Server.start_link(MyApp.MqttHandler, [],
   transport: MqttX.Transport.ThousandIsland,
   port: 1883,
   rate_limit: [
-    max_connections: 100,    # new connections per second
-    max_messages: 1000,      # messages per client per second
-    interval: 1000           # window size in ms (default)
+    max_connections: 100,        # new connections per second, all peers
+    max_connections_per_ip: 10,  # new connections per second from one address
+    max_messages: 1000,          # messages per client per second
+    interval: 1000               # window size in ms (default)
   ]
 )
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `:max_connections` | Max new connections per interval | unlimited |
+| `:max_connections` | Max new connections per interval, all peers together | unlimited |
+| `:max_connections_per_ip` | Max new connections per interval from one peer address — one source cannot use up the shared budget | unlimited |
 | `:max_messages` | Max messages per client per interval | unlimited |
 | `:interval` | Counter reset interval in ms | `1000` |
 
@@ -249,7 +251,7 @@ of it is in `transport_opts`:
 | Retained topics (cleared ones count for an hour) | `:max_retained_messages` | 100 000 |
 | Levels in a topic or filter | — | 128 |
 | Time a session is kept after its connection ends | `:max_session_expiry_interval` | 1 day |
-| Connections per second (all peers together) | `:rate_limit` | none |
+| Connections per second, all peers together and per peer address | `:rate_limit` | none |
 
 `handle_connect/4` decides who may have a session at all and
 `handle_subscribe/2` which filters; the caps above only bound what an

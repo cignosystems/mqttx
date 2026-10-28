@@ -485,8 +485,20 @@ defmodule MqttX.Client.Connection do
         )
     }
 
-    # Register with ClientRegistry for lookup by client_id
-    Registry.register(MqttX.ClientRegistry, client_id, %{host: state.host, port: state.port})
+    # Register with ClientRegistry for lookup by client_id. A second client
+    # with the same id in this VM is almost always a mistake (the broker will
+    # take one of them over): said once, and MqttX.Client.whereis/1 keeps
+    # finding the first
+    case Registry.register(MqttX.ClientRegistry, client_id, %{host: state.host, port: state.port}) do
+      {:ok, _owner} ->
+        :ok
+
+      {:error, {:already_registered, other}} ->
+        Logger.warning(
+          "[MqttX.Client] client id #{inspect(client_id)} is already used by #{inspect(other)} " <>
+            "in this VM; the broker will disconnect one of the two"
+        )
+    end
 
     # Trap exits so terminate/2 runs on supervisor/VM shutdown: without it a
     # :shutdown kill skips the clean DISCONNECT (broker publishes the will)
@@ -990,7 +1002,7 @@ defmodule MqttX.Client.Connection do
   defp do_connect(%{transport: :ws} = state) do
     case open_tcp(state) do
       {:ok, socket} ->
-        case MqttX.Client.WebSocket.upgrade(socket, :tcp, state.host, state.ws_path) do
+        case MqttX.Client.WebSocket.upgrade(socket, :tcp, state.host, state.port, state.ws_path) do
           :ok ->
             :inet.setopts(socket, active: :once)
             send_connect(reset_ws_state(%{state | socket: socket}))
@@ -1010,7 +1022,7 @@ defmodule MqttX.Client.Connection do
 
     with {:ok, tcp_socket} <- open_tcp(state),
          {:ok, socket} <- ssl_upgrade(tcp_socket, ssl_opts) do
-      case MqttX.Client.WebSocket.upgrade(socket, :ssl, state.host, state.ws_path) do
+      case MqttX.Client.WebSocket.upgrade(socket, :ssl, state.host, state.port, state.ws_path) do
         :ok ->
           :ssl.setopts(socket, active: :once)
           send_connect(reset_ws_state(%{state | socket: socket}))

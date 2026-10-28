@@ -12,12 +12,13 @@ defmodule MqttX.Server.RateLimiter do
   ## Usage
 
       limiter = MqttX.Server.RateLimiter.new(
-        max_connections: 100,    # new connections per interval
-        max_messages: 1000,      # messages per client per interval
-        interval: 1000           # window size in ms (default)
+        max_connections: 100,         # new connections per interval, all peers
+        max_connections_per_ip: 10,   # new connections per interval from one address
+        max_messages: 1000,           # messages per client per interval
+        interval: 1000                # window size in ms (default)
       )
 
-      case MqttX.Server.RateLimiter.allow_connection?(limiter) do
+      case MqttX.Server.RateLimiter.allow_connection?(limiter, peer_ip) do
         :ok -> # accept connection
         {:error, :rate_limited} -> # close the connection
       end
@@ -31,6 +32,7 @@ defmodule MqttX.Server.RateLimiter do
   @type t :: %{
           table: :ets.table(),
           max_connections: pos_integer() | nil,
+          max_connections_per_ip: pos_integer() | nil,
           max_messages: pos_integer() | nil,
           interval: pos_integer(),
           timer_pid: pid() | nil
@@ -41,13 +43,18 @@ defmodule MqttX.Server.RateLimiter do
 
   ## Options
 
-  - `:max_connections` - Maximum new connections per interval (default: nil, unlimited)
+  - `:max_connections` - Maximum new connections per interval, all peers
+    together (default: nil, unlimited)
+  - `:max_connections_per_ip` - Maximum new connections per interval from one
+    peer address, so one source cannot use up the shared budget or hold the
+    listener on its own (default: nil, unlimited)
   - `:max_messages` - Maximum messages per client per interval (default: nil, unlimited)
   - `:interval` - Window size in milliseconds (default: 1000)
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     max_connections = Keyword.get(opts, :max_connections)
+    max_connections_per_ip = Keyword.get(opts, :max_connections_per_ip)
     max_messages = Keyword.get(opts, :max_messages)
     interval = Keyword.get(opts, :interval, 1000)
 
@@ -68,6 +75,7 @@ defmodule MqttX.Server.RateLimiter do
     %{
       table: table,
       max_connections: max_connections,
+      max_connections_per_ip: max_connections_per_ip,
       max_messages: max_messages,
       interval: interval,
       timer_pid: timer_pid
@@ -75,15 +83,23 @@ defmodule MqttX.Server.RateLimiter do
   end
 
   @doc """
-  Check and increment the connection counter.
+  Check and increment the connection counters: the shared one and, given the
+  peer's address, that address's.
 
   Returns `:ok` if the connection is allowed, or `{:error, :rate_limited}`
-  if the connection rate limit has been exceeded.
+  if either connection rate limit has been exceeded.
   """
-  @spec allow_connection?(t()) :: :ok | {:error, :rate_limited}
-  def allow_connection?(%{max_connections: nil}), do: :ok
+  @spec allow_connection?(t(), :inet.ip_address() | nil) :: :ok | {:error, :rate_limited}
+  def allow_connection?(limiter, peer_ip \\ nil) do
+    with :ok <- allow_shared_connection(limiter),
+         :ok <- allow_peer_connection(limiter, peer_ip) do
+      :ok
+    end
+  end
 
-  def allow_connection?(%{table: table, max_connections: max}) do
+  defp allow_shared_connection(%{max_connections: nil}), do: :ok
+
+  defp allow_shared_connection(%{table: table, max_connections: max}) do
     count = :ets.update_counter(table, :connections, {2, 1})
 
     if count <= max do
@@ -91,6 +107,31 @@ defmodule MqttX.Server.RateLimiter do
     else
       # Decrement back since we won't use this slot
       :ets.update_counter(table, :connections, {2, -1})
+      {:error, :rate_limited}
+    end
+  end
+
+  defp allow_peer_connection(%{max_connections_per_ip: nil}, _peer_ip), do: :ok
+  defp allow_peer_connection(_limiter, nil), do: :ok
+
+  defp allow_peer_connection(%{table: table, max_connections_per_ip: max}, peer_ip) do
+    key = {:ip, peer_ip}
+
+    count =
+      try do
+        :ets.update_counter(table, key, {2, 1})
+      rescue
+        ArgumentError ->
+          :ets.insert_new(table, {key, 1})
+          1
+      end
+
+    if count <= max do
+      :ok
+    else
+      :ets.update_counter(table, key, {2, -1})
+      # The shared slot taken above is given back too
+      :ets.update_counter(table, :connections, {2, -1}, {:connections, 0})
       {:error, :rate_limited}
     end
   end

@@ -43,13 +43,13 @@ defmodule MqttX.Client.WebSocket do
   Perform WebSocket HTTP upgrade over an existing TCP/SSL socket.
   Returns :ok on successful upgrade or {:error, reason}.
   """
-  def upgrade(socket, transport, host, path) do
+  def upgrade(socket, transport, host, port, path) do
     raw_key = :crypto.strong_rand_bytes(16)
     key = Base.encode64(raw_key)
 
     request =
       "GET #{path} HTTP/1.1\r\n" <>
-        "Host: #{host}\r\n" <>
+        "Host: #{host_header(host, port, transport)}\r\n" <>
         "Upgrade: websocket\r\n" <>
         "Connection: Upgrade\r\n" <>
         "Sec-WebSocket-Key: #{key}\r\n" <>
@@ -293,6 +293,12 @@ defmodule MqttX.Client.WebSocket do
     pad = :binary.copy(mask_key, full) <> binary_part(mask_key, 0, rem_bytes)
     :crypto.exor(data, pad)
   end
+
+  # RFC 7230 §5.4: the port goes in the Host header unless it is the
+  # scheme's default; a virtual-hosted gateway routes on it
+  defp host_header(host, 80, :tcp), do: host
+  defp host_header(host, 443, :ssl), do: host
+  defp host_header(host, port, _transport), do: "#{host}:#{port}"
 
   defp send_raw(socket, :tcp, data), do: :gen_tcp.send(socket, data)
   defp send_raw(socket, :ssl, data), do: :ssl.send(socket, data)

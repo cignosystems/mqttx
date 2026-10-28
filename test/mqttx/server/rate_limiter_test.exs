@@ -35,6 +35,39 @@ defmodule MqttX.Server.RateLimiterTest do
     end
   end
 
+  describe "allow_connection?/2 per peer address" do
+    test "one address is capped on its own; others and the shared budget go on" do
+      limiter = RateLimiter.new(max_connections: 100, max_connections_per_ip: 2, interval: 60_000)
+      on_exit(fn -> RateLimiter.cleanup(limiter) end)
+
+      assert :ok = RateLimiter.allow_connection?(limiter, {10, 0, 0, 1})
+      assert :ok = RateLimiter.allow_connection?(limiter, {10, 0, 0, 1})
+      assert {:error, :rate_limited} = RateLimiter.allow_connection?(limiter, {10, 0, 0, 1})
+
+      assert :ok = RateLimiter.allow_connection?(limiter, {10, 0, 0, 2})
+      # A refusal does not use up a shared slot
+      assert [{:connections, 3}] = :ets.lookup(limiter.table, :connections)
+    end
+
+    test "an unknown address is not counted per address, only against the shared budget" do
+      limiter = RateLimiter.new(max_connections: 1, max_connections_per_ip: 1, interval: 60_000)
+      on_exit(fn -> RateLimiter.cleanup(limiter) end)
+
+      assert :ok = RateLimiter.allow_connection?(limiter, nil)
+      assert {:error, :rate_limited} = RateLimiter.allow_connection?(limiter, nil)
+    end
+
+    test "the per-address counters reset with the interval" do
+      limiter = RateLimiter.new(max_connections_per_ip: 1, interval: 50)
+      on_exit(fn -> RateLimiter.cleanup(limiter) end)
+
+      assert :ok = RateLimiter.allow_connection?(limiter, {127, 0, 0, 1})
+      assert {:error, :rate_limited} = RateLimiter.allow_connection?(limiter, {127, 0, 0, 1})
+      Process.sleep(120)
+      assert :ok = RateLimiter.allow_connection?(limiter, {127, 0, 0, 1})
+    end
+  end
+
   describe "allow_message?/2" do
     test "allows messages under per-client limit", %{limiter: limiter} do
       for _ <- 1..10 do

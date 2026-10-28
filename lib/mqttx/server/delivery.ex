@@ -14,6 +14,7 @@ defmodule MqttX.Server.Delivery do
 
   require Logger
 
+  alias MqttX.Packet.Buffer
   alias MqttX.Server.Cluster
   alias MqttX.Server.SessionStore
   alias MqttX.Topic
@@ -331,7 +332,8 @@ defmodule MqttX.Server.Delivery do
           # before: a message matched here waits behind those, so a
           # publisher's messages keep their order (§4.6)
           via == :direct and SessionStore.fenced?(ctx.sessions, client) ->
-            SessionStore.hold_message(ctx.sessions, client, {id, topic, payload, opts, queued_at})
+            held = {id, topic, Buffer.detach(payload), opts, queued_at}
+            SessionStore.hold_message(ctx.sessions, client, held)
 
             # The fence may have come down while this went in, after the
             # held messages were let out
@@ -388,7 +390,11 @@ defmodule MqttX.Server.Delivery do
     end
   end
 
-  defp queue(ctx, client, pids, {topic, _payload, opts, _queued_at} = entry) do
+  defp queue(ctx, client, pids, {topic, payload, opts, queued_at}) do
+    # Kept, maybe for long: with memory of its own, not a reference into the
+    # whole read the message arrived in
+    entry = {topic, Buffer.detach(payload), opts, queued_at}
+
     case SessionStore.enqueue(ctx.sessions, client, entry, ctx.max_outbound_queue) do
       :ok ->
         Enum.each(pids, &send(&1, :mqttx_drain))

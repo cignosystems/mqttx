@@ -15,6 +15,8 @@ defmodule MqttX.Packet.Properties do
   property is a single value.
   """
 
+  import Bitwise
+
   alias MqttX.Packet.Varint
 
   # Property identifiers
@@ -154,6 +156,8 @@ defmodule MqttX.Packet.Properties do
   and becomes `{:error, {:property_not_allowed, name, packet_type}}`.
   """
   @spec encode(integer(), map(), packet_type()) :: iodata()
+  def encode(5, properties, _packet_type) when map_size(properties) == 0, do: [<<0>>]
+
   def encode(5, properties, packet_type) when is_map(properties) do
     # §3.8.2.1.2: a SUBSCRIBE carries one Subscription Identifier at most
     if packet_type == :subscribe and is_list(Map.get(properties, :subscription_identifier)) and
@@ -174,6 +178,8 @@ defmodule MqttX.Packet.Properties do
   makes the packet malformed (§2.2.2.2).
   """
   @spec decode(integer(), binary(), packet_type()) :: {:ok, map(), binary()} | {:error, atom()}
+  def decode(5, <<0, rest::binary>>, _packet_type), do: {:ok, %{}, rest}
+
   def decode(5, data, packet_type) do
     with {:ok, props, rest} <- decode(5, data) do
       case disallowed(props, packet_type) do
@@ -700,7 +706,18 @@ defmodule MqttX.Packet.Properties do
   # MQTT §1.5.4: UTF-8 strings MUST NOT contain U+0000 (null) or surrogates
   # (U+D800..U+DFFF). `:unicode.characters_to_binary/1` rejects standalone surrogates
   # and any ill-formed UTF-8 sequence. The null byte requires a separate scan.
+  # ASCII is checked here first, four bytes at a time (as in the codec): a
+  # word with no byte above 0x7F and no zero byte is fine; from the first
+  # byte that is not, the rest goes to the runtime's validator.
   defp valid_mqtt_utf8?(<<>>), do: true
+
+  defp valid_mqtt_utf8?(<<word::32, rest::binary>>)
+       when (word &&& 0x80808080) == 0 and
+              (word - 0x01010101 &&& bnot(word) &&& 0x80808080) == 0,
+       do: valid_mqtt_utf8?(rest)
+
+  defp valid_mqtt_utf8?(<<0, _::binary>>), do: false
+  defp valid_mqtt_utf8?(<<c, rest::binary>>) when c < 128, do: valid_mqtt_utf8?(rest)
 
   defp valid_mqtt_utf8?(bin) when is_binary(bin) do
     case :binary.match(bin, <<0>>) do

@@ -197,8 +197,14 @@ defmodule MqttX.Server.SessionStore do
   @doc "Record that a session exists (replacing any previous metadata)."
   @spec put(t(), client_id(), meta()) :: :ok
   def put(store, client_id, meta) when is_binary(client_id) and is_map(meta) do
+    # A persistent session (saved, or about to be) replaced by one that ends
+    # with its connection: the flush deletes what the backend holds for it
+    replaced_saved? =
+      store.backend != nil and
+        match?([{_, %{persistent: true}}], :ets.lookup(store.sessions, client_id))
+
     :ets.insert(store.sessions, {client_id, meta})
-    touch(store, client_id)
+    if replaced_saved?, do: mark(store, client_id), else: touch(store, client_id)
   end
 
   @doc """
@@ -268,6 +274,40 @@ defmodule MqttX.Server.SessionStore do
     ArgumentError -> 0
   end
 
+  # How long a count serves the :max_sessions check
+  @count_ttl_ms 1_000
+
+  @doc false
+  # Whether a session may begin under a cap of `max` on this node. count/1
+  # scans the table, so a count is kept for a second with each session
+  # admitted meanwhile added to it: never fewer than the sessions there are.
+  # A CONNECT that count would refuse recounts first — a session may have
+  # ended since — so a refusal is always from a fresh count.
+  @spec admit?(t(), pos_integer()) :: boolean()
+  def admit?(store, max) do
+    now = System.monotonic_time(:millisecond)
+
+    admitted =
+      case :ets.lookup(store.sessions, :session_count) do
+        [{_, _n, at}] when now - at < @count_ttl_ms ->
+          :ets.update_counter(store.sessions, :session_count, {2, 1})
+
+        _ ->
+          recount(store, now)
+      end
+
+    admitted <= max or recount(store, now) <= max
+  rescue
+    ArgumentError -> true
+  end
+
+  # The sessions there are, the one being admitted included
+  defp recount(store, now) do
+    n = count(store) + 1
+    :ets.insert(store.sessions, {:session_count, n, now})
+    n
+  end
+
   @doc "Set when the session ends (`:infinity` while it is connected or never expires)."
   @spec set_expiry(t(), client_id(), :infinity | integer()) :: :ok
   def set_expiry(store, client_id, expires_at) do
@@ -288,13 +328,19 @@ defmodule MqttX.Server.SessionStore do
   end
 
   defp do_delete(store, client_id) do
+    # Deleted from the backend too, unless it was never saved there (a
+    # session that ends with its connection)
+    saved? =
+      store.backend != nil and
+        not match?([{_, %{persistent: false}}], :ets.lookup(store.sessions, client_id))
+
     drop_state(store, client_id)
     :ets.select_delete(store.queue, [{{{client_id, :_}, :_}, [], [true]}])
     :ets.select_delete(store.held, [{{{client_id, :_}, :_}, [], [true]}])
     :ets.delete(store.sessions, {:qlen, client_id})
     :ets.delete(store.sessions, {:fence, client_id})
     :ets.delete(store.sessions, client_id)
-    touch(store, client_id)
+    if saved?, do: mark(store, client_id), else: :ok
   end
 
   # A session's subscriptions and in-flight state, not its queue or its row
@@ -550,19 +596,19 @@ defmodule MqttX.Server.SessionStore do
   end
 
   # Every subscriber of exactly this filter: {filter, subscriber, opts}.
-  defp collect(tab, filter), do: collect(tab, filter, :ets.next(tab, {filter, 0}), [])
+  # Most of the prefixes the walk probes have none, and the key after
+  # {filter, 0} says so; the select, bounded by the filter in the key, runs
+  # only when there is one, and reads a filter's thousand subscribers in a
+  # fifth of the time stepping through them with next/2 and lookup/2 takes.
+  defp collect(tab, filter) do
+    case :ets.next(tab, {filter, 0}) do
+      {^filter, _subscriber} ->
+        :ets.select(tab, [{{{filter, :"$1"}, :"$2"}, [], [{{{:const, filter}, :"$1", :"$2"}}]}])
 
-  defp collect(tab, filter, {filter, subscriber} = key, acc) do
-    acc =
-      case :ets.lookup(tab, key) do
-        [{_, opts}] -> [{filter, subscriber, opts} | acc]
-        [] -> acc
-      end
-
-    collect(tab, filter, :ets.next(tab, key), acc)
+      _ ->
+        []
+    end
   end
-
-  defp collect(_tab, _filter, _other_key, acc), do: acc
 
   # One delivery per client at the highest matching QoS; the Subscription
   # Identifiers of every matching subscription ride along (§3.3.4).
@@ -833,7 +879,11 @@ defmodule MqttX.Server.SessionStore do
     end
   end
 
-  defp next_seq(store), do: :ets.update_counter(store.sessions, :seq, {2, 1}, {:seq, 0})
+  # Orders a client's queue, held messages and in-flight entries: unique and
+  # increasing on this node, as a counter row would be, without every
+  # enqueue on the node waiting its turn at one ETS key (under contention
+  # that key cost forty times what the insert itself does)
+  defp next_seq(_store), do: :erlang.unique_integer([:monotonic, :positive])
 
   # ---------- Whole sessions: moving between nodes, durable backend ----------
 
@@ -1146,10 +1196,19 @@ defmodule MqttX.Server.SessionStore do
     end
   end
 
-  # Remember that a session changed, for the next backend save
+  # Remember that a session changed, for the next backend save. One that ends
+  # with its connection is never saved: the connection goes, the session with
+  # it, and a copy restored after a crash would be dead on arrival.
   defp touch(%{backend: nil}, _client_id), do: :ok
 
   defp touch(store, client_id) do
+    case :ets.lookup(store.sessions, client_id) do
+      [{_, %{persistent: false}}] -> :ok
+      _ -> mark(store, client_id)
+    end
+  end
+
+  defp mark(store, client_id) do
     :ets.insert(store.dirty, {client_id})
     :ok
   end
@@ -1170,6 +1229,9 @@ defmodule MqttX.Server.SessionStore do
           # On its way here, or gone from here: the node that has it saves it
           [{_, %{placeholder: true}}] -> :ok
           [{_, %{moved_to: _}}] -> :ok
+          # Ends with its connection: nothing to keep, and what a persistent
+          # session under the id left in the backend goes
+          [{_, %{persistent: false}}] -> delete_saved(module, state, client_id)
           [] -> delete_saved(module, state, client_id)
           _ -> save(module, state, client_id, export(store, client_id))
         end

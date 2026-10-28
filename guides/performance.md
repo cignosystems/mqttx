@@ -47,6 +47,10 @@ All socket sends use `Codec.encode_iodata/2` which returns an iolist — a neste
 
 For a typical 50-byte PUBLISH packet, this saves one 50-byte allocation and copy per send. At 100k messages/second, that's 5MB/s of avoided garbage collection pressure.
 
+A PUBLISH's Topic Name is validated in one pass over its bytes (`MqttX.Topic.valid_name?/1` on encode; `validate_publish/1` splits the levels in that same pass on decode), and a name that passes is a well-formed UTF-8 string by construction, so it is not checked again as one. The broker encodes a message once per recipient, so this is paid per delivery: a small PUBLISH encodes about three times faster than it did and decodes 2.6 times faster. An empty properties map costs nothing to encode or decode, and ASCII strings are UTF-8-checked a word at a time.
+
+**Acknowledgements are written once per read.** The PUBACKs, PUBRECs and PUBCOMPs for the packets of one socket read are sent together after it, on both the broker and the client — one `gen_tcp.send` (about 2.8 µs, or 4.5 µs for `ssl.send`) instead of one per packet — and at most sixteen at a time, so an acknowledgement never waits on a long read's processing (the peer's window refills as they arrive). Anything else sent during the read goes out behind them, so the wire order is unchanged. A client taking in QoS 1 messages that arrive several to a read went from 315k to over a million messages a second.
+
 **Codec benchmarks** (Apple M4 Pro):
 
 | Operation | Throughput | Notes |

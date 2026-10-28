@@ -127,6 +127,8 @@ defmodule MqttX.Transport.Handler do
       connected: false,
       keep_alive: 0,
       keepalive_timer: nil,
+      # A Control Packet arrived in the read being processed (after_read/1)
+      packet_received: false,
       # Keepalive-independent idle ceiling (see @default_max_idle_timeout)
       max_idle_timeout:
         case Map.get(transport_opts, :max_idle_timeout, @default_max_idle_timeout) do
@@ -267,9 +269,13 @@ defmodule MqttX.Transport.Handler do
         {:ok, %{state | buffer: buffer}}
 
       {:ready, buffer} ->
-        case process_buffer(buffer, state) do
+        result = process_buffer(buffer, state)
+        # The acknowledgements of this read's packets, in one write
+        flush_acks(state)
+
+        case result do
           {:ok, new_state} ->
-            {:ok, new_state}
+            {:ok, after_read(new_state)}
 
           {:close, reason, new_state} ->
             Logger.debug("[MqttX.Transport] Closing connection: #{inspect(reason)}")
@@ -282,6 +288,14 @@ defmodule MqttX.Transport.Handler do
         end
     end
   end
+
+  # The keep-alive clock (§3.1.2.10) restarts when a Control Packet arrives:
+  # once per read, after its packets, rather than for each of them — the
+  # deadline is the same, set from the last one
+  defp after_read(%{packet_received: true} = state),
+    do: reset_keepalive_timer(%{state | packet_received: false})
+
+  defp after_read(state), do: state
 
   @doc """
   Transport connection closed.
@@ -685,7 +699,7 @@ defmodule MqttX.Transport.Handler do
           {:ok, {packet, rest}} ->
             case handle_packet(packet, state) do
               {:ok, new_state} ->
-                process_buffer(rest, %{reset_keepalive_timer(new_state) | buffer: rest})
+                process_buffer(rest, %{new_state | buffer: rest, packet_received: true})
 
               {:close, reason, new_state} ->
                 {:close, reason, %{new_state | buffer: rest}}
@@ -1180,7 +1194,7 @@ defmodule MqttX.Transport.Handler do
           properties: %{}
         }
 
-        send_packet(state, pubcomp, state.protocol_version)
+        queue_ack(state, pubcomp)
         {:ok, state}
 
       {{stored_packet, opts}, remaining} ->
@@ -1200,8 +1214,7 @@ defmodule MqttX.Transport.Handler do
               store_retained_message(stored_packet, state)
             end
 
-            pubcomp = %{type: :pubcomp, packet_id: packet.packet_id}
-            send_packet(state, pubcomp, state.protocol_version)
+            queue_ack(state, %{type: :pubcomp, packet_id: packet.packet_id})
 
             {:ok,
              untrack_inflight(
@@ -1215,8 +1228,7 @@ defmodule MqttX.Transport.Handler do
              )}
 
           {:error, _reason, new_handler_state} ->
-            pubcomp = %{type: :pubcomp, packet_id: packet.packet_id}
-            send_packet(state, pubcomp, state.protocol_version)
+            queue_ack(state, %{type: :pubcomp, packet_id: packet.packet_id})
 
             {:ok,
              untrack_inflight(
@@ -1456,7 +1468,7 @@ defmodule MqttX.Transport.Handler do
 
   defp session_quota_exceeded?(state, client_id) do
     not SessionStore.exists?(state.sessions, client_id) and
-      SessionStore.count(state.sessions) >= state.max_sessions
+      not SessionStore.admit?(state.sessions, state.max_sessions)
   end
 
   defp cap_subscriptions(acks, _topics, %{max_subscriptions: nil}), do: acks
@@ -1770,7 +1782,7 @@ defmodule MqttX.Transport.Handler do
       # A re-sent QoS 2 PUBLISH whose id is pending is already in the window:
       # the PUBREC again, however full the window is
       packet.qos == 2 and Map.has_key?(state.pending_qos2_rx, packet.packet_id) ->
-        send_packet(state, %{type: :pubrec, packet_id: packet.packet_id}, state.protocol_version)
+        queue_ack(state, %{type: :pubrec, packet_id: packet.packet_id})
         {:ok, state}
 
       # §3.3.4 / §4.9: a client with more QoS > 0 PUBLISH packets in flight
@@ -1785,13 +1797,14 @@ defmodule MqttX.Transport.Handler do
       packet.qos == 2 ->
         # DUP handling: if packet_id already pending, re-send PUBREC without re-storing
         if Map.has_key?(state.pending_qos2_rx, packet.packet_id) do
-          pubrec = %{type: :pubrec, packet_id: packet.packet_id}
-          send_packet(state, pubrec, state.protocol_version)
+          queue_ack(state, %{type: :pubrec, packet_id: packet.packet_id})
           {:ok, state}
         else
-          pubrec = %{type: :pubrec, packet_id: packet.packet_id}
-          send_packet(state, pubrec, state.protocol_version)
+          queue_ack(state, %{type: :pubrec, packet_id: packet.packet_id})
 
+          # Kept until PUBREL, with memory of its own: as decoded, the
+          # payload is a reference into the whole read it arrived in
+          packet = %{packet | payload: Buffer.detach(packet.payload)}
           pending = Map.put(state.pending_qos2_rx, packet.packet_id, {packet, opts})
           state = %{state | pending_qos2_rx: pending, inflight_count: state.inflight_count + 1}
           {:ok, track_inflight(state, {:rx2, packet.packet_id}, {packet, opts})}
@@ -1807,8 +1820,7 @@ defmodule MqttX.Transport.Handler do
             end
 
             if packet.qos == 1 do
-              puback = %{type: :puback, packet_id: packet.packet_id}
-              send_packet(state, puback, state.protocol_version)
+              queue_ack(state, %{type: :puback, packet_id: packet.packet_id})
             end
 
             {:ok, %{state | handler_state: new_handler_state}}
@@ -1820,14 +1832,12 @@ defmodule MqttX.Transport.Handler do
             # the refusal in the Reason Code; a pre-5 PUBACK has none. (QoS 2
             # is refused the same way at PUBREL, with PUBCOMP.)
             if packet.qos == 1 do
-              puback = %{
+              queue_ack(state, %{
                 type: :puback,
                 packet_id: packet.packet_id,
                 reason_code: publish_refusal_code(reason),
                 properties: %{}
-              }
-
-              send_packet(state, puback, state.protocol_version)
+              })
             end
 
             {:ok, %{state | handler_state: new_handler_state}}
@@ -2013,11 +2023,61 @@ defmodule MqttX.Transport.Handler do
   defp send_packet(state, packet, version) do
     case Codec.encode_iodata(version || 4, packet) do
       {:ok, data} ->
-        state.send_fn.(data)
+        state.send_fn.(behind_acks(data))
 
       {:error, reason} ->
         Logger.warning("[MqttX.Transport] Failed to encode packet: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  # PUBACK, PUBREC and PUBCOMP for the packets of one read go out together,
+  # after the read (handle_data/2): one socket write per read rather than one
+  # per acknowledgement, which was most of the cost of taking a QoS 1
+  # message in. They wait in the process dictionary, for the duration of the
+  # read only, and anything else sent meanwhile goes out behind them
+  # (send_packet/3, send_publish/4), so the wire order is the order made. No
+  # more than @ack_batch wait at a time: the publisher's window (the Receive
+  # Maximum this side advertised) refills as they arrive, and none should
+  # wait on a long read's processing.
+  @acks :mqttx_acks
+  @ack_batch 16
+
+  defp queue_ack(state, packet) do
+    case Codec.encode_iodata(state.protocol_version || 4, packet) do
+      {:ok, data} ->
+        case Process.get(@acks) do
+          {n, acks} when n + 1 >= @ack_batch ->
+            Process.delete(@acks)
+            state.send_fn.([acks, data])
+
+          {n, acks} ->
+            Process.put(@acks, {n + 1, [acks, data]})
+
+          nil ->
+            Process.put(@acks, {1, data})
+        end
+
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[MqttX.Transport] Failed to encode packet: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp flush_acks(state) do
+    case Process.delete(@acks) do
+      nil -> :ok
+      {_n, acks} -> state.send_fn.(acks)
+    end
+  end
+
+  # `data`, behind the acknowledgements waiting to go out
+  defp behind_acks(data) do
+    case Process.delete(@acks) do
+      nil -> data
+      {_n, acks} -> [acks, data]
     end
   end
 
@@ -2257,7 +2317,7 @@ defmodule MqttX.Transport.Handler do
           # rather than leaking it.
           if qos > 0, do: %{state | next_packet_id: packet_id}, else: state
         else
-          state.send_fn.(data)
+          state.send_fn.(behind_acks(data))
           # The client has learned a new alias only now that it was sent
           state = %{state | topic_to_alias: aliases}
 

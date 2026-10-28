@@ -245,6 +245,11 @@ Conflicts resolve as "last connect wins" (sessions) and "latest write wins"
   carried over. Wall clocks decide which copy began last.
 - Splits are tested with two nodes on one machine; not under real network
   partitions or with more than two nodes.
+- The member process is a serialization point: it matches and delivers
+  every message from another node, answers claims, flushes sessions and
+  replicates retained messages. Sharding the receiving side, and flushing
+  from a process of its own with deltas rather than whole sessions, are
+  the open performance items (CONTRIBUTING.md, "Performance").
 
 ## Operational notes
 

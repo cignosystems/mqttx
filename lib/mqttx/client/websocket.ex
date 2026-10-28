@@ -281,17 +281,36 @@ defmodule MqttX.Client.WebSocket do
     [<<1::1, 0::3, 0x08::4, 1::1, 0::7>>, mask_key]
   end
 
-  # XOR masking per RFC 6455. `:crypto.exor/2` is dramatically faster than the
-  # previous byte-by-byte recursion (especially for large MQTT publishes) — it
-  # delegates to the OpenSSL/SIMD path on most VMs.
+  # XOR masking per RFC 6455 §5.3: the key, as one 32-bit word, against the
+  # data four words at a time, then the words of the tail and its last
+  # bytes. Faster than `:crypto.exor/2`, whose pad the length of the data
+  # cost more to build than the XOR itself.
   defp mask(<<>>, _key), do: <<>>
 
-  defp mask(data, mask_key) when byte_size(mask_key) == 4 do
-    data_len = byte_size(data)
-    full = div(data_len, 4)
-    rem_bytes = rem(data_len, 4)
-    pad = :binary.copy(mask_key, full) <> binary_part(mask_key, 0, rem_bytes)
-    :crypto.exor(data, pad)
+  defp mask(data, <<key::32>>) do
+    whole = byte_size(data) - rem(byte_size(data), 16)
+    <<body::binary-size(^whole), tail::binary>> = data
+
+    masked =
+      for <<a::32, b::32, c::32, d::32 <- body>>,
+        into: <<>>,
+        do:
+          <<Bitwise.bxor(a, key)::32, Bitwise.bxor(b, key)::32, Bitwise.bxor(c, key)::32,
+            Bitwise.bxor(d, key)::32>>
+
+    mask_tail(masked, tail, key)
+  end
+
+  defp mask_tail(acc, <<>>, _key), do: acc
+
+  defp mask_tail(acc, <<word::32, rest::binary>>, key),
+    do: mask_tail(<<acc::binary, Bitwise.bxor(word, key)::32>>, rest, key)
+
+  defp mask_tail(acc, tail, key) do
+    bits = bit_size(tail)
+    <<key_part::size(^bits), _::bits>> = <<key::32>>
+    <<tail_int::size(^bits)>> = tail
+    <<acc::binary, Bitwise.bxor(tail_int, key_part)::size(bits)>>
   end
 
   # RFC 7230 §5.4: the port goes in the Host header unless it is the

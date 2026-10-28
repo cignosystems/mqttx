@@ -5,7 +5,9 @@
 #     BENCH_TRANSPORT=ws mix run bench/e2e.exs      # MQTT over WebSocket
 #
 # Environment: BENCH_TIME (seconds per scenario, default 3), BENCH_SUBSCRIBERS
-# (fan-out width, default 50).
+# (fan-out width, default 50), BENCH_PAYLOADS (a comma-separated subset of
+# "100 B", "4 KiB", "64 KiB"; all three by default — the whole run is long,
+# and a before/after comparison of one size wants several interleaved runs).
 #
 # Scenarios, each over 100 B / 4 KiB / 64 KiB payloads:
 #   uplink QoS 0  — one publisher, the broker's handle_publish counts arrivals
@@ -187,11 +189,17 @@ IO.puts(
 )
 
 # Batch sizes keep each iteration in the tens of milliseconds
-inputs = %{
-  "100 B" => {:binary.copy(<<"x">>, 100), 1_000},
-  "4 KiB" => {:binary.copy(<<"x">>, 4_096), 500},
-  "64 KiB" => {:binary.copy(<<"x">>, 65_536), 50}
-}
+payloads = System.get_env("BENCH_PAYLOADS", "100 B,4 KiB,64 KiB") |> String.split(",")
+
+inputs =
+  %{
+    "100 B" => {:binary.copy(<<"x">>, 100), 1_000},
+    "4 KiB" => {:binary.copy(<<"x">>, 4_096), 500},
+    "64 KiB" => {:binary.copy(<<"x">>, 65_536), 50}
+  }
+  |> Map.filter(fn {name, _} -> name in payloads end)
+
+if inputs == %{}, do: raise("BENCH_PAYLOADS names none of \"100 B\", \"4 KiB\", \"64 KiB\"")
 
 uplink = fn qos ->
   fn {payload, batch} ->

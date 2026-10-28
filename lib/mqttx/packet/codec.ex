@@ -454,11 +454,10 @@ defmodule MqttX.Packet.Codec do
   def encode(version, packet) do
     case encode_packet(version, packet) do
       {:ok, {header, variable}} ->
-        var_bin = IO.iodata_to_binary(variable)
-        size = byte_size(var_bin)
+        size = IO.iodata_length(variable)
 
         if size <= @max_packet_size do
-          {:ok, <<header::binary, Varint.encode(size)::binary, var_bin::binary>>}
+          {:ok, IO.iodata_to_binary([header, Varint.encode(size), variable])}
         else
           {:error, :packet_too_large}
         end
@@ -612,15 +611,13 @@ defmodule MqttX.Packet.Codec do
       end
 
     # Never emit a PUBLISH the receiver must reject: wildcards (or an empty
-    # topic without a topic alias) are invalid in PUBLISH (§3.3.2.1).
-    has_alias = is_integer(get_in(msg, [:properties, :topic_alias]))
+    # topic without a topic alias) are invalid in PUBLISH (§3.3.2.1). One
+    # pass over the bytes; a name that passes is a UTF-8 string of at most
+    # 65 535 bytes, so it goes on the wire as it is.
+    has_alias = match?(%{properties: %{topic_alias: a}} when is_integer(a), msg)
 
-    unless topic == "" and has_alias do
-      case Topic.validate_publish(topic) do
-        {:ok, _} -> :ok
-        {:error, _} -> throw(:mqttx_invalid_topic)
-      end
-    end
+    unless (topic == "" and has_alias) or Topic.valid_name?(topic),
+      do: throw(:mqttx_invalid_topic)
 
     flags = dup <<< 3 ||| qos <<< 1 ||| retain
 
@@ -633,7 +630,7 @@ defmodule MqttX.Packet.Codec do
     props = Properties.encode(version, Map.get(msg, :properties, %{}), :publish)
     payload = Map.get(msg, :payload, <<>>)
 
-    variable = [encode_utf8(topic), packet_id_bin, props, payload]
+    variable = [<<byte_size(topic)::16-big, topic::binary>>, packet_id_bin, props, payload]
     {:ok, {<<@publish::4, flags::4>>, variable}}
   end
 
@@ -897,7 +894,19 @@ defmodule MqttX.Packet.Codec do
 
   # MQTT §1.5.4: UTF-8 strings MUST NOT contain U+0000 (null) or U+D800..U+DFFF (surrogates)
   # `:unicode.characters_to_binary/1` rejects standalone surrogates and ill-formed UTF-8.
+  # ASCII — most topics and names — is checked here first, four bytes at a
+  # time: a word with no byte above 0x7F and no zero byte (the usual
+  # has-a-zero-byte test) is fine. From the first byte that is not, the rest
+  # goes to the runtime's validator.
   defp valid_mqtt_utf8?(<<>>), do: true
+
+  defp valid_mqtt_utf8?(<<word::32, rest::binary>>)
+       when (word &&& 0x80808080) == 0 and
+              (word - 0x01010101 &&& bnot(word) &&& 0x80808080) == 0,
+       do: valid_mqtt_utf8?(rest)
+
+  defp valid_mqtt_utf8?(<<0, _::binary>>), do: false
+  defp valid_mqtt_utf8?(<<c, rest::binary>>) when c < 128, do: valid_mqtt_utf8?(rest)
 
   defp valid_mqtt_utf8?(bin) when is_binary(bin) do
     case :binary.match(bin, <<0>>) do
@@ -918,14 +927,11 @@ defmodule MqttX.Packet.Codec do
 
     # §3.1.3.3: a Will Topic is a Topic Name; never emit one the broker must
     # reject (wildcards / empty) — mirrors the PUBLISH encoder.
-    case Topic.validate_publish(topic) do
-      {:ok, _} -> :ok
-      {:error, _} -> throw(:mqttx_invalid_topic)
-    end
+    unless Topic.valid_name?(topic), do: throw(:mqttx_invalid_topic)
 
     [
       Properties.encode(version, Map.get(will, :properties, %{}), :will),
-      encode_utf8(topic),
+      <<byte_size(topic)::16-big, topic::binary>>,
       # §3.1.3.4: the Will Payload is BINARY data — length-prefixed but not
       # UTF-8 validated (decode already treats it as binary)
       encode_length_prefixed_binary(Map.get(will, :payload, <<>>))

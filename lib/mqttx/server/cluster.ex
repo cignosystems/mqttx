@@ -582,12 +582,11 @@ defmodule MqttX.Server.Cluster do
     {:noreply, state}
   end
 
+  # Expired sessions are swept with the :sweep tick, not here: a scan of the
+  # table every second was most of what this process did at a million
+  # sessions, and an expired session is discarded on access meanwhile
   def handle_info(:flush, state) do
-    guarded(fn ->
-      SessionStore.sweep(state.ctx.sessions)
-      SessionStore.flush(state.ctx.sessions)
-    end)
-
+    guarded(fn -> SessionStore.flush(state.ctx.sessions) end)
     {:noreply, schedule_flush(state)}
   end
 

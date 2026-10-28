@@ -103,6 +103,50 @@ All notable changes to this project will be documented in this file.
 - **`MqttX.Server.Router` keeps a client's filters in a `MapSet`.**
   Subscribing, unsubscribing and the duplicate check no longer walk a list
   of the client's filters; the public functions are unchanged.
+- **Performance** (from a review of the whole library; each item measured
+  before and after, nothing on the wire changed):
+  - Acknowledgements go out one write per read, not one per packet. The
+    PUBACKs, PUBRECs and PUBCOMPs for the packets of one read are written
+    together after it (at most sixteen at a time, so none waits on a long
+    read), on the broker and on the client, behind nothing and ahead of
+    anything else sent during the read. A client taking in QoS 1 messages
+    that arrive several to a read went from 315k to over a million messages
+    a second over TCP; over TLS the write was nearly the whole cost.
+  - A PUBLISH's Topic Name is checked in one pass over its bytes
+    (`MqttX.Topic.valid_name?/1`; `validate_publish/1` splits the levels
+    in the same pass) instead of being split, checked level by level, and
+    then validated again as a UTF-8 string. Encoding a small PUBLISH is
+    3× faster, decoding one 2.6×; the broker paid the old cost once per
+    recipient. A properties map that is empty is encoded and decoded
+    without a pass over it, `Codec.encode/2` builds the packet in one copy
+    instead of two, and ASCII strings are UTF-8-checked a word at a time.
+  - Messages queued or in flight on the broker are ordered by
+    `:erlang.unique_integer/1` rather than one counter row in ETS, which
+    every enqueue on the node serialized on: 0.2 M enqueues a second with
+    14 processes contending became 8 M.
+  - A filter's subscribers are read with one bounded `:ets.select/2`
+    instead of a `next`/`lookup` pair per subscriber: a fan-out to a
+    thousand subscribers of one filter takes a fifth of the time it did.
+  - The broker's keep-alive timer is re-armed once per read rather than
+    once per packet; a read with only part of a packet does not re-arm it.
+  - A session that ends with its connection is never saved to a
+    `:session_backend` (it was saved on every change and deleted on
+    disconnect, each a message to every node with the `Replicated`
+    backend), and the `:max_sessions` check no longer scans the session
+    table on every CONNECT: it keeps a count for a second, adds each
+    session it admits, and recounts before refusing.
+  - The cluster member no longer sweeps the whole session table on every
+    flush tick (every second); the 30 s sweep does that, and an expired
+    session is discarded on access meanwhile.
+  - A payload kept by the broker (retained, queued for a session, held for
+    one on its way, a QoS 2 message until PUBREL) or by the client (a QoS 2
+    message until PUBREL) gets memory of its own when it is small next to
+    the read it arrived in: as decoded it was a reference into the whole
+    read, so a hundred-byte retained message could hold tens of kilobytes.
+  - The client's QoS 2 in-flight count is kept, not recounted over every
+    pending acknowledgement on each QoS 2 message.
+  - The WebSocket client masks a frame a word at a time; a 64 KiB frame
+    took 86 µs, now 20.
 
 ### Fixed
 

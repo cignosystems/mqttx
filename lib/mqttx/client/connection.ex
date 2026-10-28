@@ -54,6 +54,15 @@ defmodule MqttX.Client.Connection do
   # remaining length and make the client buffer toward it.
   @default_max_packet_size 1_048_576
 
+  # Acknowledgements are written together, after the read they belong to —
+  # one socket write per read — but no more than this many at a time. The
+  # broker's window for this client (its Receive Maximum, 100 by default)
+  # refills as the acknowledgements arrive, so none should wait on a long
+  # read's processing: sixteen keeps nearly all of the saving (a write per
+  # sixteen packets) and measured level with or ahead of a whole read's
+  # worth on a window-bound fan-out (bench/cluster.exs, 40 subscribers).
+  @ack_batch 16
+
   defstruct [
     :host,
     :port,
@@ -130,6 +139,14 @@ defmodule MqttX.Client.Connection do
     pending_subs: %{},
     handler_has_handle_mqtt_event: false,
     inflight_tx_count: 0,
+    # QoS 2 PUBLISHes taken in and not yet released by PUBREL: the {:rx, id}
+    # entries of pending_acks, counted (checked against the Receive Maximum
+    # advertised, on every QoS 2 message)
+    inflight_rx_count: 0,
+    # The acknowledgements of the read being processed, sent together after
+    # it (or every @ack_batch of them), and how many there are
+    ack_out: [],
+    ack_count: 0,
     # Outstanding PINGREQ deadline timer (close connection if no PINGRESP arrives)
     pingresp_timer: nil,
     # Pending reconnect timer (avoid stacking timers when several events fire)
@@ -474,6 +491,7 @@ defmodule MqttX.Client.Connection do
       packet_id: packet_id,
       buffer: <<>>,
       pending_acks: pending_acks,
+      inflight_rx_count: count_rx(pending_acks),
       pending_seq: next_pending_seq(pending_acks),
       max_inflight: Keyword.get(opts, :max_inflight, @default_max_inflight),
       will: build_will(opts),
@@ -953,6 +971,9 @@ defmodule MqttX.Client.Connection do
         true ->
           process_buffer(state)
       end
+
+    # The acknowledgements of this read's packets, in one write
+    state = flush_acks(state)
 
     state =
       if state.ws_close_pending and state.socket do
@@ -1500,6 +1521,7 @@ defmodule MqttX.Client.Connection do
       state
       | pending_acks: pending,
         inflight_tx_count: length(now_sent),
+        inflight_rx_count: count_rx(pending),
         resend_backlog: Enum.map(later, fn {packet_id, _entry} -> packet_id end)
     }
   end
@@ -1514,7 +1536,7 @@ defmodule MqttX.Client.Connection do
       )
     end
 
-    %{state | pending_acks: %{}, inflight_tx_count: 0}
+    %{state | pending_acks: %{}, inflight_tx_count: 0, inflight_rx_count: 0}
   end
 
   # An acknowledgement made room in the window: the next message of a resumed
@@ -1721,9 +1743,13 @@ defmodule MqttX.Client.Connection do
             {publish_packet.topic, publish_packet.payload, publish_packet}
           )
 
-        send_packet(state, %{type: :pubcomp, packet_id: packet.packet_id})
         pending = Map.delete(state.pending_acks, {:rx, packet.packet_id})
-        %{state | pending_acks: pending}
+        rx_count = max(state.inflight_rx_count - 1, 0)
+
+        queue_ack(
+          %{state | pending_acks: pending, inflight_rx_count: rx_count},
+          %{type: :pubcomp, packet_id: packet.packet_id}
+        )
 
       _ ->
         # PUBREL for an id we no longer track: our PUBCOMP was lost and the
@@ -1940,38 +1966,65 @@ defmodule MqttX.Client.Connection do
         # QoS 1: deliver and send PUBACK
         emit_message_telemetry.()
         state = notify_handler(state, :message, {topic, packet.payload, packet})
-        send_packet(state, %{type: :puback, packet_id: packet.packet_id})
-        state
+        queue_ack(state, %{type: :puback, packet_id: packet.packet_id})
 
       2 ->
         # QoS 2: store message, send PUBREC, wait for PUBREL before delivering.
         # Bound the inbound in-flight set by our advertised Receive Maximum
         # (§3.3.4) — a broker exceeding it gets DISCONNECT 0x93.
-        rx_count =
-          Enum.count(state.pending_acks, fn
-            {{:rx, _}, _} -> true
-            _ -> false
-          end)
-
         already_pending = Map.has_key?(state.pending_acks, {:rx, packet.packet_id})
 
-        if not already_pending and rx_count >= inbound_receive_maximum(state) do
+        if not already_pending and state.inflight_rx_count >= inbound_receive_maximum(state) do
           if state.protocol_version >= 5 do
             send_packet(state, %{type: :disconnect, reason_code: 0x93, properties: %{}})
           end
 
           protocol_error_teardown(state, :receive_maximum_exceeded)
         else
+          # Kept until PUBREL, with memory of its own: as decoded, the
+          # payload is a reference into the whole read it arrived in
+          packet = %{packet | payload: Buffer.detach(packet.payload)}
+
           pending =
             Map.put(state.pending_acks, {:rx, packet.packet_id}, %{
               phase: :pubrec_sent,
               packet: packet
             })
 
-          send_packet(state, %{type: :pubrec, packet_id: packet.packet_id})
-          %{state | pending_acks: pending}
+          rx_count =
+            if already_pending, do: state.inflight_rx_count, else: state.inflight_rx_count + 1
+
+          queue_ack(
+            %{state | pending_acks: pending, inflight_rx_count: rx_count},
+            %{type: :pubrec, packet_id: packet.packet_id}
+          )
         end
     end
+  end
+
+  defp count_rx(pending_acks), do: Enum.count(pending_acks, &match?({{:rx, _}, _}, &1))
+
+  # PUBACK, PUBREC and PUBCOMP for the packets of one read go out together,
+  # after the read: one socket write per read rather than one per
+  # acknowledgement, which was most of the cost of taking QoS 1 messages in
+  # (and on TLS nearly all of it)
+  defp queue_ack(state, packet) do
+    case Codec.encode_iodata(state.protocol_version, packet) do
+      {:ok, data} ->
+        state = %{state | ack_out: [state.ack_out, data], ack_count: state.ack_count + 1}
+        if state.ack_count >= @ack_batch, do: flush_acks(state), else: state
+
+      {:error, _} ->
+        state
+    end
+  end
+
+  defp flush_acks(%{ack_out: []} = state), do: state
+  defp flush_acks(%{socket: nil} = state), do: %{state | ack_out: [], ack_count: 0}
+
+  defp flush_acks(state) do
+    socket_send(state, state.ack_out)
+    %{state | ack_out: [], ack_count: 0}
   end
 
   # The Receive Maximum we advertised in CONNECT (default: no limit per

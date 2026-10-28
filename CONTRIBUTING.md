@@ -93,6 +93,16 @@ When a change moves a hot path, refresh the numbers in
 principles. Two of the fixes in 0.12 (retained-store match specs, the
 receive buffer) were quadratic paths that only showed up under measurement.
 
+A before/after comparison needs the two builds interleaved on the same
+machine (a `git worktree` of the other commit), several runs each: one run
+of `e2e.exs` at `BENCH_TIME=2` swings by ±40 % on the fan-out scenarios, so
+`BENCH_PAYLOADS="64 KiB"` to repeat one size, and `cluster.exs` at its
+defaults runs 0.3 s and is startup-dominated — `BENCH_SUBSCRIBERS=40` gives
+runs of a second whose medians agree to a few percent. Its
+`BENCH_MESSAGES × BENCH_PUBLISHERS` must stay under the broker's
+`:max_outbound_queue` (10 000), or QoS 1 deliveries are dropped and the run
+waits out its timeout.
+
 ## Known test environment couplings
 
 The `MqttX.ClientTest` suite (~11 tests) hardcodes `localhost:1883` and asserts
@@ -115,6 +125,42 @@ ordered roughly by ratio of impact to effort.
   across a node loss, merging session copies after a split).
   `test/mqttx/cluster_test.exs` and
   `cluster_split_test.exs` run real nodes with `:peer` (needs epmd).
+
+### Performance (from the 0.13 performance review; design work, not quick fixes)
+
+The review's measured quick wins are in (see the 0.13 changelog). What is
+left changes a design, so each needs its own look. Figures are from the
+review's benchmarks on an M4 Pro.
+
+- **Inbound cross-node fan-out is serialized in one process per node.** A
+  message from another node is matched and delivered by the listener's
+  `MqttX.Server.Cluster` member, which also answers claims, flushes and
+  sweeps: about 700k deliveries/s at one subscriber per message, 6.5k
+  messages/s at a hundred, and CONNECT latency grows with publish load.
+  Sharding the receiving side across the relays needs the fence handshake
+  (`docs/design/clustering.md`) redone per shard.
+- **Whole sessions are re-exported and re-sent on every change.** A flush
+  exports a changed session entire (707 µs and 172 KB for a thousand-message
+  queue), and `SessionBackend.Replicated` sends the record to every node.
+  Deltas (per queue entry / in-flight change) and a flush in its own process
+  rather than the member's.
+- **One socket write per delivered PUBLISH.** Writes to the same connection
+  made while it processes a batch could be coalesced as the
+  acknowledgements now are (`gen_tcp.send` is ~2.8 µs a packet, ~0.12 µs
+  batched), but `:ok` from `publish/4` would then mean "queued", not
+  "written"; an opt-in async publish on the client is the same trade.
+- **Shared subscriptions cost O(members) per message**: every member of a
+  group is sorted and checked for being online on each delivery (108 µs at
+  a hundred members). An O(1) pick needs a cursor per group and a different
+  answer to "which member when some are offline"; the present answer is
+  even round-robin among the online ones.
+- **`use MqttX` has no backpressure.** The connection acknowledges a message
+  once it is in the module process's mailbox, so a slow `handle_message/4`
+  grows that mailbox without bound while Receive Maximum bounds nothing
+  (documented in the client guide).
+- **`:ets.select` over every dirty session, and the retained-store
+  replication, both run in the member.** Cheap today; they queue behind the
+  fan-out above.
 
 ### Smaller polish (low risk, do whenever)
 

@@ -288,6 +288,76 @@ defmodule MqttX.Client.ConnectionGuardrailsTest do
     assert_receive {:broker, :packet, %{type: :publish, topic: ["jobs", "new"]}}, 2_000
   end
 
+  defp publish_bytes(id, qos, payload \\ "p") do
+    {:ok, bytes} =
+      MqttX.Packet.Codec.encode(5, %{
+        type: :publish,
+        topic: "in/#{id}",
+        payload: payload,
+        qos: qos,
+        retain: false,
+        dup: false,
+        packet_id: if(qos > 0, do: id),
+        properties: %{}
+      })
+
+    bytes
+  end
+
+  defp acks(type, n) do
+    for _ <- 1..n do
+      assert_receive {:broker, :packet, %{type: ^type, packet_id: id}}, 2_000
+      id
+    end
+  end
+
+  test "the acknowledgements of a read's packets go out together, in order" do
+    broker = FakeBroker.start()
+    client = start_client(broker)
+    assert_receive {:mqtt_event, :connected, _}, 5_000
+
+    # Four messages in one read: their PUBACKs and the PUBREC leave in one
+    # write, in order, after every message reached the handler
+    read =
+      publish_bytes(1, 1) <> publish_bytes(2, 1) <> publish_bytes(3, 2) <> publish_bytes(4, 1)
+
+    FakeBroker.send_raw(broker, read)
+
+    for id <- ["1", "2", "4"],
+        do: assert_receive({:mqtt_event, :message, {["in", ^id], _, _}}, 2_000)
+
+    assert acks(:puback, 3) == [1, 2, 4]
+    assert [3] = acks(:pubrec, 1)
+    assert :sys.get_state(client).inflight_rx_count == 1
+
+    FakeBroker.send(broker, %{type: :pubrel, packet_id: 3, reason_code: 0, properties: %{}})
+    assert_receive {:mqtt_event, :message, {["in", "3"], _, _}}, 2_000
+    assert [3] = acks(:pubcomp, 1)
+    assert :sys.get_state(client).inflight_rx_count == 0
+    assert :sys.get_state(client).ack_out == []
+  end
+
+  test "QoS 2 messages in flight are counted against the Receive Maximum advertised" do
+    broker = FakeBroker.start()
+    client = start_client(broker, connect_properties: %{receive_maximum: 2})
+    assert_receive {:mqtt_event, :connected, _}, 5_000
+
+    FakeBroker.send_raw(broker, publish_bytes(1, 2) <> publish_bytes(2, 2))
+    assert acks(:pubrec, 2) == [1, 2]
+    assert :sys.get_state(client).inflight_rx_count == 2
+
+    # The same one again (a re-send) is within the window; a third is not
+    FakeBroker.send_raw(broker, publish_bytes(2, 2))
+    assert [2] = acks(:pubrec, 1)
+    assert :sys.get_state(client).inflight_rx_count == 2
+
+    FakeBroker.send_raw(broker, publish_bytes(3, 2))
+    assert_receive {:broker, :packet, %{type: :disconnect, reason_code: 0x93}}, 2_000
+
+    assert_receive {:mqtt_event, :disconnected, {:protocol_error, :receive_maximum_exceeded}},
+                   2_000
+  end
+
   defp recv_until(sock, buffer, marker) do
     if String.contains?(buffer, marker) do
       buffer

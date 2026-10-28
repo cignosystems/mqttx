@@ -38,6 +38,20 @@ defmodule MqttX.Packet.Buffer do
   def new, do: <<>>
 
   @doc """
+  `payload` with memory of its own, for keeping. A payload decoded from a
+  read is a reference into that read's buffer, and stored as it is (a
+  retained message, a queued one) keeps the whole buffer alive: a hundred
+  bytes holding sixty kilobytes. Copied only when the buffer is at least
+  twice the payload; one that is most of its buffer stays as it is.
+  """
+  @spec detach(term()) :: term()
+  def detach(bin) when is_binary(bin) and byte_size(bin) > 0 do
+    if :binary.referenced_byte_size(bin) >= 2 * byte_size(bin), do: :binary.copy(bin), else: bin
+  end
+
+  def detach(other), do: other
+
+  @doc """
   Number of bytes currently buffered.
   """
   @spec size(t()) :: non_neg_integer()

@@ -77,6 +77,8 @@ defmodule MqttX.Topic do
   """
   @spec validate_publish(binary() | list()) ::
           {:ok, normalized_topic()} | {:error, :invalid_topic}
+  def validate_publish(topic) when is_binary(topic), do: split_name(topic)
+
   def validate_publish(topic) do
     case do_validate(topic, :name) do
       {:ok, normalized} ->
@@ -90,6 +92,62 @@ defmodule MqttX.Topic do
         error
     end
   end
+
+  @doc """
+  Whether `topic` is a valid Topic Name (§4.7): not empty, at most 65 535
+  bytes and #{@max_topic_levels} levels, well-formed UTF-8 without U+0000,
+  and no `+` or `#`. The rule `validate_publish/1` applies to a binary, in
+  one pass over its bytes and without building the levels — for a sender
+  that only needs to know.
+  """
+  @spec valid_name?(binary()) :: boolean()
+  def valid_name?(<<>>), do: false
+  def valid_name?(topic) when byte_size(topic) > @max_topic_bytes, do: false
+  def valid_name?(topic) when is_binary(topic), do: scan_name(topic, 1)
+
+  defp scan_name(<<>>, _levels), do: true
+
+  defp scan_name(<<?/, rest::binary>>, levels) when levels < @max_topic_levels,
+    do: scan_name(rest, levels + 1)
+
+  defp scan_name(<<c, rest::binary>>, levels) when c < 128 and c not in [0, ?+, ?#, ?/],
+    do: scan_name(rest, levels)
+
+  defp scan_name(<<c, _::binary>>, _levels) when c < 128, do: false
+  defp scan_name(<<_::utf8, rest::binary>>, levels), do: scan_name(rest, levels)
+  defp scan_name(_, _levels), do: false
+
+  # validate_publish/1 for a binary: the levels, in the one pass that checks
+  # them. `pos` is the offset the unread `rest` starts at, `start` that of
+  # the level being read; a level is the bytes between two separators.
+  defp split_name(<<>>), do: {:error, :invalid_topic}
+  defp split_name(topic) when byte_size(topic) > @max_topic_bytes, do: {:error, :invalid_topic}
+  defp split_name(topic), do: split_name(topic, topic, 0, 0, 1, [])
+
+  defp split_name(<<>>, topic, start, pos, _levels, acc),
+    do: {:ok, :lists.reverse([binary_part(topic, start, pos - start) | acc])}
+
+  defp split_name(<<?/, rest::binary>>, topic, start, pos, levels, acc)
+       when levels < @max_topic_levels do
+    level = binary_part(topic, start, pos - start)
+    split_name(rest, topic, pos + 1, pos + 1, levels + 1, [level | acc])
+  end
+
+  defp split_name(<<c, rest::binary>>, topic, start, pos, levels, acc)
+       when c < 128 and c not in [0, ?+, ?#, ?/],
+       do: split_name(rest, topic, start, pos + 1, levels, acc)
+
+  defp split_name(<<c, _::binary>>, _topic, _start, _pos, _levels, _acc) when c < 128,
+    do: {:error, :invalid_topic}
+
+  defp split_name(<<cp::utf8, rest::binary>>, topic, start, pos, levels, acc),
+    do: split_name(rest, topic, start, pos + utf8_size(cp), levels, acc)
+
+  defp split_name(_, _topic, _start, _pos, _levels, _acc), do: {:error, :invalid_topic}
+
+  defp utf8_size(cp) when cp < 0x800, do: 2
+  defp utf8_size(cp) when cp < 0x10000, do: 3
+  defp utf8_size(_cp), do: 4
 
   defp do_validate(topic, _kind) when is_binary(topic) and byte_size(topic) > @max_topic_bytes do
     {:error, :invalid_topic}

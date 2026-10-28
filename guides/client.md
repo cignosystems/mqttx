@@ -305,6 +305,17 @@ defaults, so implement only what you need. Each returns `{:ok, state}` or
 module, usable from inside callbacks or from anywhere else in your app. See
 `MqttX.SimpleClient` for details.
 
+The module's process is where its callbacks run, so the connection is not
+held up by them — and is not held back by them either. A message is
+acknowledged once it is in the module's mailbox, so with a slow
+`handle_message/4` the mailbox grows without bound while the broker keeps
+sending: the Receive Maximum the client advertises limits what the
+connection holds, not what the module has yet to process. Keep the callback
+quick (hand work to a `Task`, a queue, or a pool), or use the
+`handle_mqtt_event/3` handler form, whose callback runs in the connection
+process: a slow one there delays the acknowledgement, and a broker honouring
+Receive Maximum then waits.
+
 ## MQTT 5.0 Features
 
 ### Request/Response

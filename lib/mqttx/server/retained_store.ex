@@ -32,6 +32,7 @@ defmodule MqttX.Server.RetainedStore do
 
   require Logger
 
+  alias MqttX.Packet.Buffer
   alias MqttX.Topic
 
   @type table :: :ets.table()
@@ -103,6 +104,9 @@ defmodule MqttX.Server.RetainedStore do
         ) :: {:ok, tuple()} | :dropped
   def write(table, topic, payload, qos, properties, max) do
     segments = Topic.normalize(topic)
+    # Kept until overwritten: with memory of its own, not a reference into
+    # the whole read the message arrived in
+    payload = Buffer.detach(payload)
     existing = :ets.lookup(table, segments)
     version = next_version(existing)
     now = System.system_time(:second)

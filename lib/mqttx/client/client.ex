@@ -147,6 +147,9 @@ defmodule MqttX.Client do
     hostname checking, TLS 1.2/1.3). Pass `[verify: :verify_none]` to opt out
     deliberately; it is logged as a warning.
   - `:ws_path` - WebSocket path for `:ws`/`:wss` (default: `"/mqtt"`)
+  - `:send_timeout` - Milliseconds a socket write may block, when the broker has
+    stopped reading, before the connection is closed and reconnected
+    (default: `30000`)
   - `:proxy` - Tunnel through an HTTP `CONNECT` proxy, e.g.
     `[host: "proxy.corp", port: 3128, auth: {"user", "pass"}]`. Works for all
     transports; `:port` defaults to 3128 and `:auth` (Basic) is optional. TLS

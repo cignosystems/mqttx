@@ -48,6 +48,11 @@ defmodule MqttX.Client.Connection do
   @default_keepalive 60
   @default_max_inflight 100
   @connect_timeout 5000
+  # A peer that stops reading fills the send buffer and blocks the write, and
+  # with it this process: its timers, including the keep-alive that would
+  # otherwise notice. The socket closes at this deadline, so the usual
+  # disconnect and reconnect follow.
+  @send_timeout 30_000
 
   # Ceiling on a single inbound MQTT packet (1 MiB). Mirrors the server-side
   # cap: a hostile or compromised broker can otherwise declare a ~256 MB
@@ -124,6 +129,7 @@ defmodule MqttX.Client.Connection do
     server_retain_available: true,
     # WebSocket path (for :ws/:wss transport)
     ws_path: "/mqtt",
+    send_timeout: @send_timeout,
     # WebSocket frame buffer (for :ws/:wss transport)
     ws_buffer: <<>>,
     # WebSocket fragmentation state — partial multi-frame message in flight
@@ -198,6 +204,8 @@ defmodule MqttX.Client.Connection do
   - `:transport` - Transport type: `:tcp`, `:ssl`, `:ws`, or `:wss` (default: `:tcp`)
   - `:ssl_opts` - SSL options when transport is `:ssl` or `:wss` (e.g., `[verify: :verify_peer]`)
   - `:ws_path` - WebSocket path when transport is `:ws` or `:wss` (default: "/mqtt")
+  - `:send_timeout` - Milliseconds a socket write may block before the connection
+    is closed and reconnected (default: 30000)
   - `:proxy` - HTTP CONNECT proxy for any transport, e.g.
     `[host: "proxy.corp", port: 3128, auth: {"user", "pass"}]` (`:port`
     defaults to 3128, `:auth` is optional Basic auth). TLS is negotiated with
@@ -477,6 +485,7 @@ defmodule MqttX.Client.Connection do
       transport: transport,
       ssl_opts: Keyword.get(opts, :ssl_opts, []),
       ws_path: Keyword.get(opts, :ws_path, "/mqtt"),
+      send_timeout: Keyword.get(opts, :send_timeout, @send_timeout),
       proxy: Keyword.get(opts, :proxy),
       max_packet_size:
         case Keyword.get(opts, :max_packet_size, @default_max_packet_size) do
@@ -1151,7 +1160,20 @@ defmodule MqttX.Client.Connection do
 
   # Open the raw TCP socket (passive mode) — directly, or tunneled through
   # an HTTP CONNECT proxy (RFC 9110 §9.3.6) when `:proxy` is configured.
-  defp open_tcp(%{proxy: nil} = state) do
+  defp open_tcp(state) do
+    with {:ok, socket} <- connect_tcp(state) do
+      case :inet.setopts(socket, send_timeout: state.send_timeout, send_timeout_close: true) do
+        :ok ->
+          {:ok, socket}
+
+        {:error, _} = err ->
+          :gen_tcp.close(socket)
+          err
+      end
+    end
+  end
+
+  defp connect_tcp(%{proxy: nil} = state) do
     :gen_tcp.connect(
       to_charlist(state.host),
       state.port,
@@ -1160,7 +1182,7 @@ defmodule MqttX.Client.Connection do
     )
   end
 
-  defp open_tcp(%{proxy: proxy} = state) do
+  defp connect_tcp(%{proxy: proxy} = state) do
     MqttX.Client.Proxy.connect(state.host, state.port, proxy, @connect_timeout)
   end
 

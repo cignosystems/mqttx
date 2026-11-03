@@ -150,6 +150,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A broker that stops reading can no longer freeze the client.** A write
+  into a full send buffer blocked the connection process, and with it the
+  keep-alive that would have noticed. Client sockets now have a
+  `:send_timeout` (default 30 seconds), past which the connection closes and
+  the usual disconnect and reconnect follow.
 - **A saved session whose client connected again before the listener's
   restore ran stayed in the backend.** The restore leaves a session that is
   already there alone, and did not touch its record: if the client had come

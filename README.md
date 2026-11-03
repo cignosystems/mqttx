@@ -695,6 +695,7 @@ multi-node deployment.
 | `:transport` | `:tcp`, `:ssl`, `:ws`, or `:wss` | `:tcp` |
 | `:ssl_opts` | SSL options, merged **over** the secure baseline (see [TLS/SSL](https://hexdocs.pm/mqttx/client.html#tls-ssl)) | `[]` |
 | `:ws_path` | WebSocket path for `:ws` or `:wss` | `"/mqtt"` |
+| `:send_timeout` | Milliseconds a socket write may block before the connection is closed and reconnected | `30000` |
 | `:proxy` | HTTP CONNECT proxy, e.g. `[host: "proxy.corp", port: 3128, auth: {"u", "p"}]` | `nil` |
 | `:max_inflight` | Max pending QoS 1/2 messages | `100` |
 | `:max_packet_size` | Reject inbound packets declaring more than this (`:infinity` disables) | `1 MiB` |

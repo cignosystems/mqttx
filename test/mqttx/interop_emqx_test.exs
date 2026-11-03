@@ -1664,11 +1664,12 @@ defmodule MqttX.InteropEmqxTest do
       GenServer.stop(publisher, :normal, 1000)
     end
 
-    test "default TLS verification refuses an untrusted certificate" do
-      # This broker's certificate is self-signed (and currently expired), so
-      # the secure-by-default client MUST refuse it unless the caller
-      # explicitly opts out with verify: :verify_none — which is exactly what
-      # the rest of this suite does.
+    test "default TLS verification refuses a certificate outside its trust anchors" do
+      # The only anchor here is the test suite's private CA, which signed no
+      # broker's certificate, so this holds for a self-signed broker and for a
+      # publicly trusted one alike. The secure-by-default client MUST refuse
+      # unless the caller explicitly opts out with verify: :verify_none, which
+      # is exactly what the rest of this suite does.
       agent = start_supervised!(Supervisor.child_spec({Agent, fn -> [] end}, id: :tls_agent))
 
       {:ok, client} =
@@ -1680,7 +1681,7 @@ defmodule MqttX.InteropEmqxTest do
           password: @password,
           transport: :ssl,
           # no verify_none: secure defaults apply
-          ssl_opts: [],
+          ssl_opts: [cacertfile: Path.expand("../fixtures/tls/ca.pem", __DIR__)],
           handler: Handler,
           handler_state: %{agent: agent}
         )

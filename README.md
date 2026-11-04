@@ -22,10 +22,6 @@ Fast, pure Elixir MQTT 5.0 — client, server, and codec in one package.
 > for the mental model, idiomatic patterns, and a list of mistakes commonly
 > made when integrating MqttX.
 
-> **Name note:** MqttX (this Elixir library) is not affiliated with
-> [MQTTX](https://mqttx.app), EMQX's desktop MQTT client tool. The hex package
-> name `mqttx` is stable — you can depend on it.
-
 ## Installation
 
 Requires **Elixir 1.18+ / OTP 27+** (the JSON payload codec uses the native
@@ -36,12 +32,12 @@ Add `mqttx` to your dependencies:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.12.0"},
+    {:mqttx, "~> 0.13.0"},
     # Optional: Pick a transport
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # Optional: WebSocket transport
     {:bandit, "~> 1.6"},
-    {:websock_adapter, "~> 0.5 or ~> 0.6"},
+    {:websock_adapter, "~> 0.5 or ~> 0.6 or ~> 0.7"},
     # Optional: Payload codecs
     {:protox, "~> 2.0"}
   ]
@@ -206,6 +202,9 @@ gap. The reasoning — protocol-overhead comparisons against HTTP and
 WebSocket, real payload measurements, monthly cellular data budgets, and an
 honest comparison with the other Elixir/Erlang MQTT libraries — lives in
 [Why MQTT for IoT](https://hexdocs.pm/mqttx/why-mqtt-for-iot.html).
+
+The name is a coincidence: MqttX is not related to [MQTTX](https://mqttx.app),
+EMQX's desktop client tool. The hex package name `mqttx` is here to stay.
 
 ## Common Patterns
 

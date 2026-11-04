@@ -75,7 +75,7 @@ defmodule MqttX.SimpleClientTest do
         end
       end)
 
-    {:ok, pid} =
+    {:ok, _pid} =
       EchoClient.start_link(
         host: "localhost",
         port: port,

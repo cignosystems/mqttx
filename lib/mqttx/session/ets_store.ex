@@ -30,8 +30,8 @@ defmodule MqttX.Session.ETSStore do
 
   ## Expiry
 
-  Records carry `expires_at` (see `MqttX.Session.Store`). `MqttX.Session.ETSOwner`
-  sweeps every table it owns on an interval (default 60s, configurable with
+  Records carry `expires_at` (see `MqttX.Session.Store`). The application's
+  table owner (MqttX.Session.ETSOwner) sweeps every table it owns on an interval (default 60s, configurable with
   `config :mqttx, session_sweep_interval: ms`), deleting expired records;
   `sweep_expired/2` runs the same sweep on demand.
 

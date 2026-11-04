@@ -9,7 +9,7 @@ mental model and the mistakes agents most often make.
 
 ## What MqttX is
 
-A single hex package (`{:mqttx, "~> 0.12.0"}`) that ships **three independent
+A single hex package (`{:mqttx, "~> 0.13.0"}`) that ships **three independent
 pieces** — choose only what you need:
 
 | Piece | Module | Use when |
@@ -32,7 +32,7 @@ The codec is dep-free; transports are optional packages:
 | Any client transport behind an HTTP `CONNECT` proxy | nothing extra — pass `proxy: [host:, port:, auth:]` |
 | WebSocket client (`ws` / `wss`) | nothing extra (RFC 6455 client is built-in) |
 | TCP server | `{:thousand_island, "~> 1.4"}` (preferred) or `{:ranch, "~> 2.2"}` |
-| WebSocket server (`ws`, or `wss` with `scheme: :https`) | `{:bandit, "~> 1.6"} + {:websock_adapter, "~> 0.5 or ~> 0.6"}` |
+| WebSocket server (`ws`, or `wss` with `scheme: :https`) | `{:bandit, "~> 1.6"} + {:websock_adapter, "~> 0.5 or ~> 0.6 or ~> 0.7"}` |
 
 If `MqttX.Transport.ThousandIsland` (or `Ranch`, or `Bandit`) fails at server
 startup with an undefined-module / undefined-function error, the
@@ -124,10 +124,12 @@ server guide has an Ecto/Postgres one for a database).
 What one client can make the broker hold is bounded by default (1 MiB
 packets, 100 QoS 1/2 messages in flight, 10 000 subscriptions, 10 000 queued
 messages, 128 topic levels); the server guide's "Limits" section lists the
-options. `:max_sessions` is off unless set.
+options. `:max_sessions` is off unless set, and so is `:rate_limit`, which
+caps new connections per second (per peer address too) and messages per
+client per second (since 0.13).
 
 Listeners started with the same `:name` on connected nodes act as one broker
-(`MqttX.Server.Cluster`, unreleased — 0.13): `deliver/3,4` reaches every node,
+(`MqttX.Server.Cluster`, since 0.13): `deliver/3,4` reaches every node,
 a CONNECT on any node takes the client and its session over from the others,
 retained messages are replicated, and a shared subscription delivers once
 cluster-wide. Nodes are connected by your application (libcluster,

@@ -147,7 +147,7 @@ PubSub.
 ### WebSocket
 
 ```elixir
-# mix.exs: {:bandit, "~> 1.6"}, {:websock_adapter, "~> 0.5 or ~> 0.6"}
+# mix.exs: {:bandit, "~> 1.6"}, {:websock_adapter, "~> 0.5 or ~> 0.6 or ~> 0.7"}
 
 {:ok, _pid} = MqttX.Server.start_link(
   MyApp.MqttHandler,

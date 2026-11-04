@@ -51,19 +51,23 @@ A PUBLISH's Topic Name is validated in one pass over its bytes (`MqttX.Topic.val
 
 **Acknowledgements are written once per read.** The PUBACKs, PUBRECs and PUBCOMPs for the packets of one socket read are sent together after it, on both the broker and the client — one `gen_tcp.send` (about 2.8 µs, or 4.5 µs for `ssl.send`) instead of one per packet — and at most sixteen at a time, so an acknowledgement never waits on a long read's processing (the peer's window refills as they arrive). Anything else sent during the read goes out behind them, so the wire order is unchanged. A client taking in QoS 1 messages that arrive several to a read went from 315k to over a million messages a second.
 
-**Codec benchmarks** (Apple M4 Pro):
+**Codec benchmarks** (`mix run bench/codec.exs`, Apple M4 Pro, Elixir 1.20 / OTP 29; encode is `encode_iodata/2`, what the socket gets):
 
-| Operation | Throughput | Notes |
-|-----------|-----------|-------|
-| PUBLISH encode | 5.05M ops/s | 2.9x faster than mqtt_packet_map |
-| SUBSCRIBE encode | 3.42M ops/s | 4.2x faster than mqtt_packet_map |
-| PUBLISH decode | 2.36M ops/s | Zero-copy sub-binary references |
+| Packet | Encode | Decode |
+|--------|--------|--------|
+| v4 PUBLISH QoS 0, 100 B | 9.9M ops/s (100 ns) | 5.5M ops/s (180 ns) |
+| v5 PUBLISH QoS 1, 100 B, 2 properties | 2.6M ops/s | 2.7M ops/s |
+| v5 PUBLISH QoS 1, 64 KiB | 2.8M ops/s (the payload is referenced, not copied) | 2.7M ops/s |
+| v5 CONNECT | 3.5M ops/s | 3.2M ops/s |
+| v5 SUBSCRIBE, 3 filters | 3.5M ops/s | 1.1M ops/s |
+
+Decoding a PUBLISH returns the payload as a sub-binary of the read, so decode cost does not grow with the payload.
 
 ## Buffer Handling
 
 TCP delivers data in arbitrarily-sized chunks. In the common case a complete MQTT packet arrives in one read and the receive buffer is empty, so the read is handed straight to the decoder — no copy — and the `rest` returned by `Codec.decode` is a zero-copy sub-binary of the original data.
 
-The interesting case is a packet that spans many reads. The obvious `buffer <> data` followed by a decode attempt is quadratic: decoding pattern-matches the buffer, and a binary that has been matched loses the BEAM's in-place append optimization, so every read re-copies everything buffered so far. Instead, once the fixed header of an incomplete packet has arrived its total length is known, and `MqttX.Packet.Buffer` simply collects reads (an iolist cons per read — no copy, no match) until that many bytes are in hand, then flattens and decodes exactly once. The same buffer serves the broker, the client, and the client's WebSocket frame layer.
+The interesting case is a packet that spans many reads. The obvious `buffer <> data` followed by a decode attempt is quadratic: decoding pattern-matches the buffer, and a binary that has been matched loses the BEAM's in-place append optimization, so every read re-copies everything buffered so far. Instead, once the fixed header of an incomplete packet has arrived its total length is known, and the receive buffer (MqttX.Packet.Buffer, internal) simply collects reads (an iolist cons per read — no copy, no match) until that many bytes are in hand, then flattens and decodes exactly once. The same buffer serves the broker, the client, and the client's WebSocket frame layer.
 
 Measured on the broker, one PUBLISH arriving in 1460-byte segments (`bench/server.exs`):
 
@@ -103,7 +107,7 @@ The counter is incremented when sending PUBREC (QoS 2 received) and decremented 
 
 ## Retained Message Delivery
 
-When a client subscribes, the server delivers matching retained messages from an ETS `ordered_set` keyed by the topic's segment list (`MqttX.Server.RetainedStore`).
+When a client subscribes, the server delivers matching retained messages from an ETS `ordered_set` keyed by the topic's segment list (MqttX.Server.RetainedStore, internal).
 
 1. **Exact topic subscriptions** (no wildcards): the filter *is* the key — one `ets.lookup/2`.
 2. **Wildcard subscriptions**: the filter compiles to a single ETS match spec — literal segments bound, `+` a wildcard segment, `#` a wildcard tail — so matching runs inside ETS, and a literal prefix bounds the traversal to that key range. A lone `#` is the one filter that must still visit everything.

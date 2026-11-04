@@ -9,13 +9,13 @@ Add `mqttx` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:mqttx, "~> 0.12.0"},
+    {:mqttx, "~> 0.13.0"},
 
     # Pick a transport for the server (optional)
     {:thousand_island, "~> 1.4"},  # or {:ranch, "~> 2.2"}
     # WebSocket transport (optional)
     {:bandit, "~> 1.6"},
-    {:websock_adapter, "~> 0.5 or ~> 0.6"},
+    {:websock_adapter, "~> 0.5 or ~> 0.6 or ~> 0.7"},
 
     # Payload codecs (optional)
     {:protox, "~> 2.0"}

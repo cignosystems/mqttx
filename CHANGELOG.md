@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.13.0] - 2026-11-04
 
 ### Added
 
@@ -103,6 +103,10 @@ All notable changes to this project will be documented in this file.
 - **`MqttX.Server.Router` keeps a client's filters in a `MapSet`.**
   Subscribing, unsubscribing and the duplicate check no longer walk a list
   of the client's filters; the public functions are unchanged.
+- **`websock_adapter` 0.7 is accepted** (requirement `~> 0.5 or ~> 0.6 or
+  ~> 0.7`). The WebSocket listener is tested with Bandit 1.14 and
+  websock_adapter 0.7; the development lock file moves to them and to
+  Thousand Island 1.6.
 - **Performance** (from a review of the whole library; each item measured
   before and after, nothing on the wire changed):
   - Acknowledgements go out one write per read, not one per packet. The

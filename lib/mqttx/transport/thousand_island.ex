@@ -287,6 +287,10 @@ if Code.ensure_loaded?(ThousandIsland) do
         |> Map.update(:message, nil, &Proto.redact_message/1)
       end
 
+      # Thousand Island 1.6 caches the peer address at accept time and
+      # `peername/1` always succeeds; 1.4 and 1.5, which the requirement still
+      # admits, return an error once the client is gone, so the clause stays
+      @dialyzer {:no_match, peer_ip: 1}
       defp peer_ip({:ok, {ip, _port}}), do: ip
       defp peer_ip(_other), do: nil
 
